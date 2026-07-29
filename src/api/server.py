@@ -523,8 +523,8 @@ class IndexRequest(BaseModel):
 
 class RecallTestRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
-    query: str
-    mode: str = "mix"
+    query: str = Field(min_length=1, max_length=20000)
+    mode: str = Field(default="mix", pattern=r"^(mix|hybrid|local|global|naive)$")
     top_k: int = Field(default=40, ge=1, le=100)
     chunk_top_k: int = Field(default=20, ge=1, le=100)
     enable_rerank: bool = True
@@ -548,7 +548,7 @@ class RecallTestResponse(BaseModel):
 
 class TextRecallRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
-    query: str
+    query: str = Field(min_length=1, max_length=20000)
     top_k: int = Field(default=20, ge=1, le=100)
     enable_rerank: bool = True
 
@@ -622,10 +622,10 @@ class ModelBindingsUpdate(BaseModel):
 
 class SearchRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
-    query: str
-    mode: str = "mix"
-    top_k: int = 40
-    chunk_top_k: int = 20
+    query: str = Field(min_length=1, max_length=20000)
+    mode: str = Field(default="mix", pattern=r"^(mix|hybrid|local|global|naive)$")
+    top_k: int = Field(default=40, ge=1, le=100)
+    chunk_top_k: int = Field(default=20, ge=1, le=100)
     enable_rerank: bool = True
 
 # --- Chat Models ---
@@ -655,10 +655,10 @@ class ChatSettings(BaseModel):
 class ChatSendRequest(BaseModel):
     session_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{12}$")
     workspace: str = DEFAULT_WORKSPACE
-    message: str
-    mode: str = "mix"
-    top_k: int = 40
-    chunk_top_k: int = 20
+    message: str = Field(min_length=1, max_length=20000)
+    mode: str = Field(default="mix", pattern=r"^(mix|hybrid|local|global|naive)$")
+    top_k: int = Field(default=40, ge=1, le=100)
+    chunk_top_k: int = Field(default=20, ge=1, le=100)
     enable_rerank: bool = True
     settings: Optional[ChatSettings] = None
 
@@ -2441,7 +2441,7 @@ async def create_workspace(req: WorkspaceCreateRequest):
 
 @app.delete("/api/kb/workspaces/{workspace}")
 async def delete_workspace(workspace: str):
-    """Delete a non-default workspace index/manifest. Uploaded source files are kept."""
+    """Delete a non-default workspace, including its index, manifest and uploaded sources."""
     workspace = sanitize_workspace(workspace)
     default = get_config().get("lightrag", {}).get("workspace", DEFAULT_WORKSPACE)
     if workspace == default:
@@ -2677,15 +2677,15 @@ class BatchDeleteRequest(BaseModel):
 class BatchIndexRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
     doc_names: list[str]
-    separators: list[str] = ["\n\n", "\n", "。", "！", "？", "；", "  "]
-    chunk_size: int = 512
-    chunk_overlap: int = 50
+    separators: list[str] = Field(default_factory=lambda: ["\n\n", "\n", "。", "！", "？", "；", "  "])
+    chunk_size: int = Field(default=512, ge=100, le=2000)
+    chunk_overlap: int = Field(default=50, ge=0, le=500)
 
 class RebuildIndexRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
-    separators: list[str] = ["\n\n", "\n", "。", "！", "？", "；", "  "]
-    chunk_size: int = 512
-    chunk_overlap: int = 50
+    separators: list[str] = Field(default_factory=lambda: ["\n\n", "\n", "。", "！", "？", "；", "  "])
+    chunk_size: int = Field(default=512, ge=100, le=2000)
+    chunk_overlap: int = Field(default=50, ge=0, le=500)
 
 class ClearKnowledgeBaseRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE

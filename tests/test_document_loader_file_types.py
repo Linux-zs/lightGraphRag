@@ -12,6 +12,7 @@ def test_loader_supports_expected_upload_types():
     assert ".md" in supported
     assert ".pdf" in supported
     assert ".docx" in supported
+    assert ".doc" not in supported
 
 
 def test_txt_parser_reads_utf8_text(tmp_path: Path):

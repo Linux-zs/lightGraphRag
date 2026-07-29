@@ -7,7 +7,7 @@ interface Props {
   uploading?: boolean
 }
 
-const ACCEPT_TYPES = '.txt,.md,.pdf,.docx,.doc'
+const ACCEPT_TYPES = '.txt,.md,.pdf,.docx'
 
 export default function FileUpload({ onUpload, onMultiUpload, accept = ACCEPT_TYPES, uploading }: Props) {
   const inputRef = useRef<HTMLInputElement>(null)

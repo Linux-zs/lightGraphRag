@@ -50,6 +50,16 @@ def test_chat_request_rejects_invalid_session_id():
         server.ChatSendRequest(session_id=r"..\model_profiles", message="test")
 
 
+def test_chat_request_rejects_out_of_range_retrieval_params():
+    with pytest.raises(ValidationError):
+        server.ChatSendRequest(message="test", top_k=1000)
+
+
+def test_batch_index_request_validates_chunk_params():
+    with pytest.raises(ValidationError):
+        server.BatchIndexRequest(doc_names=["a.txt"], chunk_size=10)
+
+
 def test_index_endpoint_rejects_traversal_before_disk_access():
     with pytest.raises(HTTPException) as exc:
         asyncio.run(

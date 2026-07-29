@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 
 from src.api import server
 from src import model_profiles
+from src.llm_backend.siliconflow import SiliconFlowBackend
 
 
 def _request(host: str, token: str = "") -> Request:
@@ -112,3 +113,9 @@ def test_model_api_base_allows_public_and_loopback_targets():
     assert model_profiles._normalize_api_base("http://127.0.0.1:11434/v1") == (
         "http://127.0.0.1:11434/v1"
     )
+
+
+def test_siliconflow_backend_omits_empty_authorization_header():
+    backend = SiliconFlowBackend({"api_key": ""})
+
+    assert "Authorization" not in backend._headers()

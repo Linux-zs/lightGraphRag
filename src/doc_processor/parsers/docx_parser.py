@@ -11,9 +11,9 @@ from src.doc_processor.parsers.base_parser import BaseParser, Document
 
 
 class DocxParser(BaseParser):
-    """Parser for .docx and .doc files using python-docx."""
+    """Parser for .docx files using python-docx."""
 
-    SUPPORTED_EXTENSIONS = [".docx", ".doc"]
+    SUPPORTED_EXTENSIONS = [".docx"]
 
     def parse(self, file_path: Path) -> Document:
         """Parse a .docx file into a Document object.

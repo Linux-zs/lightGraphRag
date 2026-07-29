@@ -175,25 +175,20 @@ class TestLightRAGCitationContext:
             "Recall endpoint should be a LightRAG context preview, not old vector/graph scoring"
 
     def test_prompt_has_citation_instructions(self):
-        """The answer_generation prompt must instruct [数字] citation markers."""
-        prompts_path = PROJECT_ROOT / "config" / "prompts.yaml"
-        content = prompts_path.read_text(encoding="utf-8")
+        """The active answer prompt must instruct [数字] citation markers."""
+        content = (PROJECT_ROOT / "src" / "api" / "server.py").read_text(encoding="utf-8")
 
-        # Check for citation marker instructions
         assert "[数字]" in content, \
             "Prompt must instruct [数字] citation markers"
-        assert "引用文档" in content, \
-            "Prompt must instruct listing 引用文档"
+        assert "不要输出 References/引用文档列表" in content, \
+            "Prompt must forbid model-generated citation lists"
 
-    def test_prompt_forbids_chinese_numerals(self):
-        """The prompt must forbid Chinese numeral and non-Arabic numbering."""
-        prompts_path = PROJECT_ROOT / "config" / "prompts.yaml"
-        content = prompts_path.read_text(encoding="utf-8")
+    def test_prompt_forbids_bare_citation_numbers(self):
+        """The active prompt must forbid bare citation numbers."""
+        content = (PROJECT_ROOT / "src" / "api" / "server.py").read_text(encoding="utf-8")
 
-        assert "阿拉伯数字" in content, \
-            "Prompt must mandate Arabic numeral numbering"
-        assert "中文数字" in content, \
-            "Prompt must explicitly forbid Chinese numerals"
+        assert "禁止把引用编号写成裸数字" in content, \
+            "Prompt must forbid bare citation numbers"
 
 
 class TestStreamingEventFormat:

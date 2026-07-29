@@ -15,8 +15,6 @@ from src.exceptions import ConfigError
 load_dotenv()
 
 _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "default.yaml"
-_GRAPH_SKELETON_PATH = Path(__file__).resolve().parent.parent / "config" / "graph_skeleton.yaml"
-_PROMPTS_PATH = Path(__file__).resolve().parent.parent / "config" / "prompts.yaml"
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -83,30 +81,6 @@ def load_config(config_path: Path | None = None) -> dict:
         paths["log_dir"] = str(Path(data_dir) / "logs")
     logger.info("Configuration loaded and merged successfully")
     return config
-
-
-def load_graph_skeleton(path: Path | None = None) -> dict:
-    """Load graph skeleton YAML.
-
-    Args:
-        path: Optional custom path. Defaults to config/graph_skeleton.yaml.
-
-    Returns:
-        Graph skeleton dictionary with 'components' and 'edges'.
-    """
-    return load_yaml(path or _GRAPH_SKELETON_PATH)
-
-
-def load_prompts(path: Path | None = None) -> dict:
-    """Load prompt templates YAML.
-
-    Args:
-        path: Optional custom path. Defaults to config/prompts.yaml.
-
-    Returns:
-        Prompts dictionary.
-    """
-    return load_yaml(path or _PROMPTS_PATH)
 
 
 # Global config singleton

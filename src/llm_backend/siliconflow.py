@@ -19,7 +19,7 @@ class SiliconFlowBackend(LLMBackend):
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.base_url = config.get("base_url", "https://api.siliconflow.cn/v1")
-        self.api_key = config.get("api_key", "")
+        self.api_key = str(config.get("api_key", "") or "").strip()
         self.chat_model = config.get("chat_model", "Qwen/Qwen2.5-7B-Instruct")
         self.embed_model = config.get("embed_model", "BAAI/bge-large-zh-v1.5")
         self.rerank_model = config.get("rerank_model", "BAAI/bge-reranker-v2-m3")
@@ -33,11 +33,16 @@ class SiliconFlowBackend(LLMBackend):
         self.last_stream_chunks = 0
         self.last_stream_chars = 0
 
+    def _headers(self) -> dict[str, str]:
+        if not self.api_key:
+            return {}
+        return {"Authorization": f"Bearer {self.api_key}"}
+
     def _get_async_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
-                headers={"Authorization": f"Bearer {self.api_key}"},
+                headers=self._headers(),
                 timeout=self.timeout,
             )
         return self._client
@@ -46,7 +51,7 @@ class SiliconFlowBackend(LLMBackend):
         if self._sync_client is None or self._sync_client.is_closed:
             self._sync_client = httpx.Client(
                 base_url=self.base_url,
-                headers={"Authorization": f"Bearer {self.api_key}"},
+                headers=self._headers(),
                 timeout=self.timeout,
             )
         return self._sync_client
