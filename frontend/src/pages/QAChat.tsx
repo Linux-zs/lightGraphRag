@@ -1,19 +1,62 @@
 import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import {
+  Check,
+  ChevronDown,
+  Copy,
+  FileText,
+  Network,
+  Send,
+  Settings2,
+  Sparkles,
+  X,
+} from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import GraphView from '../components/GraphView'
+import { useConfirm } from '../components/ConfirmDialog'
+import { RangeField, SelectField, Toggle } from '../components/ui'
+import WorkspaceSwitcher from '../components/WorkspaceSwitcher'
 import {
   chatSendStream,
+  ChatSettings,
   getChatSession,
   getDocumentChunks,
+  getModelBindings,
+  getModelConfig,
+  listModelProfiles,
   ChatSessionListItem,
   ChatMessage,
   Citation,
   EvidenceChain,
+  ModelProfile,
+  updateChatSessionSettings,
+  WorkspaceInfo,
 } from '../api'
 
 type CitationMap = Map<number, Citation[]>
 type EvidenceMap = Map<number, EvidenceChain>
+
+const DEFAULT_CHAT_SETTINGS: ChatSettings = {
+  answer_profile_id: 'siliconflow-default',
+  answer_model: 'Qwen/Qwen2.5-7B-Instruct',
+  temperature: 0.7,
+  top_p: 0.9,
+  max_tokens: 4096,
+  frequency_penalty: 0.3,
+  presence_penalty: 0.2,
+  mode: 'mix',
+  top_k: 40,
+  chunk_top_k: 20,
+  enable_rerank: true,
+}
+
+function isLikelyChatModel(model: { id: string; type: string }) {
+  const type = (model.type || '').toLowerCase()
+  if (['chat', 'llm', 'text-generation', 'completion'].includes(type)) return true
+  const nonChatType = /(embedding|rerank|image|video|audio|tts|asr|ocr|vision-only)/
+  if (nonChatType.test(type)) return false
+  return !/(embedding|rerank|bge-|image|kolors|wan2|tts|asr|ocr|sensevoice|cosyvoice)/i.test(model.id)
+}
 
 // --- Citation marker helpers (module-level pure functions) ---
 
@@ -146,13 +189,24 @@ function citationSummary(citations: Citation[]) {
 
 interface Props {
   workspace: string
+  workspaces: WorkspaceInfo[]
+  onWorkspaceChange: (workspace: string) => void
   sessions: ChatSessionListItem[]
   activeId: string | null
   setActiveId: (id: string | null) => void
   reloadSessions: () => Promise<void>
 }
 
-export default function QAChat({ workspace, sessions, activeId, setActiveId, reloadSessions }: Props) {
+export default function QAChat({
+  workspace,
+  workspaces,
+  onWorkspaceChange,
+  sessions,
+  activeId,
+  setActiveId,
+  reloadSessions,
+}: Props) {
+  const confirm = useConfirm()
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [citationsByIndex, setCitationsByIndex] = useState<CitationMap>(new Map())
   const [evidenceByIndex, setEvidenceByIndex] = useState<EvidenceMap>(new Map())
@@ -162,6 +216,7 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const streamingRef = useRef(false)
+  const settingsSaveTimerRef = useRef<number | null>(null)
   const [copiedMsgIndex, setCopiedMsgIndex] = useState<number | null>(null)
 
   /** Tracks which citation is currently highlighted (after clicking a superscript). */
@@ -183,12 +238,9 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
     error: string | null
   } | null>(null)
 
-  // Retrieval params (F3)
   const [showSettings, setShowSettings] = useState(false)
-  const [mode, setMode] = useState('mix')
-  const [topK, setTopK] = useState(40)
-  const [chunkTopK, setChunkTopK] = useState(20)
-  const [enableRerank, setEnableRerank] = useState(true)
+  const [chatSettings, setChatSettings] = useState<ChatSettings>(DEFAULT_CHAT_SETTINGS)
+  const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([])
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -212,6 +264,7 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
     try {
       const data = await getChatSession(id, workspace)
       setMessages(data.messages)
+      setChatSettings(data.settings || DEFAULT_CHAT_SETTINGS)
       const restoredCitations: CitationMap = new Map()
       const restoredEvidence: EvidenceMap = new Map()
       data.messages.forEach((msg, idx) => {
@@ -235,6 +288,38 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
   }, [workspace])
 
   useEffect(() => {
+    let cancelled = false
+    Promise.all([
+      listModelProfiles(),
+      getModelBindings(),
+      getModelConfig(workspace),
+    ]).then(([profiles, bindings, config]) => {
+      if (cancelled) return
+      setModelProfiles(profiles)
+      if (!activeId) {
+        setChatSettings({
+          answer_profile_id: bindings.chat.profile_id,
+          answer_model: bindings.chat.model || config.chat_model,
+          temperature: config.chat_temperature,
+          top_p: config.chat_top_p,
+          max_tokens: config.chat_max_tokens,
+          frequency_penalty: config.frequency_penalty,
+          presence_penalty: config.presence_penalty,
+          mode: 'mix',
+          top_k: 40,
+          chunk_top_k: 20,
+          enable_rerank: bindings.rerank.enabled !== false,
+        })
+      }
+    }).catch(() => {
+      if (!cancelled) setModelProfiles([])
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [workspace, activeId])
+
+  useEffect(() => {
     if (activeId) {
       loadActiveSession(activeId)
     } else {
@@ -242,6 +327,27 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
       setLoadingSession(false)
     }
   }, [activeId, loadActiveSession, resetConversationState])
+
+  useEffect(() => () => {
+    if (settingsSaveTimerRef.current !== null) {
+      window.clearTimeout(settingsSaveTimerRef.current)
+    }
+  }, [])
+
+  const updateSettings = useCallback((patch: Partial<ChatSettings>) => {
+    setChatSettings((previous) => {
+      const next = { ...previous, ...patch }
+      if (activeId) {
+        if (settingsSaveTimerRef.current !== null) {
+          window.clearTimeout(settingsSaveTimerRef.current)
+        }
+        settingsSaveTimerRef.current = window.setTimeout(() => {
+          void updateChatSessionSettings(activeId, next, workspace)
+        }, 350)
+      }
+      return next
+    })
+  }, [activeId, workspace])
 
   /**
    * Handle clicking a [数字] superscript in the answer body.
@@ -362,10 +468,7 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
         session_id: activeId,
         workspace,
         message: text,
-        mode,
-        top_k: topK,
-        chunk_top_k: chunkTopK,
-        enable_rerank: enableRerank,
+        settings: chatSettings,
       })
 
       if (!response.ok) {
@@ -545,14 +648,15 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
           onClick={() => toggleCitationExpand(msgIndex)}
           className="w-full flex items-center gap-2 text-xs font-medium text-gray-500 hover:text-gray-800 transition-colors"
         >
-          <span className="inline-flex h-4 w-4 items-center justify-center rounded border border-gray-300 text-[10px] text-gray-400">
-            #
-          </span>
+          <FileText size={14} strokeWidth={1.8} />
           <span>引用文档</span>
           <span className="text-gray-400">
             {summary.docCount} 个文档 · {summary.chunkCount} 条片段 · {summary.firstDoc}
           </span>
-          <span className="ml-auto text-gray-400">{isExpanded ? '▲' : '▼'}</span>
+          <ChevronDown
+            size={14}
+            className={`ml-auto text-gray-400 transition-transform ${isExpanded ? 'rotate-180' : ''}`}
+          />
         </button>
         {isExpanded && (
           <div className="space-y-2 max-h-64 overflow-y-auto pr-1 mt-2">
@@ -616,12 +720,15 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
           onClick={() => toggleEvidenceExpand(msgIndex)}
           className="w-full flex items-center gap-2 text-xs font-medium text-gray-500 hover:text-gray-800 transition-colors"
         >
-          <span className="inline-block h-3 w-3 rotate-45 border border-gray-400" />
+          <Network size={14} strokeWidth={1.8} />
           <span>证据链</span>
           <span className="text-gray-400">
             ({evidence.nodes.length} 节点 / {evidence.edges.length} 关系)
           </span>
-          <span className="ml-auto text-gray-400">{isExpanded ? '▲' : '▼'}</span>
+          <ChevronDown
+            size={14}
+            className={`ml-auto text-gray-400 transition-transform ${isExpanded ? 'rotate-180' : ''}`}
+          />
         </button>
         {isExpanded && (
           <div className="mt-2 grid grid-cols-1 lg:grid-cols-[minmax(280px,1fr)_240px] gap-3">
@@ -699,75 +806,163 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
     )
   }
 
+  const selectedModelValue = `${chatSettings.answer_profile_id}::${chatSettings.answer_model}`
+
+  const handleModelSelection = (value: string) => {
+    const separator = value.indexOf('::')
+    if (separator < 0) return
+    updateSettings({
+      answer_profile_id: value.slice(0, separator),
+      answer_model: value.slice(separator + 2),
+    })
+  }
+
+  const handleWorkspaceSelection = async (nextWorkspace: string) => {
+    if (nextWorkspace === workspace) return
+    if (messages.length > 0) {
+      const confirmed = await confirm({
+        title: '切换问答知识库',
+        message: `将保留当前对话，并在知识库“${nextWorkspace}”中开始新对话。`,
+        confirmLabel: '切换知识库',
+      })
+      if (!confirmed) return
+    }
+    setShowSettings(false)
+    onWorkspaceChange(nextWorkspace)
+  }
+
   const renderSettingsPanel = () => (
-    <div className="px-6 py-3 border-t border-gray-100 bg-gray-50 space-y-3">
-      <div className="flex items-center justify-between">
-        <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">检索设置</span>
+    <div className="absolute bottom-full left-0 right-0 z-30 mb-2 max-h-[68vh] overflow-y-auto rounded-lg border border-gray-200 bg-white p-5 shadow-[var(--ui-shadow)]">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h3 className="text-sm font-semibold text-gray-900">对话设置</h3>
+          <p className="mt-1 text-xs text-gray-500">设置按当前对话保存；嵌入模型仍跟随知识库索引。</p>
+        </div>
         <button
           onClick={() => setShowSettings(false)}
-          className="text-xs text-gray-400 hover:text-gray-600"
+          className="ui-icon-button"
+          title="关闭设置"
+          aria-label="关闭设置"
         >
-          收起
+          <X size={16} />
         </button>
       </div>
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
-        <div>
-          <label className="block text-xs text-gray-500 mb-1">mode</label>
-          <select
-            value={mode}
-            onChange={(e) => setMode(e.target.value)}
-            className="w-full border border-gray-200 rounded-lg px-2 py-1.5 text-xs bg-white"
-          >
-            <option value="mix">mix</option>
-            <option value="hybrid">hybrid</option>
-            <option value="local">local</option>
-            <option value="global">global</option>
-            <option value="naive">naive</option>
-          </select>
-        </div>
-        <div>
-          <label className="block text-xs text-gray-500 mb-1">top_k: <span className="text-primary-600 font-medium">{topK}</span></label>
-          <input type="range" min={1} max={100} value={topK}
-            onChange={(e) => setTopK(parseInt(e.target.value))}
-            className="w-full accent-primary-500" />
-        </div>
-        <div>
-          <label className="block text-xs text-gray-500 mb-1">chunk_top_k: <span className="text-primary-600 font-medium">{chunkTopK}</span></label>
-          <input type="range" min={1} max={100} value={chunkTopK}
-            onChange={(e) => setChunkTopK(parseInt(e.target.value))}
-            className="w-full accent-primary-500" />
-        </div>
-        <div className="flex items-end">
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input type="checkbox" checked={enableRerank}
-              onChange={(e) => setEnableRerank(e.target.checked)}
-              className="w-4 h-4 rounded accent-primary-500" />
-            <span className="text-xs text-gray-600">启用重排序</span>
-          </label>
-        </div>
+
+      <div className="mt-5 grid gap-6 lg:grid-cols-2">
+        <section>
+          <div className="mb-4 flex items-center gap-2 text-sm font-semibold text-gray-800">
+            <Sparkles size={16} />
+            生成参数
+          </div>
+          <div className="space-y-4">
+            <RangeField label="Temperature" value={chatSettings.temperature} min={0} max={2} step={0.05}
+              onChange={(value) => updateSettings({ temperature: value })} />
+            <RangeField label="Top-P" value={chatSettings.top_p} min={0} max={1} step={0.05}
+              onChange={(value) => updateSettings({ top_p: value })} />
+            <RangeField label="Max Tokens" value={chatSettings.max_tokens} min={256} max={8192} step={256}
+              onChange={(value) => updateSettings({ max_tokens: value })} />
+            <RangeField label="Frequency Penalty" value={chatSettings.frequency_penalty} min={-2} max={2} step={0.1}
+              onChange={(value) => updateSettings({ frequency_penalty: value })} />
+            <RangeField label="Presence Penalty" value={chatSettings.presence_penalty} min={-2} max={2} step={0.1}
+              onChange={(value) => updateSettings({ presence_penalty: value })} />
+          </div>
+        </section>
+
+        <section>
+          <div className="mb-4 flex items-center gap-2 text-sm font-semibold text-gray-800">
+            <Network size={16} />
+            检索参数
+          </div>
+          <div className="space-y-4">
+            <SelectField
+              label="LightRAG 模式"
+              value={chatSettings.mode}
+              onChange={(event) => updateSettings({ mode: event.target.value })}
+            >
+              <option value="mix">mix - 图谱与文本向量</option>
+              <option value="hybrid">hybrid - 局部与全局图谱</option>
+              <option value="local">local - 实体局部</option>
+              <option value="global">global - 关系全局</option>
+              <option value="naive">naive - 仅文本向量</option>
+            </SelectField>
+            <RangeField label="图谱 Top-K" value={chatSettings.top_k} min={1} max={100}
+              onChange={(value) => updateSettings({ top_k: value })} />
+            <RangeField label="文本块 Top-K" value={chatSettings.chunk_top_k} min={1} max={100}
+              onChange={(value) => updateSettings({ chunk_top_k: value })} />
+            <div className="pt-1">
+              <Toggle
+                checked={chatSettings.enable_rerank}
+                onChange={(value) => updateSettings({ enable_rerank: value })}
+                label="启用 Rerank"
+              />
+            </div>
+          </div>
+        </section>
       </div>
     </div>
   )
 
-  const renderRetrievalStatusBar = () => (
-    <div className="px-4 pt-2 shrink-0">
+  const renderComposerToolbar = () => (
+    <div className="mb-2 flex min-h-10 flex-wrap items-center gap-1.5 rounded-lg border border-gray-200 bg-gray-50/70 p-1.5">
+      <WorkspaceSwitcher
+        workspace={workspace}
+        workspaces={workspaces}
+        onChange={handleWorkspaceSelection}
+        placement="top"
+        compact
+        className="w-44 shrink-0"
+      />
+
+      <span className="h-5 w-px bg-gray-200" />
+
+      <label className="flex h-8 min-w-[180px] flex-1 items-center gap-1.5 rounded-md border border-transparent bg-white px-2 text-xs text-gray-600 shadow-sm hover:border-gray-200">
+        <Sparkles size={14} strokeWidth={1.8} />
+        <select
+          value={selectedModelValue}
+          onChange={(event) => handleModelSelection(event.target.value)}
+          className="min-w-0 max-w-64 flex-1 appearance-none truncate bg-transparent font-medium text-gray-800 outline-none"
+          aria-label="选择回答模型"
+        >
+          {modelProfiles.map((profile) => {
+            const models = (profile.models_cache || []).filter(isLikelyChatModel)
+            if (
+              profile.id === chatSettings.answer_profile_id
+              && chatSettings.answer_model
+              && !models.some((model) => model.id === chatSettings.answer_model)
+            ) {
+              models.unshift({ id: chatSettings.answer_model, type: 'selected' })
+            }
+            return (
+              <optgroup key={profile.id} label={profile.name}>
+                {models.map((model) => (
+                  <option key={`${profile.id}-${model.id}`} value={`${profile.id}::${model.id}`}>
+                    {model.id}
+                  </option>
+                ))}
+              </optgroup>
+            )
+          })}
+          {modelProfiles.length === 0 && (
+            <option value={selectedModelValue}>{chatSettings.answer_model}</option>
+          )}
+        </select>
+        <ChevronDown size={13} className="text-gray-400" />
+      </label>
+
       <button
-        onClick={() => setShowSettings(true)}
-        className="mx-auto flex max-w-3xl flex-wrap items-center gap-2 rounded-full border border-gray-200 bg-white px-3 py-1.5 text-xs text-gray-500 shadow-sm transition-colors hover:border-gray-300 hover:text-gray-800"
+        onClick={() => setShowSettings((visible) => !visible)}
+        className={`flex h-8 items-center gap-1.5 rounded-md px-2 text-xs transition ${
+          showSettings ? 'bg-gray-100 text-gray-900' : 'text-gray-600 hover:bg-gray-50'
+        }`}
+        aria-expanded={showSettings}
       >
-        <span className="font-medium text-gray-700">检索</span>
-        <span>知识库: {workspace}</span>
+        <Settings2 size={14} strokeWidth={1.8} />
+        <span>{chatSettings.mode}</span>
         <span className="text-gray-300">·</span>
-        <span>mode {mode}</span>
-        <span className="text-gray-300">·</span>
-        <span>topK {topK}</span>
-        <span className="text-gray-300">·</span>
-        <span>chunk {chunkTopK}</span>
-        <span className="text-gray-300">·</span>
-        <span className={enableRerank ? 'text-emerald-600' : 'text-gray-400'}>
-          rerank {enableRerank ? '开' : '关'}
+        <span>{chatSettings.chunk_top_k} 块</span>
+        <span className={chatSettings.enable_rerank ? 'text-emerald-600' : 'text-gray-400'}>
+          Rerank {chatSettings.enable_rerank ? '开' : '关'}
         </span>
-        <span className="ml-auto text-gray-400">设置</span>
       </button>
     </div>
   )
@@ -817,18 +1012,13 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
   }
 
   return (
-    <div className="flex h-screen bg-white overflow-hidden">
+    <div className="flex h-full bg-white overflow-hidden">
       <div className="flex-1 flex flex-col min-w-0">
         {/* Header */}
-        <div className="h-14 px-5 border-b border-gray-100 shrink-0 flex items-center justify-between">
-          <div>
-            <h3 className="text-sm font-medium text-gray-800">
-              {activeId ? sessions.find((s) => s.id === activeId)?.title || '对话' : '新对话'}
-            </h3>
-            <p className="text-xs text-gray-400">
-              当前知识库: {workspace}
-            </p>
-          </div>
+        <div className="flex h-12 shrink-0 items-center justify-between border-b border-gray-100 px-5">
+          <h3 className="truncate text-sm font-medium text-gray-800">
+            {activeId ? sessions.find((s) => s.id === activeId)?.title || '对话' : '新对话'}
+          </h3>
         </div>
 
         {/* Messages */}
@@ -841,8 +1031,8 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
           ) : messages.length === 0 ? (
             <div className="flex items-center justify-center h-full">
               <div className="text-center">
-                <div className="mx-auto mb-4 h-10 w-10 rounded-full border border-gray-300 flex items-center justify-center">
-                  <span className="h-4 w-4 rounded-full border border-gray-500" />
+                <div className="mx-auto mb-4 grid h-10 w-10 place-items-center rounded-lg border border-gray-200 bg-gray-50 text-gray-500">
+                  <Sparkles size={18} strokeWidth={1.7} />
                 </div>
                 <p className="text-sm text-gray-600">{activeId ? '选择一条历史对话，或' : ''}开始新的问答</p>
                 <p className="text-xs text-gray-400 mt-1">输入问题，系统将基于当前知识库回答</p>
@@ -875,6 +1065,16 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
                   <p className="text-[10px] mt-2 text-gray-400">
                     {formatTime(msg.timestamp)}
                   </p>
+                  {msg.role === 'user' && (
+                    <button
+                      onClick={() => handleCopyAnswer(i, msg.content)}
+                      className="mt-1 inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] text-gray-400 hover:bg-white/70 hover:text-gray-700"
+                      title="复制提问"
+                    >
+                      {copiedMsgIndex === i ? <Check size={12} /> : <Copy size={12} />}
+                      {copiedMsgIndex === i ? '已复制' : '复制'}
+                    </button>
+                  )}
                   {msg.role === 'assistant' && !isStreamingMsg(msg, i) && renderAssistantActions(msg, i)}
                   {msg.role === 'assistant' && renderCitations(i)}
                   {msg.role === 'assistant' && renderEvidence(i)}
@@ -886,38 +1086,36 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Settings panel (F3) */}
-        {showSettings ? (
-          renderSettingsPanel()
-        ) : (
-          renderRetrievalStatusBar()
-        )}
-
         {/* Input */}
-        <div className="px-4 py-4 shrink-0">
-          <div className="mx-auto max-w-3xl flex gap-3 rounded-3xl border border-gray-200 bg-white px-3 py-2 shadow-sm">
-            <input
-              ref={inputRef}
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
-              placeholder="输入问题，按 Enter 发送..."
-              disabled={sending}
-              className="flex-1 bg-transparent px-2 py-2 text-sm outline-none disabled:opacity-50"
-            />
-            <button
-              onClick={handleSend}
-              disabled={!input.trim() || sending}
-              className="h-9 min-w-9 px-4 text-sm font-medium rounded-full bg-gray-900 text-white hover:bg-gray-700 disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed transition-colors"
-            >
-              {sending ? (
-                <span className="inline-flex items-center gap-1">
-                  <div className="animate-spin w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full" />
-                  发送
-                </span>
-              ) : '发送'}
-            </button>
+        <div className="shrink-0 px-4 pb-4 pt-2">
+          <div className="relative mx-auto max-w-3xl">
+            {showSettings && renderSettingsPanel()}
+            {renderComposerToolbar()}
+            <div className="flex gap-2 rounded-2xl border border-gray-200 bg-white px-3 py-2 shadow-sm focus-within:border-gray-300">
+              <input
+                ref={inputRef}
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
+                placeholder="输入问题，按 Enter 发送"
+                disabled={sending}
+                className="min-w-0 flex-1 bg-transparent px-1 py-2 text-sm outline-none disabled:opacity-50"
+              />
+              <button
+                onClick={handleSend}
+                disabled={!input.trim() || sending}
+                className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-gray-900 text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:bg-gray-200 disabled:text-gray-400"
+                title="发送"
+                aria-label="发送"
+              >
+                {sending ? (
+                  <span className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                ) : (
+                  <Send size={16} strokeWidth={2} />
+                )}
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -929,7 +1127,7 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
           onClick={() => setChunkModal(null)}
         >
           <div
-            className="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col mx-4"
+            className="mx-4 flex max-h-[80vh] w-full max-w-2xl flex-col rounded-lg bg-white shadow-2xl"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-5 py-3 border-b border-gray-200 flex items-center justify-between shrink-0">
@@ -939,9 +1137,10 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
               </h3>
               <button
                 onClick={() => setChunkModal(null)}
-                className="text-gray-400 hover:text-gray-600 text-lg leading-none ml-3 shrink-0"
+                className="ui-icon-button ml-3"
+                aria-label="关闭"
               >
-                ×
+                <X size={17} />
               </button>
             </div>
             <div className="flex-1 overflow-y-auto px-5 py-4">

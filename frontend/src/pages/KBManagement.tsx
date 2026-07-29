@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import FileUpload from '../components/FileUpload'
 import ChunkPreview from '../components/ChunkPreview'
+import { RangeField } from '../components/ui'
 import {
   uploadDocument,
   previewChunks,
@@ -647,7 +648,7 @@ export default function KBManagement({ workspace }: Props) {
       </div>
 
       {/* Upload section */}
-      <section className="bg-white border border-gray-200 rounded-xl p-6">
+      <section className="rounded-lg border border-gray-200 bg-white p-6">
         <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide mb-4">
           上传文档
         </h3>
@@ -704,12 +705,12 @@ export default function KBManagement({ workspace }: Props) {
       </section>
 
       {/* Chunking config */}
-      <section className="bg-white border border-gray-200 rounded-xl p-6">
+      <section className="rounded-lg border border-gray-200 bg-white p-6">
         <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide mb-4">
           切分配置
         </h3>
 
-        <div className="grid grid-cols-2 gap-6">
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(320px,0.85fr)]">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">
               分隔符 (逗号分隔)
@@ -718,7 +719,7 @@ export default function KBManagement({ workspace }: Props) {
               type="text"
               value={separators}
               onChange={(e) => setSeparators(e.target.value)}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-primary-200 focus:border-primary-400 outline-none"
+              className="ui-control w-full"
               placeholder="\n\n, \n, 。, ！"
             />
             <p className="text-[11px] text-gray-400 mt-1">
@@ -729,30 +730,26 @@ export default function KBManagement({ workspace }: Props) {
 
           <div className="space-y-4">
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Chunk Size: <span className="text-primary-600">{chunkSize}</span>
-              </label>
-              <input
-                type="range"
-                min={100} max={2000} step={50}
+              <RangeField
+                label="Chunk Size"
                 value={chunkSize}
-                onChange={(e) => setChunkSize(parseInt(e.target.value))}
-                className="w-full accent-primary-500"
+                min={100}
+                max={2000}
+                step={50}
+                onChange={setChunkSize}
               />
             <p className="text-[11px] text-gray-400">每个文本块的最大字符数</p>
             <p className="text-[11px] text-amber-600 mt-1">LightRAG 实际按 token 处理，此处作为索引参数传入。</p>
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Overlap: <span className="text-primary-600">{chunkOverlap}</span>
-              </label>
-              <input
-                type="range"
-                min={0} max={500} step={10}
+              <RangeField
+                label="Overlap"
                 value={chunkOverlap}
-                onChange={(e) => setChunkOverlap(parseInt(e.target.value))}
-                className="w-full accent-primary-500"
+                min={0}
+                max={500}
+                step={10}
+                onChange={setChunkOverlap}
               />
             <p className="text-[11px] text-gray-400">相邻文本块的重叠字符数</p>
             </div>
@@ -789,7 +786,7 @@ export default function KBManagement({ workspace }: Props) {
       </section>
 
       {/* Chunk preview */}
-      <section className="bg-white border border-gray-200 rounded-xl p-6">
+      <section className="rounded-lg border border-gray-200 bg-white p-6">
         <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide mb-4">
           切分预览 {chunks.length > 0 && <span className="text-gray-400">({chunks.length} 块)</span>}
         </h3>
@@ -802,7 +799,7 @@ export default function KBManagement({ workspace }: Props) {
       </section>
 
       {/* Document list */}
-      <section className="bg-white border border-gray-200 rounded-xl p-6">
+      <section className="rounded-lg border border-gray-200 bg-white p-6">
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide">
             文档清单
@@ -945,7 +942,7 @@ export default function KBManagement({ workspace }: Props) {
       {/* Raw Text Editor Modal */}
       {rawTextModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-          <div className="bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[85vh] flex flex-col mx-4">
+          <div className="mx-4 flex max-h-[85vh] w-full max-w-4xl flex-col rounded-lg bg-white shadow-2xl">
             {/* Header */}
             <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
               <div>
@@ -1021,7 +1018,7 @@ export default function KBManagement({ workspace }: Props) {
       {/* Chunk Viewer Modal */}
       {chunkModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-          <div className="bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[85vh] flex flex-col mx-4">
+          <div className="mx-4 flex max-h-[85vh] w-full max-w-4xl flex-col rounded-lg bg-white shadow-2xl">
             {/* Header */}
             <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
               <div>

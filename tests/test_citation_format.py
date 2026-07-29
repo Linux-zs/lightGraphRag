@@ -45,6 +45,21 @@ CHINESE_NUMERAL_RE = re.compile(r"^[一二三四五六七八九十]+[、.．]", 
 ROMAN_NUMERAL_RE = re.compile(r"^[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+[、.．]", re.MULTILINE)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def cleanup_live_api_sessions():
+    """Keep live-server contract checks from polluting the user's chat list."""
+    sessions_dir = PROJECT_ROOT / "data" / "sessions"
+    before = {path.name for path in sessions_dir.glob("*.json")}
+    yield
+    # The streaming endpoint persists in the generator's finally block after
+    # emitting the done event. Give that cleanup a moment to finish before
+    # removing sessions created by these live-server checks.
+    time.sleep(0.5)
+    for path in sessions_dir.glob("*.json"):
+        if path.name not in before:
+            path.unlink(missing_ok=True)
+
+
 # ===========================================================================
 # PART 1: Unit Tests (no server needed)
 # ===========================================================================

@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
+import { useConfirm } from '../components/ConfirmDialog'
+import EntityPicker from '../components/EntityPicker'
 import GraphView from '../components/GraphView'
 import {
   applyGraphChanges,
@@ -99,6 +101,7 @@ function changeTitle(change: GraphChange) {
 }
 
 export default function GraphPage({ workspace }: Props) {
+  const confirm = useConfirm()
   const [tab, setTab] = useState<Tab>('overview')
   const [data, setData] = useState<GraphData | null>(null)
   const [config, setConfig] = useState<GraphGovernanceConfig>(emptyConfig)
@@ -124,7 +127,12 @@ export default function GraphPage({ workspace }: Props) {
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null)
   const [entityEdit, setEntityEdit] = useState({ name: '', type: '', description: '' })
   const [entityCreate, setEntityCreate] = useState({ name: '', type: '', description: '' })
-  const [mergeDraft, setMergeDraft] = useState({ sources: '', target: '', description: '', type: '' })
+  const [mergeDraft, setMergeDraft] = useState({
+    sources: [] as string[],
+    target: '',
+    description: '',
+    type: '',
+  })
 
   const [relationQuery, setRelationQuery] = useState('')
   const [selectedEdge, setSelectedEdge] = useState<GraphEdge | null>(null)
@@ -273,12 +281,14 @@ export default function GraphPage({ workspace }: Props) {
     setConfig(cfg)
   }, '抽取规则已保存')
 
-  const applySelectedTemplate = () => {
+  const applySelectedTemplate = async () => {
     if (!selectedTemplateId) return
     const selected = ruleTemplates.find((item) => item.id === selectedTemplateId)
-    const ok = window.confirm(
-      `确认将“${selected?.name || selectedTemplateId}”套用到当前知识库？新规则只影响后续上传和重新索引的文档。`,
-    )
+    const ok = await confirm({
+      title: '套用抽取规则',
+      message: `将“${selected?.name || selectedTemplateId}”套用到知识库“${workspace}”。新规则只影响后续上传和重新索引的文档。`,
+      confirmLabel: '套用规则',
+    })
     if (!ok) return
     return runAction(async () => {
       const cfg = await applyGraphRuleTemplate(workspace, selectedTemplateId)
@@ -312,9 +322,14 @@ export default function GraphPage({ workspace }: Props) {
     }, '当前规则已另存为模板')
   }
 
-  const removeTemplate = (template: GraphRuleTemplate) => {
+  const removeTemplate = async (template: GraphRuleTemplate) => {
     if (template.built_in) return
-    const ok = window.confirm(`确认删除抽取规则模板“${template.name}”？不会影响已套用到知识库的规则内容。`)
+    const ok = await confirm({
+      title: '删除抽取规则模板',
+      message: `将删除模板“${template.name}”，不会影响已经套用到知识库的规则内容。`,
+      confirmLabel: '删除模板',
+      tone: 'danger',
+    })
     if (!ok) return
     return runAction(async () => {
       await deleteGraphRuleTemplate(template.id)
@@ -358,9 +373,14 @@ export default function GraphPage({ workspace }: Props) {
     setEntityCreate({ name: '', type: '', description: '' })
   }, '实体已新增')
 
-  const removeEntity = () => {
+  const removeEntity = async () => {
     if (!selectedNode) return
-    const ok = window.confirm(`确认删除实体“${selectedNode.id}”及其关系？`)
+    const ok = await confirm({
+      title: '删除图谱实体',
+      message: `将删除实体“${selectedNode.id}”以及与它连接的所有关系。`,
+      confirmLabel: '删除实体',
+      tone: 'danger',
+    })
     if (!ok) return
     return runAction(async () => {
       await deleteGraphEntity(selectedNode.id, workspace)
@@ -397,9 +417,14 @@ export default function GraphPage({ workspace }: Props) {
     }, '关系已更新')
   }
 
-  const removeRelation = () => {
+  const removeRelation = async () => {
     if (!selectedEdge) return
-    const ok = window.confirm(`确认删除关系“${selectedEdge.source} - ${selectedEdge.target}”？`)
+    const ok = await confirm({
+      title: '删除图谱关系',
+      message: `将删除“${selectedEdge.source}”到“${selectedEdge.target}”的关系。`,
+      confirmLabel: '删除关系',
+      tone: 'danger',
+    })
     if (!ok) return
     return runAction(async () => {
       await deleteGraphRelation({
@@ -414,14 +439,14 @@ export default function GraphPage({ workspace }: Props) {
   const mergeEntities = () => runAction(async () => {
     await mergeGraphEntities({
       workspace,
-      source_entities: mergeDraft.sources.split(',').map((item) => item.trim()).filter(Boolean),
+      source_entities: mergeDraft.sources,
       target_entity: mergeDraft.target,
       target_entity_data: {
         description: mergeDraft.description,
         entity_type: mergeDraft.type,
       },
     })
-    setMergeDraft({ sources: '', target: '', description: '', type: '' })
+    setMergeDraft({ sources: [], target: '', description: '', type: '' })
   }, '实体已合并')
 
   const generateSuggestions = async () => {
@@ -445,10 +470,14 @@ export default function GraphPage({ workspace }: Props) {
     }
   }
 
-  const applySelectedSuggestions = () => {
+  const applySelectedSuggestions = async () => {
     const changes = suggestions.filter((_, idx) => selectedSuggestions.has(idx))
     if (changes.length === 0) return
-    const ok = window.confirm(`确认应用 ${changes.length} 条图谱变更？`)
+    const ok = await confirm({
+      title: '应用图谱修正',
+      message: `将对知识库“${workspace}”应用 ${changes.length} 条图谱变更。`,
+      confirmLabel: '应用变更',
+    })
     if (!ok) return
     return runAction(async () => {
       await applyGraphChanges(workspace, changes)
@@ -540,7 +569,7 @@ export default function GraphPage({ workspace }: Props) {
   )
 
   const renderRules = () => (
-    <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_360px] gap-4">
+    <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
       <div className="space-y-4">
         <div className="border border-gray-200 rounded-lg bg-white p-4">
           <div className="flex items-start justify-between gap-4">
@@ -797,7 +826,7 @@ export default function GraphPage({ workspace }: Props) {
   )
 
   const renderEntities = () => (
-    <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_380px] gap-4">
+    <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
       <div className="border border-gray-200 rounded-lg bg-white overflow-hidden">
         <div className="p-4 border-b border-gray-100">
           <input
@@ -839,19 +868,19 @@ export default function GraphPage({ workspace }: Props) {
               <input
                 value={entityEdit.name}
                 onChange={(e) => setEntityEdit({ ...entityEdit, name: e.target.value })}
-                className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm"
+                className="ui-control w-full"
                 placeholder="实体名称"
               />
               <input
                 value={entityEdit.type}
                 onChange={(e) => setEntityEdit({ ...entityEdit, type: e.target.value })}
-                className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm"
+                className="ui-control w-full"
                 placeholder="实体类型"
               />
               <textarea
                 value={entityEdit.description}
                 onChange={(e) => setEntityEdit({ ...entityEdit, description: e.target.value })}
-                className="w-full min-h-32 rounded-lg border border-gray-200 px-3 py-2 text-sm"
+                className="ui-textarea min-h-32 w-full"
                 placeholder="实体描述"
               />
               <div className="flex gap-2">
@@ -871,10 +900,12 @@ export default function GraphPage({ workspace }: Props) {
         <div className="border border-gray-200 rounded-lg bg-white p-4">
           <h3 className="text-sm font-semibold text-gray-800">新增实体</h3>
           <div className="mt-3 space-y-3">
-            <input value={entityCreate.name} onChange={(e) => setEntityCreate({ ...entityCreate, name: e.target.value })} className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm" placeholder="实体名称" />
-            <input value={entityCreate.type} onChange={(e) => setEntityCreate({ ...entityCreate, type: e.target.value })} className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm" placeholder="实体类型" />
-            <textarea value={entityCreate.description} onChange={(e) => setEntityCreate({ ...entityCreate, description: e.target.value })} className="w-full min-h-24 rounded-lg border border-gray-200 px-3 py-2 text-sm" placeholder="实体描述" />
-            <button onClick={addEntity} disabled={!entityCreate.name.trim()} className="px-3 py-2 rounded-lg bg-gray-900 text-white text-sm disabled:bg-gray-300">
+            <div className="grid grid-cols-[minmax(0,1fr)_130px] gap-3">
+              <input value={entityCreate.name} onChange={(e) => setEntityCreate({ ...entityCreate, name: e.target.value })} className="ui-control w-full" placeholder="实体名称" />
+              <input value={entityCreate.type} onChange={(e) => setEntityCreate({ ...entityCreate, type: e.target.value })} className="ui-control w-full" placeholder="实体类型" />
+            </div>
+            <textarea value={entityCreate.description} onChange={(e) => setEntityCreate({ ...entityCreate, description: e.target.value })} className="ui-textarea min-h-24 w-full" placeholder="实体描述" />
+            <button onClick={addEntity} disabled={!entityCreate.name.trim()} className="ui-button-primary">
               新增实体
             </button>
           </div>
@@ -883,11 +914,30 @@ export default function GraphPage({ workspace }: Props) {
         <div className="border border-gray-200 rounded-lg bg-white p-4">
           <h3 className="text-sm font-semibold text-gray-800">合并实体</h3>
           <div className="mt-3 space-y-3">
-            <input value={mergeDraft.sources} onChange={(e) => setMergeDraft({ ...mergeDraft, sources: e.target.value })} className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm" placeholder="源实体，英文逗号分隔" />
-            <input value={mergeDraft.target} onChange={(e) => setMergeDraft({ ...mergeDraft, target: e.target.value })} className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm" placeholder="合并目标实体" />
-            <input value={mergeDraft.type} onChange={(e) => setMergeDraft({ ...mergeDraft, type: e.target.value })} className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm" placeholder="目标实体类型，可选" />
-            <textarea value={mergeDraft.description} onChange={(e) => setMergeDraft({ ...mergeDraft, description: e.target.value })} className="w-full min-h-20 rounded-lg border border-gray-200 px-3 py-2 text-sm" placeholder="目标实体描述，可选" />
-            <button onClick={mergeEntities} disabled={!mergeDraft.sources.trim() || !mergeDraft.target.trim()} className="px-3 py-2 rounded-lg bg-gray-900 text-white text-sm disabled:bg-gray-300">
+            <label className="block">
+              <span className="ui-label">被合并实体</span>
+              <EntityPicker
+                nodes={data?.nodes || []}
+                value={mergeDraft.sources}
+                onChange={(sources) => setMergeDraft({ ...mergeDraft, sources })}
+                placeholder="搜索并复选一个或多个实体"
+                multiple
+                exclude={mergeDraft.target ? [mergeDraft.target] : []}
+              />
+            </label>
+            <label className="block">
+              <span className="ui-label">保留为目标实体</span>
+              <EntityPicker
+                nodes={data?.nodes || []}
+                value={mergeDraft.target ? [mergeDraft.target] : []}
+                onChange={(target) => setMergeDraft({ ...mergeDraft, target: target[0] || '' })}
+                placeholder="搜索并选择目标实体"
+                exclude={mergeDraft.sources}
+              />
+            </label>
+            <input value={mergeDraft.type} onChange={(e) => setMergeDraft({ ...mergeDraft, type: e.target.value })} className="ui-control w-full" placeholder="目标实体类型，可选" />
+            <textarea value={mergeDraft.description} onChange={(e) => setMergeDraft({ ...mergeDraft, description: e.target.value })} className="ui-textarea min-h-20 w-full" placeholder="目标实体描述，可选" />
+            <button onClick={mergeEntities} disabled={mergeDraft.sources.length < 1 || !mergeDraft.target} className="ui-button-primary">
               合并实体
             </button>
           </div>
@@ -897,7 +947,7 @@ export default function GraphPage({ workspace }: Props) {
   )
 
   const renderRelations = () => (
-    <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_380px] gap-4">
+    <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
       <div className="border border-gray-200 rounded-lg bg-white overflow-hidden">
         <div className="p-4 border-b border-gray-100">
           <input
@@ -937,9 +987,11 @@ export default function GraphPage({ workspace }: Props) {
               <div className="rounded-lg bg-gray-50 px-3 py-2 text-xs text-gray-600 break-all">
                 {selectedEdge.source} - {selectedEdge.target}
               </div>
-              <textarea value={relationEdit.description} onChange={(e) => setRelationEdit({ ...relationEdit, description: e.target.value })} className="w-full min-h-28 rounded-lg border border-gray-200 px-3 py-2 text-sm" placeholder="关系描述" />
-              <input value={relationEdit.keywords} onChange={(e) => setRelationEdit({ ...relationEdit, keywords: e.target.value })} className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm" placeholder="关键词" />
-              <input type="number" step="0.1" value={relationEdit.weight} onChange={(e) => setRelationEdit({ ...relationEdit, weight: Number(e.target.value) })} className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm" placeholder="权重" />
+              <textarea value={relationEdit.description} onChange={(e) => setRelationEdit({ ...relationEdit, description: e.target.value })} className="ui-textarea min-h-28 w-full" placeholder="关系描述" />
+              <div className="grid grid-cols-[minmax(0,1fr)_96px] gap-3">
+                <input value={relationEdit.keywords} onChange={(e) => setRelationEdit({ ...relationEdit, keywords: e.target.value })} className="ui-control w-full" placeholder="关键词" />
+                <input type="number" step="0.1" value={relationEdit.weight} onChange={(e) => setRelationEdit({ ...relationEdit, weight: Number(e.target.value) })} className="ui-control w-full px-2 text-right" aria-label="关系权重" />
+              </div>
               <div className="flex gap-2">
                 <button onClick={saveRelation} className="px-3 py-2 rounded-lg bg-gray-900 text-white text-sm">保存</button>
                 <button onClick={removeRelation} className="px-3 py-2 rounded-lg border border-red-200 text-red-600 text-sm">删除</button>
@@ -953,12 +1005,32 @@ export default function GraphPage({ workspace }: Props) {
         <div className="border border-gray-200 rounded-lg bg-white p-4">
           <h3 className="text-sm font-semibold text-gray-800">新增关系</h3>
           <div className="mt-3 space-y-3">
-            <input value={relationCreate.source} onChange={(e) => setRelationCreate({ ...relationCreate, source: e.target.value })} className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm" placeholder="起点实体" />
-            <input value={relationCreate.target} onChange={(e) => setRelationCreate({ ...relationCreate, target: e.target.value })} className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm" placeholder="终点实体" />
-            <textarea value={relationCreate.description} onChange={(e) => setRelationCreate({ ...relationCreate, description: e.target.value })} className="w-full min-h-24 rounded-lg border border-gray-200 px-3 py-2 text-sm" placeholder="关系描述" />
-            <input value={relationCreate.keywords} onChange={(e) => setRelationCreate({ ...relationCreate, keywords: e.target.value })} className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm" placeholder="关键词" />
-            <input type="number" step="0.1" value={relationCreate.weight} onChange={(e) => setRelationCreate({ ...relationCreate, weight: Number(e.target.value) })} className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm" placeholder="权重" />
-            <button onClick={addRelation} disabled={!relationCreate.source.trim() || !relationCreate.target.trim()} className="px-3 py-2 rounded-lg bg-gray-900 text-white text-sm disabled:bg-gray-300">
+            <label className="block">
+              <span className="ui-label">起点实体</span>
+              <EntityPicker
+                nodes={data?.nodes || []}
+                value={relationCreate.source ? [relationCreate.source] : []}
+                onChange={(source) => setRelationCreate({ ...relationCreate, source: source[0] || '' })}
+                placeholder="搜索并选择起点实体"
+                exclude={relationCreate.target ? [relationCreate.target] : []}
+              />
+            </label>
+            <label className="block">
+              <span className="ui-label">终点实体</span>
+              <EntityPicker
+                nodes={data?.nodes || []}
+                value={relationCreate.target ? [relationCreate.target] : []}
+                onChange={(target) => setRelationCreate({ ...relationCreate, target: target[0] || '' })}
+                placeholder="搜索并选择终点实体"
+                exclude={relationCreate.source ? [relationCreate.source] : []}
+              />
+            </label>
+            <textarea value={relationCreate.description} onChange={(e) => setRelationCreate({ ...relationCreate, description: e.target.value })} className="ui-textarea min-h-24 w-full" placeholder="关系描述" />
+            <div className="grid grid-cols-[minmax(0,1fr)_96px] gap-3">
+              <input value={relationCreate.keywords} onChange={(e) => setRelationCreate({ ...relationCreate, keywords: e.target.value })} className="ui-control w-full" placeholder="关键词" />
+              <input type="number" step="0.1" value={relationCreate.weight} onChange={(e) => setRelationCreate({ ...relationCreate, weight: Number(e.target.value) })} className="ui-control w-full px-2 text-right" aria-label="关系权重" />
+            </div>
+            <button onClick={addRelation} disabled={!relationCreate.source || !relationCreate.target} className="ui-button-primary">
               新增关系
             </button>
           </div>
@@ -1048,7 +1120,7 @@ export default function GraphPage({ workspace }: Props) {
         <div>
           <h2 className="text-xl font-bold text-gray-800">知识图谱</h2>
           <p className="text-sm text-gray-500 mt-1">
-            图谱浏览、抽取规则、参考资料和实体关系审校。当前知识库: {workspace}
+            图谱浏览、抽取规则、参考资料和实体关系审校。
           </p>
         </div>
         <div className="flex items-center gap-2">

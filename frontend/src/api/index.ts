@@ -80,6 +80,28 @@ export interface RecallTestResponse {
   metadata: Record<string, unknown>
 }
 
+export interface TextRecallHit {
+  chunk_id: string
+  file_path: string
+  content: string
+  vector_score: number
+  vector_rank: number
+  rerank_score?: number | null
+  rerank_rank?: number | null
+}
+
+export interface TextRecallResponse {
+  query: string
+  workspace: string
+  top_k: number
+  cosine_threshold: number
+  rerank_requested: boolean
+  rerank_applied: boolean
+  rerank_warning: string
+  vector_hits: TextRecallHit[]
+  rerank_hits: TextRecallHit[]
+}
+
 export interface ModelConfig {
   workspace: string
   embed_model: string
@@ -91,7 +113,18 @@ export interface ModelConfig {
   chat_max_tokens: number
   frequency_penalty: number
   presence_penalty: number
+  answer_prompt_template_id: string
   answer_system_prompt: string
+}
+
+export interface PromptTemplate {
+  id: string
+  name: string
+  description: string
+  content: string
+  built_in: boolean
+  created_at: string
+  updated_at: string
 }
 
 export interface DocInfo {
@@ -351,6 +384,18 @@ export function recallTest(params: {
   })
 }
 
+export function textRecallTest(params: {
+  workspace?: string
+  query: string
+  top_k: number
+  enable_rerank: boolean
+}) {
+  return request<TextRecallResponse>('/recall/text', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  })
+}
+
 export function search(params: {
   workspace?: string
   query: string
@@ -384,6 +429,33 @@ export function updateModelConfig(config: ModelConfig, workspace = 'tdx_default'
     body: JSON.stringify(config),
     },
   )
+}
+
+export function listPromptTemplates() {
+  return request<PromptTemplate[]>('/prompt-templates')
+}
+
+export function createPromptTemplate(template: Pick<PromptTemplate, 'name' | 'description' | 'content'>) {
+  return request<PromptTemplate>('/prompt-templates', {
+    method: 'POST',
+    body: JSON.stringify(template),
+  })
+}
+
+export function updatePromptTemplate(
+  id: string,
+  template: Pick<PromptTemplate, 'name' | 'description' | 'content'>,
+) {
+  return request<PromptTemplate>(`/prompt-templates/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(template),
+  })
+}
+
+export function deletePromptTemplate(id: string) {
+  return request<{ status: string }>(`/prompt-templates/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  })
 }
 
 export function testEmbed(text: string) {
@@ -855,6 +927,20 @@ export interface ChatMessage {
   evidence?: EvidenceChain
 }
 
+export interface ChatSettings {
+  answer_profile_id: string
+  answer_model: string
+  temperature: number
+  top_p: number
+  max_tokens: number
+  frequency_penalty: number
+  presence_penalty: number
+  mode: string
+  top_k: number
+  chunk_top_k: number
+  enable_rerank: boolean
+}
+
 export interface Citation {
   index: number
   doc_name: string
@@ -864,6 +950,7 @@ export interface Citation {
 
 export interface ChatSendResponse {
   session_id: string
+  title: string
   user_message: ChatMessage
   assistant_message: ChatMessage
   citations: Citation[]
@@ -874,6 +961,7 @@ export interface ChatSession {
   id: string
   workspace: string
   title: string
+  settings: ChatSettings
   messages: ChatMessage[]
   created_at: string
   updated_at: string
@@ -896,6 +984,7 @@ export function chatSend(params: {
   top_k?: number
   chunk_top_k?: number
   enable_rerank?: boolean
+  settings?: ChatSettings
 }) {
   return request<ChatSendResponse>('/chat/send', {
     method: 'POST',
@@ -912,6 +1001,7 @@ export function chatSendStream(params: {
   top_k?: number
   chunk_top_k?: number
   enable_rerank?: boolean
+  settings?: ChatSettings
 }): Promise<Response> {
   return fetch(`${BASE}/chat/send/stream`, {
     method: 'POST',
@@ -939,9 +1029,23 @@ export function deleteChatSession(sessionId: string, workspace = 'tdx_default') 
   )
 }
 
-export function createChatSession(workspace = 'tdx_default') {
+export function updateChatSessionSettings(
+  sessionId: string,
+  settings: ChatSettings,
+  workspace = 'tdx_default',
+) {
+  return request<ChatSettings>(
+    `/chat/sessions/${encodeURIComponent(sessionId)}/settings?workspace=${encodeURIComponent(workspace)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(settings),
+    },
+  )
+}
+
+export function createChatSession(workspace = 'tdx_default', settings?: ChatSettings) {
   return request<ChatSessionListItem>('/chat/sessions', {
     method: 'POST',
-    body: JSON.stringify({ workspace }),
+    body: JSON.stringify({ workspace, settings }),
   })
 }

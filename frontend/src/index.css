@@ -2,12 +2,97 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  color: #172033;
+  background: #ffffff;
+  --ui-border: #e2e6ec;
+  --ui-border-strong: #cfd5dd;
+  --ui-surface: #ffffff;
+  --ui-surface-subtle: #f7f8fa;
+  --ui-text-muted: #697386;
+  --ui-radius: 8px;
+  --ui-shadow: 0 8px 28px rgba(23, 32, 51, 0.08);
+}
+
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
     'Helvetica Neue', Arial, 'Noto Sans SC', sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  color: #172033;
+  background: #ffffff;
+}
+
+button,
+input,
+select,
+textarea {
+  letter-spacing: 0;
+}
+
+@layer components {
+  .ui-panel {
+    @apply border border-gray-200 bg-white p-5;
+    border-radius: var(--ui-radius);
+  }
+
+  .ui-control {
+    @apply h-9 border border-gray-300 bg-white px-3 text-sm text-gray-800 outline-none transition;
+    border-radius: 6px;
+  }
+
+  .ui-control:hover {
+    border-color: var(--ui-border-strong);
+  }
+
+  .ui-control:focus {
+    @apply border-primary-500 ring-2 ring-primary-100;
+  }
+
+  .ui-textarea {
+    @apply border border-gray-300 bg-white px-3 py-2 text-sm leading-relaxed text-gray-800 outline-none transition;
+    border-radius: 6px;
+    resize: vertical;
+  }
+
+  .ui-textarea:hover {
+    border-color: var(--ui-border-strong);
+  }
+
+  .ui-textarea:focus {
+    @apply border-primary-500 ring-2 ring-primary-100;
+  }
+
+  .ui-form-grid {
+    @apply grid grid-cols-1 gap-4 md:grid-cols-2;
+  }
+
+  .ui-label {
+    @apply mb-1.5 block text-xs font-medium text-gray-600;
+  }
+
+  .ui-range {
+    @apply h-1.5 cursor-pointer appearance-none rounded-full bg-gray-200 accent-primary-600;
+  }
+
+  .ui-icon-button {
+    @apply grid h-8 w-8 shrink-0 place-items-center text-gray-500 transition hover:bg-gray-100 hover:text-gray-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-300;
+    border-radius: 6px;
+  }
+
+  .ui-button {
+    @apply inline-flex h-9 items-center justify-center gap-2 px-3 text-sm font-medium transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-300 disabled:cursor-not-allowed disabled:opacity-50;
+    border-radius: 6px;
+  }
+
+  .ui-button-primary {
+    @apply ui-button bg-gray-900 text-white hover:bg-gray-700;
+  }
+
+  .ui-button-secondary {
+    @apply ui-button border border-gray-300 bg-white text-gray-700 hover:bg-gray-50;
+  }
 }
 
 /* Custom scrollbar */

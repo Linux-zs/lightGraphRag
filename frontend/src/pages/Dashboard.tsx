@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { FileText, GitBranch, Layers3, Network } from 'lucide-react'
+import { useConfirm } from '../components/ConfirmDialog'
 import {
   clearKnowledgeBase,
   getIndexTask,
@@ -15,6 +17,7 @@ interface Props {
 }
 
 export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
+  const confirm = useConfirm()
   const [stats, setStats] = useState<SystemStats | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -112,7 +115,12 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
   }, [workspace, pollTask])
 
   const handleClear = async () => {
-    const confirmed = window.confirm('确认清空 LightRAG 索引？上传的原始文档会保留。')
+    const confirmed = await confirm({
+      title: '清空当前知识库索引',
+      message: `将清空知识库“${workspace}”的 LightRAG 索引和知识图谱，上传的原始文档会保留。`,
+      confirmLabel: '清空索引',
+      tone: 'danger',
+    })
     if (!confirmed) return
     setOperating(true)
     setOpMsg('')
@@ -131,7 +139,12 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
   }
 
   const handleRebuild = async () => {
-    const confirmed = window.confirm('确认清空当前 LightRAG 索引，并从上传目录重新索引全部文档？')
+    const confirmed = await confirm({
+      title: '重建当前知识库索引',
+      message: `将先清空知识库“${workspace}”的现有索引，再从该知识库的上传目录重新索引全部文档。`,
+      confirmLabel: '开始重建',
+      tone: 'danger',
+    })
     if (!confirmed) return
     setOperating(true)
     setOpMsg('')
@@ -165,7 +178,7 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
 
   if (error) {
     return (
-      <div className="p-6 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700">
+      <div className="rounded-lg border border-red-200 bg-red-50 p-6 text-sm text-red-700">
         加载失败: {error}
         <button onClick={loadStats} className="ml-3 underline">重试</button>
       </div>
@@ -175,34 +188,36 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
   if (!stats) return null
 
   const cards = [
-    { label: '文档总数', value: stats.doc_count, shape: 'rounded-[3px]', color: 'bg-blue-50 border-blue-200 text-blue-800' },
-    { label: 'Chunk 总数', value: stats.chunk_count, shape: 'rounded-full', color: 'bg-green-50 border-green-200 text-green-800' },
-    { label: '图谱节点', value: stats.graph_nodes, shape: 'rotate-45 rounded-[2px]', color: 'bg-purple-50 border-purple-200 text-purple-800' },
-    { label: '图谱关系', value: stats.graph_edges, shape: 'rounded-none', color: 'bg-orange-50 border-orange-200 text-orange-800' },
+    { label: '文档总数', value: stats.doc_count, icon: FileText, tone: 'bg-blue-50 text-blue-700' },
+    { label: 'Chunk 总数', value: stats.chunk_count, icon: Layers3, tone: 'bg-emerald-50 text-emerald-700' },
+    { label: '图谱节点', value: stats.graph_nodes, icon: Network, tone: 'bg-violet-50 text-violet-700' },
+    { label: '图谱关系', value: stats.graph_edges, icon: GitBranch, tone: 'bg-amber-50 text-amber-700' },
   ]
 
   return (
     <div className="space-y-8">
       <div>
         <h2 className="text-xl font-bold text-gray-800">系统状态</h2>
-        <p className="text-sm text-gray-500 mt-1">知识库运行状态与统计概览。当前知识库: {workspace}</p>
+        <p className="text-sm text-gray-500 mt-1">知识库运行状态与统计概览。</p>
       </div>
 
       {/* Stats cards */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         {cards.map((card) => (
-          <div key={card.label} className={`rounded-xl border p-5 ${card.color}`}>
+          <div key={card.label} className="rounded-lg border border-gray-200 bg-white p-5">
             <div className="flex items-center justify-between">
-              <span className={`inline-block h-5 w-5 border-2 border-current ${card.shape}`} />
-              <span className="text-3xl font-bold">{card.value.toLocaleString()}</span>
+              <span className={`grid h-9 w-9 place-items-center rounded-md ${card.tone}`}>
+                <card.icon size={18} strokeWidth={1.8} />
+              </span>
+              <span className="text-3xl font-semibold tabular-nums text-gray-900">{card.value.toLocaleString()}</span>
             </div>
-            <p className="text-sm font-medium mt-3 opacity-70">{card.label}</p>
+            <p className="mt-3 text-sm font-medium text-gray-500">{card.label}</p>
           </div>
         ))}
       </div>
 
       {/* Config info */}
-      <div className="bg-white border border-gray-200 rounded-xl p-6">
+      <div className="rounded-lg border border-gray-200 bg-white p-6">
         <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide mb-4">
           配置信息
         </h3>
@@ -226,7 +241,7 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
         </dl>
       </div>
 
-      <div className="bg-white border border-gray-200 rounded-xl p-6">
+      <div className="rounded-lg border border-gray-200 bg-white p-6">
         <div className="flex items-start justify-between gap-4">
           <div>
             <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide">

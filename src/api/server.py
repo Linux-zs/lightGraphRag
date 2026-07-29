@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import filecmp
 import hmac
 import ipaddress
 import json
@@ -55,6 +56,19 @@ from src.model_profiles import (
 
 @asynccontextmanager
 async def _app_lifespan(_: FastAPI):
+    migration = _migrate_legacy_source_layout()
+    if migration["migrated"] or migration["unassigned"]:
+        logger.info(
+            "Legacy source migration completed: migrated={}, unassigned={}",
+            migration["migrated"],
+            migration["unassigned"],
+        )
+    renamed_sessions = _backfill_legacy_session_titles()
+    if renamed_sessions:
+        logger.info("Backfilled {} legacy chat session titles", renamed_sessions)
+    repaired_answers = _repair_degenerate_session_answers()
+    if repaired_answers:
+        logger.info("Repaired {} degenerate assistant answers", repaired_answers)
     await _resume_persisted_index_tasks()
     yield
 
@@ -105,7 +119,23 @@ WORKSPACE_SETTINGS_DIR = Path(
     os.environ.get("TDX_WORKSPACE_SETTINGS_DIR", "data/workspace_settings")
 )
 WORKSPACE_SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+PROMPT_TEMPLATES_PATH = Path(
+    os.environ.get("TDX_PROMPT_TEMPLATES_PATH", "data/prompt_templates.json")
+)
 INDEX_TASKS_DIR = Path(os.environ.get("TDX_INDEX_TASKS_DIR", "data/index_tasks"))
+LOG_DIR = Path(os.environ.get("TDX_LOG_DIR", "data/logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+APP_LOG_PATH = LOG_DIR / "app.log"
+logger.add(
+    APP_LOG_PATH,
+    level="INFO",
+    rotation="10 MB",
+    retention="14 days",
+    encoding="utf-8",
+    enqueue=True,
+    backtrace=False,
+    diagnose=False,
+)
 
 SESSIONS_DIR = Path("data/sessions")
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -225,6 +255,126 @@ def _remove_workspace_sources(workspace: str) -> int:
     return removed_files
 
 
+def _move_legacy_unassigned(source: Path, root: Path) -> Path:
+    """Preserve an unowned legacy file outside the active workspace layout."""
+    target_dir = root / "_legacy_unassigned"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / source.name
+    if target.exists():
+        target = target_dir / f"{source.stem}-{uuid.uuid4().hex[:8]}{source.suffix}"
+    shutil.move(str(source), str(target))
+    return target
+
+
+def _migrate_legacy_source_layout() -> dict[str, int]:
+    """Move flat legacy sources into workspace-owned directories.
+
+    A legacy file can be referenced by more than one workspace manifest. In
+    that case it is copied into every owner before the root copy is removed.
+    Files that cannot be assigned safely are preserved under
+    ``_legacy_unassigned`` instead of being deleted.
+    """
+    upload_root = UPLOAD_DIR.resolve()
+    raw_root = RAW_TEXT_DIR.resolve()
+    legacy_uploads = {
+        path.name: path
+        for path in upload_root.iterdir()
+        if path.is_file()
+    }
+    legacy_raw_text = {
+        path.name: path
+        for path in raw_root.iterdir()
+        if path.is_file()
+    }
+    upload_owners: dict[str, set[str]] = {}
+    raw_owners: dict[str, set[str]] = {}
+    migrated = 0
+
+    for workspace in _discover_workspaces():
+        service = get_lightrag_service(workspace)
+        manifest = service._load_manifest()
+        changed = False
+        for doc_id, item in manifest.get("documents", {}).items():
+            if not isinstance(item, dict):
+                continue
+            doc_name = str(item.get("doc_name") or "").strip()
+            if not doc_name:
+                continue
+
+            source = legacy_uploads.get(doc_name)
+            target = _resolve_upload_path(doc_name, workspace, create_dir=True)
+            if source is not None:
+                upload_owners.setdefault(doc_name, set()).add(workspace)
+                if not target.exists():
+                    shutil.copy2(source, target)
+                    if not filecmp.cmp(source, target, shallow=False):
+                        target.unlink(missing_ok=True)
+                        raise RuntimeError(
+                            f"Legacy upload verification failed: {source} -> {target}"
+                        )
+                    migrated += 1
+            if target.exists() and item.get("file_path") != str(target):
+                item["file_path"] = str(target)
+                changed = True
+
+            raw_name = f"{doc_id}.txt"
+            raw_source = legacy_raw_text.get(raw_name)
+            raw_target = _resolve_raw_text_path(workspace, doc_id, create_dir=True)
+            if raw_source is not None:
+                raw_owners.setdefault(raw_name, set()).add(workspace)
+                if not raw_target.exists():
+                    shutil.copy2(raw_source, raw_target)
+                    if not filecmp.cmp(raw_source, raw_target, shallow=False):
+                        raw_target.unlink(missing_ok=True)
+                        raise RuntimeError(
+                            f"Legacy raw-text verification failed: {raw_source} -> {raw_target}"
+                        )
+                    migrated += 1
+            if raw_target.exists() and item.get("raw_text_path") != str(raw_target):
+                item["raw_text_path"] = str(raw_target)
+                changed = True
+
+        if changed:
+            service._save_manifest(manifest)
+
+    unassigned = 0
+    for name, source in legacy_uploads.items():
+        owners = upload_owners.get(name, set())
+        copied_to_all = bool(owners) and all(
+            _resolve_upload_path(name, workspace).is_file()
+            and filecmp.cmp(
+                source,
+                _resolve_upload_path(name, workspace),
+                shallow=False,
+            )
+            for workspace in owners
+        )
+        if copied_to_all:
+            source.unlink()
+        else:
+            _move_legacy_unassigned(source, upload_root)
+            unassigned += 1
+
+    for name, source in legacy_raw_text.items():
+        owners = raw_owners.get(name, set())
+        copied_to_all = bool(owners) and all(
+            _resolve_raw_text_path(workspace, name[:-4]).is_file()
+            and filecmp.cmp(
+                source,
+                _resolve_raw_text_path(workspace, name[:-4]),
+                shallow=False,
+            )
+            for workspace in owners
+        )
+        if copied_to_all:
+            source.unlink()
+        else:
+            _move_legacy_unassigned(source, raw_root)
+            unassigned += 1
+
+    return {"migrated": migrated, "unassigned": unassigned}
+
+
 def _session_path(session_id: str) -> Path:
     """Return the JSON path for a server-generated session id."""
     value = str(session_id or "").strip().lower()
@@ -242,8 +392,55 @@ DEFAULT_ANSWER_SYSTEM_PROMPT = (
     "不要输出 References/引用文档列表，不要输出 assistant/user 角色名，"
     "不要复述大段原始脚本，不要输出孤立的编号或字母。"
     "引用资料时在相关句子末尾使用 [数字] 标记，数字必须来自参考资料编号。"
+    "禁止把引用编号写成裸数字，禁止输出无意义的连续数字、字母或占位字符。"
 )
+DEFAULT_PROMPT_TEMPLATE_ID = "recommended"
 _LEGACY_TDX_PROMPT_PREFIX = "你是通达信系统技术支持知识库助手"
+
+
+def _built_in_prompt_templates() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": DEFAULT_PROMPT_TEMPLATE_ID,
+            "name": "严谨知识库问答",
+            "description": "综合参考资料组织答案，资料不足时明确拒答。",
+            "content": DEFAULT_ANSWER_SYSTEM_PROMPT,
+            "built_in": True,
+            "created_at": "",
+            "updated_at": "",
+        }
+    ]
+
+
+def _load_prompt_templates() -> list[dict[str, Any]]:
+    custom: list[dict[str, Any]] = []
+    if PROMPT_TEMPLATES_PATH.exists():
+        try:
+            data = json.loads(PROMPT_TEMPLATES_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                custom = [
+                    {**item, "built_in": False}
+                    for item in data
+                    if isinstance(item, dict)
+                    and str(item.get("id") or "").startswith("prompt_")
+                    and str(item.get("name") or "").strip()
+                    and str(item.get("content") or "").strip()
+                ]
+        except Exception:
+            logger.exception("Failed to read prompt templates")
+    return _built_in_prompt_templates() + custom
+
+
+def _save_custom_prompt_templates(templates: list[dict[str, Any]]) -> None:
+    custom = [
+        {**item, "built_in": False}
+        for item in templates
+        if not item.get("built_in") and str(item.get("id") or "").startswith("prompt_")
+    ]
+    _atomic_write_text(
+        PROMPT_TEMPLATES_PATH,
+        json.dumps(custom, ensure_ascii=False, indent=2),
+    )
 
 
 def _workspace_settings_path(workspace: str) -> Path:
@@ -262,7 +459,11 @@ def _load_workspace_settings(workspace: str) -> dict[str, Any]:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                return {"workspace": workspace, **data}
+                return {
+                    "answer_prompt_template_id": DEFAULT_PROMPT_TEMPLATE_ID,
+                    "workspace": workspace,
+                    **data,
+                }
         except Exception:
             logger.exception("Failed to read workspace settings for {}", workspace)
 
@@ -276,7 +477,11 @@ def _load_workspace_settings(workspace: str) -> dict[str, Any]:
         ).strip()
         if configured and not configured.startswith(_LEGACY_TDX_PROMPT_PREFIX):
             prompt = configured
-    return {"workspace": workspace, "answer_system_prompt": prompt}
+    return {
+        "workspace": workspace,
+        "answer_prompt_template_id": DEFAULT_PROMPT_TEMPLATE_ID,
+        "answer_system_prompt": prompt,
+    }
 
 
 def _save_workspace_settings(workspace: str, settings: dict[str, Any]) -> dict[str, Any]:
@@ -284,6 +489,11 @@ def _save_workspace_settings(workspace: str, settings: dict[str, Any]) -> dict[s
     current = _load_workspace_settings(workspace)
     prompt = str(settings.get("answer_system_prompt") or "").strip()
     current["answer_system_prompt"] = prompt or DEFAULT_ANSWER_SYSTEM_PROMPT
+    current["answer_prompt_template_id"] = str(
+        settings.get("answer_prompt_template_id")
+        or current.get("answer_prompt_template_id")
+        or DEFAULT_PROMPT_TEMPLATE_ID
+    ).strip()
     current["workspace"] = workspace
     current["updated_at"] = _task_now()
     path = _workspace_settings_path(workspace)
@@ -335,6 +545,36 @@ class RecallTestResponse(BaseModel):
     references: list[dict[str, Any]] = []
     metadata: dict[str, Any] = {}
 
+
+class TextRecallRequest(BaseModel):
+    workspace: str = DEFAULT_WORKSPACE
+    query: str
+    top_k: int = Field(default=20, ge=1, le=100)
+    enable_rerank: bool = True
+
+
+class TextRecallHit(BaseModel):
+    chunk_id: str = ""
+    file_path: str = ""
+    content: str = ""
+    vector_score: float = 0.0
+    vector_rank: int
+    rerank_score: Optional[float] = None
+    rerank_rank: Optional[int] = None
+
+
+class TextRecallResponse(BaseModel):
+    query: str
+    workspace: str
+    top_k: int
+    cosine_threshold: float
+    rerank_requested: bool
+    rerank_applied: bool
+    rerank_warning: str = ""
+    vector_hits: list[TextRecallHit] = []
+    rerank_hits: list[TextRecallHit] = []
+
+
 class ModelConfig(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
     embed_model: str = "BAAI/bge-large-zh-v1.5"
@@ -346,7 +586,14 @@ class ModelConfig(BaseModel):
     chat_max_tokens: int = Field(default=4096, ge=64, le=32768)
     frequency_penalty: float = Field(default=0.3, ge=-2, le=2)
     presence_penalty: float = Field(default=0.2, ge=-2, le=2)
+    answer_prompt_template_id: str = DEFAULT_PROMPT_TEMPLATE_ID
     answer_system_prompt: str = DEFAULT_ANSWER_SYSTEM_PROMPT
+
+
+class PromptTemplateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    description: str = Field(default="", max_length=240)
+    content: str = Field(min_length=1, max_length=20000)
 
 class EmbedTestRequest(BaseModel):
     text: str
@@ -390,6 +637,21 @@ class ChatMessage(BaseModel):
     citations: list["Citation"] = []
     evidence: Optional["EvidenceChain"] = None
 
+
+class ChatSettings(BaseModel):
+    answer_profile_id: str = ""
+    answer_model: str = ""
+    temperature: float = Field(default=0.7, ge=0, le=2)
+    top_p: float = Field(default=0.9, ge=0, le=1)
+    max_tokens: int = Field(default=4096, ge=64, le=32768)
+    frequency_penalty: float = Field(default=0.3, ge=-2, le=2)
+    presence_penalty: float = Field(default=0.2, ge=-2, le=2)
+    mode: str = Field(default="mix", pattern=r"^(mix|hybrid|local|global|naive)$")
+    top_k: int = Field(default=40, ge=1, le=100)
+    chunk_top_k: int = Field(default=20, ge=1, le=100)
+    enable_rerank: bool = True
+
+
 class ChatSendRequest(BaseModel):
     session_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{12}$")
     workspace: str = DEFAULT_WORKSPACE
@@ -398,6 +660,7 @@ class ChatSendRequest(BaseModel):
     top_k: int = 40
     chunk_top_k: int = 20
     enable_rerank: bool = True
+    settings: Optional[ChatSettings] = None
 
 class Citation(BaseModel):
     index: int
@@ -541,6 +804,7 @@ class GraphApplyChangesRequest(BaseModel):
 
 class ChatSendResponse(BaseModel):
     session_id: str
+    title: str = ""
     user_message: ChatMessage
     assistant_message: ChatMessage
     citations: list[Citation] = []
@@ -550,6 +814,7 @@ class ChatSession(BaseModel):
     id: str
     workspace: str = DEFAULT_WORKSPACE
     title: str
+    settings: ChatSettings
     messages: list[ChatMessage]
     created_at: str
     updated_at: str
@@ -585,6 +850,138 @@ def _save_session(session_id: str, data: dict) -> None:
     """Save a session dict to disk."""
     path = _session_path(session_id)
     _atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _backfill_legacy_session_titles() -> int:
+    """Give existing untitled sessions a deterministic title from the first turn."""
+    renamed = 0
+    for path in SESSIONS_DIR.glob("*.json"):
+        if not _SESSION_ID_RE.fullmatch(path.stem.lower()):
+            continue
+        session = _load_session(path.stem)
+        if not session or str(session.get("title") or "").strip() not in {"", "新对话"}:
+            continue
+        first_question = next(
+            (
+                str(message.get("content") or "")
+                for message in session.get("messages", [])
+                if isinstance(message, dict) and message.get("role") == "user"
+            ),
+            "",
+        )
+        if not first_question:
+            continue
+        session["title"] = _fallback_session_title(first_question)
+        _save_session(path.stem, session)
+        renamed += 1
+    return renamed
+
+
+def _repair_degenerate_session_answers() -> int:
+    """Replace previously persisted model-noise answers with citation-backed text."""
+    repaired = 0
+    for path in SESSIONS_DIR.glob("*.json"):
+        if not _SESSION_ID_RE.fullmatch(path.stem.lower()):
+            continue
+        session = _load_session(path.stem)
+        if not session:
+            continue
+        changed = False
+        last_question = ""
+        for message in session.get("messages", []):
+            if message.get("role") == "user":
+                last_question = str(message.get("content") or "")
+                continue
+            if message.get("role") != "assistant":
+                continue
+            content = str(message.get("content") or "")
+            if _is_bad_generated_answer(content):
+                salvaged, remaining = _salvage_generated_answer(content)
+                message["content"] = (
+                    salvaged
+                    if salvaged and not remaining
+                    else _fallback_answer_from_citations(
+                        last_question,
+                        message.get("citations") or [],
+                    )
+                )
+                repaired += 1
+                changed = True
+        if changed:
+            _save_session(path.stem, session)
+    return repaired
+
+
+def _default_chat_settings() -> ChatSettings:
+    runtime = get_runtime_model_config(get_config())["chat"]
+    binding = get_bindings(get_config()).get("chat", {})
+    return ChatSettings(
+        answer_profile_id=str(binding.get("profile_id") or ""),
+        answer_model=str(runtime.get("model") or ""),
+        temperature=float(runtime.get("temperature", 0.7)),
+        top_p=float(runtime.get("top_p", 0.9)),
+        max_tokens=int(runtime.get("max_tokens", 4096)),
+        frequency_penalty=float(runtime.get("frequency_penalty", 0.3)),
+        presence_penalty=float(runtime.get("presence_penalty", 0.2)),
+    )
+
+
+def _session_chat_settings(session: dict[str, Any]) -> ChatSettings:
+    defaults = _default_chat_settings().model_dump()
+    stored = session.get("settings")
+    if isinstance(stored, dict):
+        defaults.update(stored)
+    settings = ChatSettings(**defaults)
+    if not settings.answer_profile_id or not settings.answer_model:
+        fallback = _default_chat_settings()
+        settings.answer_profile_id = settings.answer_profile_id or fallback.answer_profile_id
+        settings.answer_model = settings.answer_model or fallback.answer_model
+    return settings
+
+
+def _request_chat_settings(req: ChatSendRequest, session: dict[str, Any]) -> ChatSettings:
+    if req.settings is not None:
+        payload = req.settings.model_dump()
+    else:
+        payload = _session_chat_settings(session).model_dump()
+        compatibility_fields = {
+            "mode": req.mode,
+            "top_k": req.top_k,
+            "chunk_top_k": req.chunk_top_k,
+            "enable_rerank": req.enable_rerank,
+        }
+        for key, value in compatibility_fields.items():
+            if key in req.model_fields_set:
+                payload[key] = value
+
+    defaults = _default_chat_settings()
+    payload["answer_profile_id"] = (
+        str(payload.get("answer_profile_id") or "").strip()
+        or defaults.answer_profile_id
+    )
+    payload["answer_model"] = (
+        str(payload.get("answer_model") or "").strip()
+        or defaults.answer_model
+    )
+    settings = ChatSettings(**payload)
+    try:
+        get_profile_with_key(settings.answer_profile_id, get_config())
+    except KeyError as exc:
+        raise ValueError("Selected answer model connection no longer exists") from exc
+    return settings
+
+
+def _answer_runtime(settings: ChatSettings) -> dict[str, Any]:
+    try:
+        profile = get_profile_with_key(settings.answer_profile_id, get_config())
+    except KeyError as exc:
+        raise ValueError("Selected answer model connection no longer exists") from exc
+    return {
+        "base_url": profile.get("api_base", ""),
+        "api_key": profile.get("api_key", ""),
+        "model": settings.answer_model,
+        "timeout": get_config().get("siliconflow", {}).get("timeout", 90),
+    }
 
 
 # Per-session locks serializing read-modify-write of a session's JSON file so
@@ -908,28 +1305,67 @@ def _clean_excerpt_for_answer(excerpt: str, max_chars: int = 420) -> str:
     return cleaned[:max_chars].rstrip()
 
 
-def _is_bad_generated_answer(text: str) -> bool:
-    """Detect answer degeneration before it is shown or persisted."""
+def _generated_answer_quality_issues(text: str) -> list[str]:
+    """Return machine-readable reasons why generated text is unsafe to persist."""
+    issues: list[str] = []
     if not text or not text.strip():
-        return True
+        return ["empty"]
     if _is_contaminated_text(text):
-        return True
+        issues.append("contaminated")
 
     compact = re.sub(r"\s+", " ", text)
     if re.search(r"(?:^|\s)(?:[1DzZ])(?:\s+(?:[1DzZ])){12,}(?:\s|$)", compact):
-        return True
+        issues.append("repeated_noise_tokens")
+
+    numeric_noise_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and re.fullmatch(r"[0-9iIlL| ]+", line.strip())
+    ]
+    if any(len(re.sub(r"\s+", "", line)) >= 4 for line in numeric_noise_lines):
+        issues.append("numeric_noise_line")
+    elif len(numeric_noise_lines) >= 3:
+        issues.append("multiple_numeric_noise_lines")
 
     tokens = re.findall(r"\S+", text)
     isolated_noise = re.findall(r"(?<![\w])(?:D|z|Z|1)(?![\w])", text)
     if len(isolated_noise) >= 18 and len(isolated_noise) / max(len(tokens), 1) > 0.18:
-        return True
+        issues.append("isolated_noise_ratio")
 
     if len(re.findall(r"^\s*#{1,6}\s*$", text, flags=re.MULTILINE)) >= 3:
-        return True
+        issues.append("empty_markdown_headings")
     if text.count("```") % 2 == 1:
-        return True
+        issues.append("unclosed_code_fence")
 
-    return False
+    return list(dict.fromkeys(issues))
+
+
+def _is_bad_generated_answer(text: str) -> bool:
+    """Detect answer degeneration before it is shown or persisted."""
+    return bool(_generated_answer_quality_issues(text))
+
+
+def _salvage_generated_answer(text: str) -> tuple[str, list[str]]:
+    """Remove localized model noise while preserving the useful answer body."""
+    issues = _generated_answer_quality_issues(text)
+    if not issues:
+        return text, []
+
+    has_numeric_noise = any("numeric_noise" in issue for issue in issues)
+    cleaned_lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if has_numeric_noise and stripped and re.fullmatch(r"[0-9iIlL| ]+", stripped):
+            continue
+        if re.fullmatch(r"\s*#{1,6}\s*", line):
+            continue
+        cleaned_lines.append(line)
+
+    cleaned = "\n".join(cleaned_lines).strip()
+    if cleaned.count("```") % 2 == 1:
+        cleaned = f"{cleaned}\n```"
+    cleaned = _strip_lightrag_noise(_strip_citation_section(cleaned))
+    return cleaned, _generated_answer_quality_issues(cleaned)
 
 
 def _fallback_answer_from_citations(question: str, citations_data: list[dict]) -> str:
@@ -1065,12 +1501,16 @@ async def _generate_answer_text(
     citations_data: list[dict],
     history: list[dict],
     workspace: str = DEFAULT_WORKSPACE,
+    settings: ChatSettings | None = None,
 ) -> str:
     if not citations_data:
         return "未检索到相关文档，知识库上下文不足，无法基于当前资料回答。"
 
-    cfg = get_config()
-    runtime_chat = get_runtime_model_config(cfg)["chat"]
+    runtime_chat = (
+        _answer_runtime(settings)
+        if settings is not None
+        else get_runtime_model_config(get_config())["chat"]
+    )
     backend = SiliconFlowBackend(
         {
             "base_url": runtime_chat["base_url"],
@@ -1087,16 +1527,52 @@ async def _generate_answer_text(
                 history,
                 workspace,
             ),
-            temperature=float(runtime_chat.get("temperature", 0.7)),
-            top_p=float(runtime_chat.get("top_p", 0.9)),
-            max_tokens=int(runtime_chat.get("max_tokens", 4096)),
-            frequency_penalty=float(runtime_chat.get("frequency_penalty", 0.3)),
-            presence_penalty=float(runtime_chat.get("presence_penalty", 0.2)),
+            temperature=(
+                settings.temperature
+                if settings is not None
+                else float(runtime_chat.get("temperature", 0.7))
+            ),
+            top_p=(
+                settings.top_p
+                if settings is not None
+                else float(runtime_chat.get("top_p", 0.9))
+            ),
+            max_tokens=(
+                settings.max_tokens
+                if settings is not None
+                else int(runtime_chat.get("max_tokens", 4096))
+            ),
+            frequency_penalty=(
+                settings.frequency_penalty
+                if settings is not None
+                else float(runtime_chat.get("frequency_penalty", 0.3))
+            ),
+            presence_penalty=(
+                settings.presence_penalty
+                if settings is not None
+                else float(runtime_chat.get("presence_penalty", 0.2))
+            ),
         )
         ai_text = _strip_lightrag_noise(_strip_citation_section(response.content))
-        if _is_bad_generated_answer(ai_text) or not re.search(r"\[\d+\]", ai_text):
-            logger.warning("Generated answer looked degenerate; using citation fallback")
+        issues = _generated_answer_quality_issues(ai_text)
+        if issues:
+            salvaged, remaining = _salvage_generated_answer(ai_text)
+            logger.warning(
+                "answer_quality_check path=nonstream action={} issues={} remaining={} length={}",
+                "salvaged" if salvaged and not remaining else "fallback",
+                ",".join(issues),
+                ",".join(remaining) or "none",
+                len(ai_text),
+            )
+            if salvaged and not remaining:
+                return salvaged
             return _fallback_answer_from_citations(question, citations_data)
+        if not re.search(r"\[\d+\]", ai_text):
+            logger.info(
+                "answer_quality_check path=nonstream action=preserved "
+                "issues=missing_inline_citation length={}",
+                len(ai_text),
+            )
         return ai_text
     except Exception as e:
         logger.warning(f"Answer generation failed; using citation fallback: {e}")
@@ -1110,13 +1586,18 @@ async def _stream_answer_text(
     citations_data: list[dict],
     history: list[dict],
     workspace: str = DEFAULT_WORKSPACE,
+    settings: ChatSettings | None = None,
 ):
     """Yield answer tokens directly from the configured chat provider."""
     if not citations_data:
         yield "未检索到相关文档，知识库上下文不足，无法基于当前资料回答。"
         return
 
-    runtime_chat = get_runtime_model_config(get_config())["chat"]
+    runtime_chat = (
+        _answer_runtime(settings)
+        if settings is not None
+        else get_runtime_model_config(get_config())["chat"]
+    )
     backend = SiliconFlowBackend(
         {
             "base_url": runtime_chat["base_url"],
@@ -1134,11 +1615,31 @@ async def _stream_answer_text(
                 history,
                 workspace,
             ),
-            temperature=float(runtime_chat.get("temperature", 0.7)),
-            top_p=float(runtime_chat.get("top_p", 0.9)),
-            max_tokens=int(runtime_chat.get("max_tokens", 4096)),
-            frequency_penalty=float(runtime_chat.get("frequency_penalty", 0.3)),
-            presence_penalty=float(runtime_chat.get("presence_penalty", 0.2)),
+            temperature=(
+                settings.temperature
+                if settings is not None
+                else float(runtime_chat.get("temperature", 0.7))
+            ),
+            top_p=(
+                settings.top_p
+                if settings is not None
+                else float(runtime_chat.get("top_p", 0.9))
+            ),
+            max_tokens=(
+                settings.max_tokens
+                if settings is not None
+                else int(runtime_chat.get("max_tokens", 4096))
+            ),
+            frequency_penalty=(
+                settings.frequency_penalty
+                if settings is not None
+                else float(runtime_chat.get("frequency_penalty", 0.3))
+            ),
+            presence_penalty=(
+                settings.presence_penalty
+                if settings is not None
+                else float(runtime_chat.get("presence_penalty", 0.2))
+            ),
         ):
             clean_token = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", token)
             if clean_token:
@@ -1152,6 +1653,60 @@ async def _stream_answer_text(
         yield fallback
     finally:
         await backend.close()
+
+
+def _fallback_session_title(question: str) -> str:
+    title = re.sub(r"[\r\n\t]+", " ", question)
+    title = re.sub(r"\s+", " ", title).strip()
+    title = title.strip("`#*_~，。！？!?：:；;\"'“”‘’")
+    return (title[:24] + ("…" if len(title) > 24 else "")) or "新对话"
+
+
+async def _generate_session_title(
+    question: str,
+    answer: str,
+    settings: ChatSettings,
+) -> str:
+    """Generate a compact first-turn title, falling back without blocking chat."""
+    runtime_chat = _answer_runtime(settings)
+    backend = SiliconFlowBackend(
+        {
+            "base_url": runtime_chat["base_url"],
+            "api_key": runtime_chat["api_key"],
+            "chat_model": runtime_chat["model"],
+            "timeout": min(int(runtime_chat.get("timeout", 90)), 30),
+        }
+    )
+    try:
+        response = await backend.chat(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "为知识库问答会话生成一个简体中文标题。"
+                        "只输出标题，不要引号、序号或解释，长度不超过18个汉字。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"用户问题：{question[:500]}\n回答摘要：{answer[:700]}",
+                },
+            ],
+            temperature=0.2,
+            top_p=0.8,
+            max_tokens=48,
+            frequency_penalty=0,
+            presence_penalty=0,
+        )
+        title = re.sub(r"[\r\n]+", " ", response.content or "").strip()
+        title = title.strip("`#*_~，。！？!?：:；;\"'“”‘’")
+        if title:
+            return title[:24] + ("…" if len(title) > 24 else "")
+    except Exception:
+        logger.exception("Session title generation failed; using the first question")
+    finally:
+        await backend.close()
+    return _fallback_session_title(question)
 
 
 def _format_chat_citations(citations_data: list[dict]) -> list[Citation]:
@@ -2481,6 +3036,25 @@ async def recall_test(req: RecallTestRequest):
     )
 
 
+@app.post("/api/recall/text", response_model=TextRecallResponse)
+async def text_recall_test(req: TextRecallRequest):
+    """Compare LightRAG chunk-vector recall with the configured reranker."""
+    req.workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(req.workspace)
+    _ensure_embedding_compatible(req.workspace)
+    try:
+        async with _get_workspace_rag_lock(req.workspace):
+            result = await get_lightrag_service(req.workspace).text_recall(
+                req.query,
+                top_k=req.top_k,
+                enable_rerank=req.enable_rerank,
+            )
+    except Exception as exc:
+        logger.exception("LightRAG text recall test failed")
+        raise HTTPException(500, f"LightRAG text recall test failed: {exc}")
+    return TextRecallResponse(**result)
+
+
 # --- Search Endpoint (full pipeline) ---
 
 @app.post("/api/search")
@@ -2518,6 +3092,7 @@ async def get_model_config(workspace: str = Query(DEFAULT_WORKSPACE)):
     cfg = get_config()
     sf = cfg.get("siliconflow", {})
     runtime = get_runtime_model_config(cfg)
+    workspace_settings = _load_workspace_settings(workspace)
     return ModelConfig(
         workspace=workspace,
         embed_model=runtime["embedding"]["model"],
@@ -2529,7 +3104,11 @@ async def get_model_config(workspace: str = Query(DEFAULT_WORKSPACE)):
         chat_max_tokens=sf.get("chat_max_tokens", 4096),
         frequency_penalty=sf.get("frequency_penalty", 0.3),
         presence_penalty=sf.get("presence_penalty", 0.2),
-        answer_system_prompt=_load_workspace_settings(workspace).get(
+        answer_prompt_template_id=workspace_settings.get(
+            "answer_prompt_template_id",
+            DEFAULT_PROMPT_TEMPLATE_ID,
+        ),
+        answer_system_prompt=workspace_settings.get(
             "answer_system_prompt",
             DEFAULT_ANSWER_SYSTEM_PROMPT,
         ),
@@ -2566,13 +3145,72 @@ async def update_model_config(
 
     _save_workspace_settings(
         workspace,
-        {"answer_system_prompt": config.answer_system_prompt},
+        {
+            "answer_prompt_template_id": config.answer_prompt_template_id,
+            "answer_system_prompt": config.answer_system_prompt,
+        },
     )
     # Config changed: rebuild the LightRAG adapter on the next request.
     reset_config()
     reset_lightrag_service()
 
     logger.info("Model config updated and saved")
+    return {"status": "ok"}
+
+
+@app.get("/api/prompt-templates")
+async def list_prompt_templates():
+    return _load_prompt_templates()
+
+
+@app.post("/api/prompt-templates")
+async def create_prompt_template(template: PromptTemplateRequest):
+    now = _task_now()
+    item = {
+        "id": f"prompt_{uuid.uuid4().hex[:12]}",
+        "name": template.name.strip(),
+        "description": template.description.strip(),
+        "content": template.content.strip(),
+        "built_in": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+    templates = _load_prompt_templates()
+    templates.append(item)
+    _save_custom_prompt_templates(templates)
+    return item
+
+
+@app.put("/api/prompt-templates/{template_id}")
+async def update_prompt_template(template_id: str, template: PromptTemplateRequest):
+    if not template_id.startswith("prompt_"):
+        raise HTTPException(400, "Built-in prompt templates cannot be modified")
+    templates = _load_prompt_templates()
+    current = next((item for item in templates if item.get("id") == template_id), None)
+    if current is None:
+        raise HTTPException(404, "Prompt template not found")
+    current.update(
+        {
+            "name": template.name.strip(),
+            "description": template.description.strip(),
+            "content": template.content.strip(),
+            "updated_at": _task_now(),
+        }
+    )
+    _save_custom_prompt_templates(templates)
+    return current
+
+
+@app.delete("/api/prompt-templates/{template_id}")
+async def delete_prompt_template(template_id: str):
+    if not template_id.startswith("prompt_"):
+        raise HTTPException(400, "Built-in prompt templates cannot be deleted")
+    templates = _load_prompt_templates()
+    if not any(item.get("id") == template_id for item in templates):
+        raise HTTPException(404, "Prompt template not found")
+    _save_custom_prompt_templates(
+        [item for item in templates if item.get("id") != template_id]
+    )
     return {"status": "ok"}
 
 
@@ -2739,11 +3377,11 @@ def _ensure_session(
     # Create new session
     sid = uuid.uuid4().hex[:12]
     now = datetime.now(timezone.utc).isoformat()
-    title = first_message[:40] + ("..." if len(first_message) > 40 else "")
     session = {
         "id": sid,
         "workspace": workspace,
-        "title": title,
+        "title": "新对话",
+        "settings": _default_chat_settings().model_dump(),
         "messages": [],
         "created_at": now,
         "updated_at": now,
@@ -2780,16 +3418,24 @@ async def chat_send(req: ChatSendRequest):
             {"role": m["role"], "content": m["content"]}
             for m in session.get("messages", [])
         ]
+    try:
+        chat_settings = _request_chat_settings(req, session)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    should_generate_title = (
+        len(raw_history) == 0
+        and str(session.get("title") or "").strip() in {"", "新对话"}
+    )
     history = _sanitize_history_for_llm(raw_history)
 
     try:
         async with _get_workspace_rag_lock(req.workspace):
             context_result = await service.preview_context(
                 req.message,
-                mode=req.mode,
-                top_k=req.top_k,
-                chunk_top_k=req.chunk_top_k,
-                enable_rerank=req.enable_rerank,
+                mode=chat_settings.mode,
+                top_k=chat_settings.top_k,
+                chunk_top_k=chat_settings.chunk_top_k,
+                enable_rerank=chat_settings.enable_rerank,
             )
     except Exception as e:
         context_result = {}
@@ -2808,6 +3454,7 @@ async def chat_send(req: ChatSendRequest):
                 citations_data,
                 history,
                 req.workspace,
+                chat_settings,
             )
 
     if not citations_data:
@@ -2837,6 +3484,9 @@ async def chat_send(req: ChatSendRequest):
         citations=citations,
         evidence=evidence,
     )
+    title = str(session.get("title") or "新对话")
+    if should_generate_title:
+        title = await _generate_session_title(req.message, ai_text, chat_settings)
 
     # Critical section 2 (per-session lock): append messages + persist. Re-load
     # the latest session from disk first so concurrent appends on the same
@@ -2853,11 +3503,14 @@ async def chat_send(req: ChatSendRequest):
             "citations": _dump_chat_citations(citations),
             "evidence": evidence.model_dump(),
         })
+        session["settings"] = chat_settings.model_dump()
+        session["title"] = title
         session["updated_at"] = now
         _save_session(sid, session)
 
     return ChatSendResponse(
         session_id=sid,
+        title=title,
         user_message=user_msg,
         assistant_message=assistant_msg,
         citations=citations,
@@ -2891,16 +3544,24 @@ async def chat_send_stream(req: ChatSendRequest):
             {"role": m["role"], "content": m["content"]}
             for m in session.get("messages", [])
         ]
+    try:
+        chat_settings = _request_chat_settings(req, session)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    should_generate_title = (
+        len(raw_history) == 0
+        and str(session.get("title") or "").strip() in {"", "新对话"}
+    )
     history = _sanitize_history_for_llm(raw_history)
 
     try:
         async with _get_workspace_rag_lock(req.workspace):
             context_result = await service.preview_context(
                 req.message,
-                mode=req.mode,
-                top_k=req.top_k,
-                chunk_top_k=req.chunk_top_k,
-                enable_rerank=req.enable_rerank,
+                mode=chat_settings.mode,
+                top_k=chat_settings.top_k,
+                chunk_top_k=chat_settings.chunk_top_k,
+                enable_rerank=chat_settings.enable_rerank,
             )
     except Exception as e:
         logger.exception("LightRAG context retrieval failed")
@@ -2916,6 +3577,7 @@ async def chat_send_stream(req: ChatSendRequest):
 
     async def event_generator():
         full_text = ""
+        generated_title = str(session.get("title") or "新对话")
 
         # First: send citations + graph hit nodes as an event
         citations_payload = {
@@ -2933,16 +3595,50 @@ async def chat_send_stream(req: ChatSendRequest):
                     citations_data,
                     history,
                     req.workspace,
+                    chat_settings,
                 ):
                     full_text += token
                     yield f"data: {json.dumps({'token': token}, ensure_ascii=False)}\n\n"
 
                 final_text = _strip_lightrag_noise(_strip_citation_section(full_text))
-                if _is_contaminated_text(final_text):
-                    final_text = _fallback_answer_from_citations(req.message, citations_data)
+                issues = _generated_answer_quality_issues(final_text)
+                if issues:
+                    salvaged, remaining = _salvage_generated_answer(final_text)
+                    action = "salvaged" if salvaged and not remaining else "fallback"
+                    logger.warning(
+                        "answer_quality_check path=stream action={} session_id={} "
+                        "workspace={} model={} issues={} remaining={} length={}",
+                        action,
+                        sid,
+                        req.workspace,
+                        chat_settings.answer_model or "default",
+                        ",".join(issues),
+                        ",".join(remaining) or "none",
+                        len(final_text),
+                    )
+                    final_text = (
+                        salvaged
+                        if salvaged and not remaining
+                        else _fallback_answer_from_citations(req.message, citations_data)
+                    )
+                elif citations_data and not re.search(r"\[\d+\]", final_text):
+                    logger.info(
+                        "answer_quality_check path=stream action=preserved session_id={} "
+                        "workspace={} model={} issues=missing_inline_citation length={}",
+                        sid,
+                        req.workspace,
+                        chat_settings.answer_model or "default",
+                        len(final_text),
+                    )
                 full_text = final_text or "未检索到相关文档，知识库上下文不足，无法基于当前资料回答。"
+                if should_generate_title:
+                    generated_title = await _generate_session_title(
+                        req.message,
+                        full_text,
+                        chat_settings,
+                    )
                 # Final: done with session info
-                yield f"event: done\ndata: {json.dumps({'session_id': sid, 'content': full_text}, ensure_ascii=False)}\n\n"
+                yield f"event: done\ndata: {json.dumps({'session_id': sid, 'content': full_text, 'title': generated_title}, ensure_ascii=False)}\n\n"
             except Exception as e:
                 logger.error(f"Stream error: {e}")
                 yield f"event: error\ndata: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
@@ -2955,29 +3651,47 @@ async def chat_send_stream(req: ChatSendRequest):
             # Best-effort: never let cleanup mask the propagating
             # GeneratorExit/exception (swallow only Exception, not BaseException).
             try:
-                if _is_contaminated_text(full_text):
+                persist_issues = _generated_answer_quality_issues(full_text)
+                if persist_issues:
+                    salvaged, remaining = _salvage_generated_answer(full_text)
                     logger.warning(
-                        f"Contaminated output detected ({len(full_text)} chars), "
-                        f"replacing with placeholder before saving to session"
+                        "answer_quality_check path=persist action={} session_id={} "
+                        "workspace={} issues={} remaining={} length={}",
+                        "salvaged" if salvaged and not remaining else "fallback",
+                        sid,
+                        req.workspace,
+                        ",".join(persist_issues),
+                        ",".join(remaining) or "none",
+                        len(full_text),
                     )
-                    full_text = "[此前的回答因技术原因丢失，已清理]"
+                    full_text = (
+                        salvaged
+                        if salvaged and not remaining
+                        else _fallback_answer_from_citations(req.message, citations_data)
+                    )
 
                 # Critical section 2 (per-session lock): append + persist. Re-load
                 # the latest session so concurrent appends are not clobbered.
                 async with _get_session_lock(sid):
                     latest = _load_session(sid)
-                    if latest is not None:
-                        session = latest
-                    session["messages"].append({"role": "user", "content": req.message, "timestamp": now})
-                    session["messages"].append({
+                    persisted_session = latest if latest is not None else session
+                    persisted_session["messages"].append({"role": "user", "content": req.message, "timestamp": now})
+                    persisted_session["messages"].append({
                         "role": "assistant",
                         "content": full_text,
                         "timestamp": now,
                         "citations": _dump_chat_citations(citations),
                         "evidence": evidence.model_dump(),
                     })
-                    session["updated_at"] = now
-                    _save_session(sid, session)
+                    persisted_session["settings"] = chat_settings.model_dump()
+                    if should_generate_title:
+                        persisted_session["title"] = (
+                            generated_title
+                            if generated_title != "新对话"
+                            else _fallback_session_title(req.message)
+                        )
+                    persisted_session["updated_at"] = now
+                    _save_session(sid, persisted_session)
             except Exception:
                 logger.exception("Failed to persist streaming chat session")
 
@@ -3023,14 +3737,57 @@ async def get_chat_session(
         raise HTTPException(404, "Session not found")
     if s.get("workspace") != sanitize_workspace(workspace):
         raise HTTPException(404, "Session not found in current workspace")
+    repaired = False
+    last_question = ""
+    for message in s.get("messages", []):
+        if message.get("role") == "user":
+            last_question = str(message.get("content") or "")
+            continue
+        if message.get("role") != "assistant":
+            continue
+        content = str(message.get("content") or "")
+        citations_data = message.get("citations") or []
+        if _is_bad_generated_answer(content):
+            salvaged, remaining = _salvage_generated_answer(content)
+            message["content"] = (
+                salvaged
+                if salvaged and not remaining
+                else _fallback_answer_from_citations(last_question, citations_data)
+            )
+            repaired = True
+    if repaired:
+        _save_session(session_id, s)
     return ChatSession(
         id=s["id"],
         workspace=s.get("workspace", DEFAULT_WORKSPACE),
         title=s.get("title", ""),
+        settings=_session_chat_settings(s),
         messages=[ChatMessage(**m) for m in s.get("messages", [])],
         created_at=s.get("created_at", ""),
         updated_at=s.get("updated_at", ""),
     )
+
+
+@app.patch("/api/chat/sessions/{session_id}/settings", response_model=ChatSettings)
+async def update_chat_session_settings(
+    session_id: str,
+    settings: ChatSettings,
+    workspace: str = Query(DEFAULT_WORKSPACE),
+):
+    """Persist answer and retrieval settings for one conversation."""
+    workspace = sanitize_workspace(workspace)
+    try:
+        get_profile_with_key(settings.answer_profile_id, get_config())
+    except KeyError:
+        raise HTTPException(400, "Selected answer model connection no longer exists")
+    async with _get_session_lock(session_id):
+        session = _load_session(session_id)
+        if not session or session.get("workspace") != workspace:
+            raise HTTPException(404, "Session not found in current workspace")
+        session["settings"] = settings.model_dump()
+        session["settings_updated_at"] = _task_now()
+        _save_session(session_id, session)
+    return settings
 
 
 @app.delete("/api/chat/sessions/{session_id}")
@@ -3054,6 +3811,7 @@ async def delete_chat_session(
 
 class ChatSessionCreateRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
+    settings: Optional[ChatSettings] = None
 
 
 @app.post("/api/chat/sessions")
@@ -3062,10 +3820,16 @@ async def create_chat_session(req: ChatSessionCreateRequest):
     workspace = sanitize_workspace(req.workspace)
     sid = uuid.uuid4().hex[:12]
     now = datetime.now(timezone.utc).isoformat()
+    settings = req.settings or _default_chat_settings()
+    try:
+        get_profile_with_key(settings.answer_profile_id, get_config())
+    except KeyError:
+        raise HTTPException(400, "Selected answer model connection no longer exists")
     session = {
         "id": sid,
         "workspace": workspace,
         "title": "新对话",
+        "settings": settings.model_dump(),
         "messages": [],
         "created_at": now,
         "updated_at": now,

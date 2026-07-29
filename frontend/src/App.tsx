@@ -61,10 +61,8 @@ export default function App() {
     localStorage.setItem('tdx_workspace', next)
   }
 
-  const handleCreateWorkspace = async () => {
-    const name = window.prompt('输入新知识库名称（字母、数字、下划线或短横线）')
-    if (!name) return
-    const created = await createWorkspace(name.trim())
+  const handleCreateWorkspace = async (name: string) => {
+    const created = await createWorkspace(name)
     await loadWorkspaces()
     handleWorkspaceChange(created.workspace)
   }
@@ -110,6 +108,8 @@ export default function App() {
       {page === 'chat' && (
         <QAChat
           workspace={workspace}
+          workspaces={workspaces}
+          onWorkspaceChange={handleWorkspaceChange}
           sessions={chatSessions}
           activeId={activeChatId}
           setActiveId={setActiveChatId}

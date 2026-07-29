@@ -1588,6 +1588,83 @@ class LightRAGService:
             "metadata": raw.get("metadata") or {},
         }
 
+    async def text_recall(
+        self,
+        query: str,
+        *,
+        top_k: int = 20,
+        enable_rerank: bool = True,
+    ) -> dict[str, Any]:
+        """Inspect LightRAG chunk-vector recall before and after reranking."""
+        self.assert_embedding_compatible()
+        rag = await self.get_rag()
+        raw_hits = await rag.chunks_vdb.query(query, top_k=top_k)
+        vector_hits: list[dict[str, Any]] = []
+        for rank, item in enumerate(raw_hits, start=1):
+            if not isinstance(item, dict) or not item.get("content"):
+                continue
+            vector_hits.append(
+                {
+                    "chunk_id": str(item.get("id") or ""),
+                    "file_path": str(item.get("file_path") or ""),
+                    "content": str(item.get("content") or ""),
+                    "vector_score": float(item.get("distance") or 0.0),
+                    "vector_rank": rank,
+                    "rerank_score": None,
+                    "rerank_rank": None,
+                }
+            )
+
+        rerank_hits = [dict(item) for item in vector_hits]
+        rerank_applied = False
+        rerank_warning = ""
+        rerank_config = self._runtime_models()["rerank"]
+        if enable_rerank and vector_hits:
+            if not rerank_config.get("enabled", True):
+                rerank_warning = "系统绑定的 Rerank 模型已关闭"
+            elif not str(rerank_config.get("api_key") or "").strip():
+                rerank_warning = "Rerank 连接没有可用的 API Key"
+            else:
+                results = await self._make_rerank_func()(
+                    query,
+                    [item["content"] for item in vector_hits],
+                    top_n=len(vector_hits),
+                )
+                score_by_index = {
+                    int(item["index"]): float(item.get("relevance_score") or 0.0)
+                    for item in results
+                    if isinstance(item, dict) and "index" in item
+                }
+                if score_by_index:
+                    rerank_applied = True
+                    for index, item in enumerate(rerank_hits):
+                        item["rerank_score"] = score_by_index.get(index)
+                    rerank_hits.sort(
+                        key=lambda item: (
+                            item["rerank_score"] is not None,
+                            item["rerank_score"] or 0.0,
+                        ),
+                        reverse=True,
+                    )
+                    for rank, item in enumerate(rerank_hits, start=1):
+                        item["rerank_rank"] = rank
+                else:
+                    rerank_warning = "Rerank 未返回有效分数，已保留向量排序"
+
+        return {
+            "query": query,
+            "workspace": self.workspace,
+            "top_k": top_k,
+            "cosine_threshold": float(
+                getattr(rag.chunks_vdb, "cosine_better_than_threshold", 0.0)
+            ),
+            "rerank_requested": enable_rerank,
+            "rerank_applied": rerank_applied,
+            "rerank_warning": rerank_warning,
+            "vector_hits": vector_hits,
+            "rerank_hits": rerank_hits,
+        }
+
     async def replay_graph_audit(self) -> dict[str, Any]:
         """Replay manual graph governance operations after a full rebuild."""
         rag = await self.get_rag()

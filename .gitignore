@@ -23,6 +23,7 @@ data/
 deliverables/
 artifacts/
 screenshots/
+.playwright-cli/
 
 # Frontend dependencies and build output
 frontend/node_modules/

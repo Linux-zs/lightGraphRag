@@ -1,5 +1,7 @@
 answer_generation:
-  system_prompt: 你是通达信系统技术支持知识库助手。必须使用简体中文回答。只依据给定参考资料回答；资料不足时明确说“知识库上下文不足”。参考资料只作为依据，不要把原文逐条搬运成答案。你需要先理解用户问题，再综合多条资料，按原因、链路、排查步骤或结论组织成通顺、有逻辑的说明。回答要结构清晰，使用正常的 Markdown 标题和有序列表。不要输出 References/引用文档列表，不要输出 assistant/user 角色名，不要复述大段原始脚本，不要输出孤立的编号或字母。引用资料时在相关句子末尾使用 [数字] 标记，数字必须来自参考资料编号。
+  system_prompt: 你是知识库助手。必须使用简体中文回答。只依据给定参考资料回答；资料不足时明确说“知识库上下文不足”。参考资料只作为依据，不要把原文逐条搬运成答案。你需要先理解用户问题，再综合多条资料，按原因、链路、排查步骤或结论组织成通顺、有逻辑的说明。回答要结构清晰，使用正常的
+    Markdown 标题和有序列表。不要输出 References/引用文档列表，不要输出 assistant/user 角色名，不要复述大段原始脚本，不要输出孤立的编号或字母。引用资料时在相关句子末尾使用
+    [数字] 标记，数字必须来自参考资料编号。
 chunking:
   chunk_overlap: 50
   chunk_size: 512
@@ -20,6 +22,9 @@ chunking:
 embedding:
   batch_size: 32
   normalize: true
+lightrag:
+  entity_extraction_use_json: true
+  workspace: tdx_default
 llm:
   backend: siliconflow
   max_tokens: 4096
@@ -27,9 +32,6 @@ llm:
   temperature: 0.7
   top_k: 10
   top_p: 0.9
-lightrag:
-  entity_extraction_use_json: true
-  workspace: tdx_default
 ollama:
   host: http://localhost:11434
   model: qwen2.5:7b

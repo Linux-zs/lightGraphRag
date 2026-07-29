@@ -2,22 +2,30 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   discoverModels,
   discoverProfileModels,
+  createPromptTemplate,
   DiscoveredModel,
+  deletePromptTemplate,
   deleteModelProfile,
   getModelBindings,
   getModelConfig,
   listModelProfiles,
+  listPromptTemplates,
   ModelBinding,
   ModelBindings,
   ModelConfig,
   ModelProfile,
+  PromptTemplate,
   saveModelProfile,
   testChatModel,
   testEmbeddingModel,
   testRerankModel,
   updateModelBindings,
   updateModelConfig,
+  updatePromptTemplate,
 } from '../api'
+import { useConfirm } from '../components/ConfirmDialog'
+import ModelCombobox from '../components/ModelCombobox'
+import { Toggle } from '../components/ui'
 
 const DEFAULT_ANSWER_SYSTEM_PROMPT =
   '你是严谨的知识库问答助手。必须使用简体中文回答。' +
@@ -40,6 +48,7 @@ const DEFAULT_CONFIG: ModelConfig = {
   chat_max_tokens: 4096,
   frequency_penalty: 0.3,
   presence_penalty: 0.2,
+  answer_prompt_template_id: 'recommended',
   answer_system_prompt: DEFAULT_ANSWER_SYSTEM_PROMPT,
 }
 
@@ -86,7 +95,9 @@ interface Props {
 }
 
 export default function ModelSettings({ workspace }: Props) {
+  const confirm = useConfirm()
   const [profiles, setProfiles] = useState<ModelProfile[]>([])
+  const [promptTemplates, setPromptTemplates] = useState<PromptTemplate[]>([])
   const [bindings, setBindings] = useState<ModelBindings>(DEFAULT_BINDINGS)
   const [config, setConfig] = useState<ModelConfig>(DEFAULT_CONFIG)
   const [loading, setLoading] = useState(true)
@@ -102,6 +113,8 @@ export default function ModelSettings({ workspace }: Props) {
   })
   const [draftModels, setDraftModels] = useState<DiscoveredModel[]>([])
   const [discovering, setDiscovering] = useState(false)
+  const [showTemplateModal, setShowTemplateModal] = useState(false)
+  const [templateDraft, setTemplateDraft] = useState({ name: '', description: '' })
 
   const profileById = useMemo(() => {
     const map = new Map<string, ModelProfile>()
@@ -113,14 +126,16 @@ export default function ModelSettings({ workspace }: Props) {
     setLoading(true)
     setMessage('')
     try {
-      const [profileData, bindingData, modelConfig] = await Promise.all([
+      const [profileData, bindingData, modelConfig, templates] = await Promise.all([
         listModelProfiles(),
         getModelBindings(),
         getModelConfig(workspace),
+        listPromptTemplates(),
       ])
       setProfiles(profileData)
       setBindings(bindingData)
       setConfig(modelConfig)
+      setPromptTemplates(templates)
     } catch (e) {
       setMessage(`加载失败: ${(e as Error).message}`)
     } finally {
@@ -216,7 +231,12 @@ export default function ModelSettings({ workspace }: Props) {
   }
 
   const removeProfile = async (profile: ModelProfile) => {
-    const ok = window.confirm(`确认删除连接档案“${profile.name}”？相关绑定会回退到默认连接。`)
+    const ok = await confirm({
+      title: '删除模型连接',
+      message: `删除“${profile.name}”后，相关模型绑定会回退到默认连接。`,
+      confirmLabel: '删除连接',
+      tone: 'danger',
+    })
     if (!ok) return
     setSaving(true)
     setMessage('')
@@ -234,7 +254,11 @@ export default function ModelSettings({ workspace }: Props) {
   const saveBindings = async () => {
     const ok =
       !bindings.embedding.embed_dim ||
-      window.confirm('如果嵌入模型或维度发生变化，已有 LightRAG 索引可能不可复用，需要清空并重建知识库。确认保存？')
+      await confirm({
+        title: '保存模型绑定',
+        message: '嵌入模型或维度变化后，已有 LightRAG 索引可能不可复用，需要重建对应知识库。',
+        confirmLabel: '确认保存',
+      })
     if (!ok) return
     setSaving(true)
     setMessage('')
@@ -257,17 +281,83 @@ export default function ModelSettings({ workspace }: Props) {
     }
   }
 
-  const saveGenerationConfig = async () => {
+  const savePromptConfig = async () => {
     setSaving(true)
     setMessage('')
     try {
       await updateModelConfig(config, workspace)
-      setMessage(`生成参数和知识库 ${workspace} 的问答提示词已保存`)
+      setMessage(`知识库 ${workspace} 的问答提示词已保存`)
     } catch (e) {
       setMessage(`保存失败: ${(e as Error).message}`)
     } finally {
       setSaving(false)
     }
+  }
+
+  const applyPromptTemplate = (templateId: string) => {
+    const template = promptTemplates.find((item) => item.id === templateId)
+    if (!template) return
+    setConfig({
+      ...config,
+      answer_prompt_template_id: template.id,
+      answer_system_prompt: template.content,
+    })
+  }
+
+  const createTemplateFromCurrent = async () => {
+    if (!templateDraft.name.trim() || !config.answer_system_prompt.trim()) return
+    setSaving(true)
+    try {
+      const created = await createPromptTemplate({
+        name: templateDraft.name.trim(),
+        description: templateDraft.description.trim(),
+        content: config.answer_system_prompt.trim(),
+      })
+      setPromptTemplates((current) => [...current, created])
+      setConfig({ ...config, answer_prompt_template_id: created.id })
+      setTemplateDraft({ name: '', description: '' })
+      setShowTemplateModal(false)
+      setMessage('提示词已另存为模板，请保存当前知识库提示词以应用')
+    } catch (e) {
+      setMessage(`保存模板失败: ${(e as Error).message}`)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const updateCurrentTemplate = async () => {
+    const current = promptTemplates.find((item) => item.id === config.answer_prompt_template_id)
+    if (!current || current.built_in) return
+    setSaving(true)
+    try {
+      const updated = await updatePromptTemplate(current.id, {
+        name: current.name,
+        description: current.description,
+        content: config.answer_system_prompt.trim(),
+      })
+      setPromptTemplates((items) => items.map((item) => item.id === updated.id ? updated : item))
+      setMessage('当前提示词模板已更新')
+    } catch (e) {
+      setMessage(`更新模板失败: ${(e as Error).message}`)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const removeCurrentTemplate = async () => {
+    const current = promptTemplates.find((item) => item.id === config.answer_prompt_template_id)
+    if (!current || current.built_in) return
+    const accepted = await confirm({
+      title: '删除提示词模板',
+      message: `确认删除模板“${current.name}”？已保存到知识库的提示词内容不会被清空。`,
+      confirmLabel: '删除模板',
+      tone: 'danger',
+    })
+    if (!accepted) return
+    await deletePromptTemplate(current.id)
+    setPromptTemplates((items) => items.filter((item) => item.id !== current.id))
+    setConfig({ ...config, answer_prompt_template_id: 'recommended' })
+    setMessage('提示词模板已删除')
   }
 
   const testPurpose = async (purpose: keyof ModelBindings) => {
@@ -312,21 +402,22 @@ export default function ModelSettings({ workspace }: Props) {
             <p className="mt-1 text-xs text-gray-500">{hint}</p>
           </div>
           {purpose === 'rerank' && (
-            <label className="flex items-center gap-2 text-xs text-gray-600">
-              <input
-                type="checkbox"
-                checked={binding.enabled !== false}
-                onChange={(e) => updateBinding('rerank', { enabled: e.target.checked })}
-              />
-              启用
-            </label>
+            <Toggle
+              checked={binding.enabled !== false}
+              onChange={(enabled) => updateBinding('rerank', { enabled })}
+              label="启用"
+            />
           )}
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-[220px_minmax(0,1fr)_auto] gap-3">
           <select
             value={binding.profile_id}
-            onChange={(e) => updateBinding(purpose, { profile_id: e.target.value })}
+            onChange={(e) => {
+              const profileId = e.target.value
+              const firstModel = profileById.get(profileId)?.models_cache?.[0]?.id || ''
+              updateBinding(purpose, { profile_id: profileId, model: firstModel })
+            }}
             className="rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
           >
             {profiles.map((item) => (
@@ -336,26 +427,11 @@ export default function ModelSettings({ workspace }: Props) {
             ))}
           </select>
 
-          <div className="flex gap-2">
-            <select
-              value={binding.model}
-              onChange={(e) => updateBinding(purpose, { model: e.target.value })}
-              className="min-w-0 flex-1 rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
-            >
-              {options.map((model) => (
-                <option key={model.id} value={model.id}>
-                  {model.id}
-                </option>
-              ))}
-              {options.length === 0 && <option value={binding.model}>{binding.model || '请手动输入模型名'}</option>}
-            </select>
-            <input
-              value={binding.model}
-              onChange={(e) => updateBinding(purpose, { model: e.target.value })}
-              className="min-w-0 flex-1 rounded-lg border border-gray-300 px-3 py-2 text-sm"
-              placeholder="也可手动输入模型名"
-            />
-          </div>
+          <ModelCombobox
+            value={binding.model}
+            options={options.map((model) => model.id)}
+            onChange={(model) => updateBinding(purpose, { model })}
+          />
 
           <button
             onClick={() => testPurpose(purpose)}
@@ -540,42 +616,6 @@ export default function ModelSettings({ workspace }: Props) {
       </div>
 
       <section className="bg-white border border-gray-200 rounded-lg p-5">
-        <h3 className="text-sm font-semibold text-gray-800">生成参数</h3>
-        <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-5">
-          <label className="text-sm text-gray-600">
-            Temperature: {config.chat_temperature}
-            <input type="range" min={0} max={2} step={0.05} value={config.chat_temperature}
-              onChange={(e) => setConfig({ ...config, chat_temperature: parseFloat(e.target.value) })}
-              className="mt-2 w-full accent-primary-500" />
-          </label>
-          <label className="text-sm text-gray-600">
-            Top-P: {config.chat_top_p}
-            <input type="range" min={0} max={1} step={0.05} value={config.chat_top_p}
-              onChange={(e) => setConfig({ ...config, chat_top_p: parseFloat(e.target.value) })}
-              className="mt-2 w-full accent-primary-500" />
-          </label>
-          <label className="text-sm text-gray-600">
-            Max Tokens: {config.chat_max_tokens}
-            <input type="range" min={256} max={8192} step={256} value={config.chat_max_tokens}
-              onChange={(e) => setConfig({ ...config, chat_max_tokens: parseInt(e.target.value) })}
-              className="mt-2 w-full accent-primary-500" />
-          </label>
-          <label className="text-sm text-gray-600">
-            Frequency Penalty: {config.frequency_penalty}
-            <input type="range" min={-2} max={2} step={0.1} value={config.frequency_penalty}
-              onChange={(e) => setConfig({ ...config, frequency_penalty: parseFloat(e.target.value) })}
-              className="mt-2 w-full accent-primary-500" />
-          </label>
-          <label className="text-sm text-gray-600">
-            Presence Penalty: {config.presence_penalty}
-            <input type="range" min={-2} max={2} step={0.1} value={config.presence_penalty}
-              onChange={(e) => setConfig({ ...config, presence_penalty: parseFloat(e.target.value) })}
-              className="mt-2 w-full accent-primary-500" />
-          </label>
-        </div>
-      </section>
-
-      <section className="bg-white border border-gray-200 rounded-lg p-5">
         <div className="flex items-start justify-between gap-4 mb-4">
           <div>
             <h3 className="text-sm font-semibold text-gray-800">问答提示词</h3>
@@ -583,30 +623,106 @@ export default function ModelSettings({ workspace }: Props) {
               当前知识库：{workspace}。控制该知识库的最终回答风格；参考资料会另行拼接到用户消息中。
             </p>
           </div>
-          <button
-            onClick={() => setConfig({ ...config, answer_system_prompt: DEFAULT_ANSWER_SYSTEM_PROMPT })}
-            className="shrink-0 px-3 py-1.5 text-xs rounded-lg border border-gray-300 bg-white text-gray-600 hover:bg-gray-50"
-          >
-            恢复推荐模板
-          </button>
+        </div>
+        <div className="mb-4 grid gap-3 md:grid-cols-[minmax(240px,420px)_auto] md:items-end">
+          <label className="text-xs font-medium text-gray-600">
+            提示词模板
+            <select
+              value={config.answer_prompt_template_id}
+              onChange={(event) => applyPromptTemplate(event.target.value)}
+              className="mt-1 h-10 w-full rounded-md border border-gray-300 bg-white px-3 text-sm"
+            >
+              {!promptTemplates.some((item) => item.id === config.answer_prompt_template_id) && (
+                <option value={config.answer_prompt_template_id}>当前知识库自定义内容</option>
+              )}
+              {promptTemplates.map((template) => (
+                <option key={template.id} value={template.id}>
+                  {template.name}{template.built_in ? '（内置）' : ''}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="flex flex-wrap gap-2">
+            <button onClick={() => setShowTemplateModal(true)} className="ui-button-secondary">
+              另存为模板
+            </button>
+            <button
+              onClick={updateCurrentTemplate}
+              disabled={promptTemplates.find((item) => item.id === config.answer_prompt_template_id)?.built_in !== false}
+              className="ui-button-secondary disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              更新模板
+            </button>
+            <button
+              onClick={removeCurrentTemplate}
+              disabled={promptTemplates.find((item) => item.id === config.answer_prompt_template_id)?.built_in !== false}
+              className="ui-button-secondary text-red-600 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              删除模板
+            </button>
+          </div>
         </div>
         <textarea
           value={config.answer_system_prompt}
-          onChange={(e) => setConfig({ ...config, answer_system_prompt: e.target.value })}
+          onChange={(e) => setConfig({
+            ...config,
+            answer_prompt_template_id: config.answer_prompt_template_id,
+            answer_system_prompt: e.target.value,
+          })}
           rows={10}
           className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm leading-relaxed outline-none font-mono"
         />
         <div className="mt-3 flex items-center justify-between">
           <span className="text-xs text-gray-400">{config.answer_system_prompt.length} 字符</span>
           <button
-            onClick={saveGenerationConfig}
+            onClick={savePromptConfig}
             disabled={saving}
             className="rounded-lg bg-gray-900 px-4 py-2 text-sm text-white hover:bg-gray-700 disabled:bg-gray-300"
           >
-            保存生成参数和提示词
+            保存当前知识库提示词
           </button>
         </div>
       </section>
+
+      {showTemplateModal && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4">
+          <div className="w-full max-w-md rounded-lg border border-gray-200 bg-white p-5 shadow-xl">
+            <h3 className="text-base font-semibold text-gray-900">另存为提示词模板</h3>
+            <p className="mt-1 text-sm text-gray-500">保存后可在任意知识库中选择该模板。</p>
+            <div className="mt-4 space-y-3">
+              <label className="block text-xs font-medium text-gray-600">
+                模板名称
+                <input
+                  autoFocus
+                  value={templateDraft.name}
+                  onChange={(event) => setTemplateDraft({ ...templateDraft, name: event.target.value })}
+                  className="mt-1 h-10 w-full rounded-md border border-gray-300 px-3 text-sm"
+                  placeholder="例如：技术排障助手"
+                />
+              </label>
+              <label className="block text-xs font-medium text-gray-600">
+                说明
+                <input
+                  value={templateDraft.description}
+                  onChange={(event) => setTemplateDraft({ ...templateDraft, description: event.target.value })}
+                  className="mt-1 h-10 w-full rounded-md border border-gray-300 px-3 text-sm"
+                  placeholder="模板适用场景，可选"
+                />
+              </label>
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <button onClick={() => setShowTemplateModal(false)} className="ui-button-secondary">取消</button>
+              <button
+                onClick={createTemplateFromCurrent}
+                disabled={saving || !templateDraft.name.trim()}
+                className="ui-button-primary disabled:opacity-40"
+              >
+                保存模板
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
