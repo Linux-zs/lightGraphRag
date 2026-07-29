@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
+import ipaddress
 import json
 import os
 import re
+import shutil
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -14,7 +17,7 @@ from typing import Any, Optional
 
 import uvicorn
 import yaml
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
@@ -58,9 +61,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+APP_API_TOKEN = os.environ.get("TDX_APP_API_TOKEN", "").strip()
+
+
+def _is_loopback_client(host: str | None) -> bool:
+    if not host:
+        return True
+    if host in {"localhost", "testclient"}:
+        return True
+    try:
+        return ipaddress.ip_address(host.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
+@app.middleware("http")
+async def require_remote_api_token(request: Request, call_next):
+    """Keep local desktop use frictionless and protect explicitly remote binds."""
+    client_host = request.client.host if request.client else None
+    if not _is_loopback_client(client_host):
+        provided = request.headers.get("X-App-Token", "").strip()
+        if not APP_API_TOKEN or not hmac.compare_digest(provided, APP_API_TOKEN):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Remote API access requires a valid X-App-Token"},
+            )
+    return await call_next(request)
+
 CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "default.yaml"
 UPLOAD_DIR = Path(os.environ.get("TDX_UPLOAD_DIR", "data/uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+RAW_TEXT_DIR = Path(os.environ.get("TDX_RAW_TEXT_DIR", "data/upload_text"))
+RAW_TEXT_DIR.mkdir(parents=True, exist_ok=True)
+WORKSPACE_SETTINGS_DIR = Path(
+    os.environ.get("TDX_WORKSPACE_SETTINGS_DIR", "data/workspace_settings")
+)
+WORKSPACE_SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
 
 SESSIONS_DIR = Path("data/sessions")
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -80,14 +116,83 @@ def _safe_leaf_name(value: str, *, label: str = "File name") -> str:
     return name
 
 
-def _resolve_upload_path(file_name: str) -> Path:
-    """Resolve a direct child of UPLOAD_DIR and reject path traversal."""
+def _workspace_upload_dir(workspace: str, *, create: bool = False) -> Path:
+    workspace_dir = UPLOAD_DIR.resolve() / sanitize_workspace(workspace)
+    if workspace_dir.parent != UPLOAD_DIR.resolve():
+        raise ValueError("Invalid workspace upload path")
+    if create:
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+    return workspace_dir
+
+
+def _workspace_raw_text_dir(workspace: str, *, create: bool = False) -> Path:
+    workspace_dir = RAW_TEXT_DIR.resolve() / sanitize_workspace(workspace)
+    if workspace_dir.parent != RAW_TEXT_DIR.resolve():
+        raise ValueError("Invalid workspace raw-text path")
+    if create:
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+    return workspace_dir
+
+
+def _resolve_upload_path(
+    file_name: str,
+    workspace: str = DEFAULT_WORKSPACE,
+    *,
+    create_dir: bool = False,
+    migrate_legacy: bool = False,
+) -> Path:
+    """Resolve a workspace-owned upload and optionally copy a legacy source."""
     safe_name = _safe_leaf_name(file_name)
-    upload_root = UPLOAD_DIR.resolve()
+    upload_root = _workspace_upload_dir(workspace, create=create_dir)
     candidate = (upload_root / safe_name).resolve()
     if candidate.parent != upload_root:
         raise ValueError("Invalid file name")
+    if migrate_legacy and not candidate.exists():
+        legacy = (UPLOAD_DIR.resolve() / safe_name).resolve()
+        if legacy.parent == UPLOAD_DIR.resolve() and legacy.is_file():
+            upload_root.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(legacy, candidate)
+            logger.info("Migrated legacy upload '{}' into workspace '{}'", safe_name, workspace)
     return candidate
+
+
+def _resolve_raw_text_path(workspace: str, doc_id: str, *, create_dir: bool = False) -> Path:
+    safe_doc_id = _safe_leaf_name(doc_id, label="Document id")
+    raw_root = _workspace_raw_text_dir(workspace, create=create_dir)
+    candidate = (raw_root / f"{safe_doc_id}.txt").resolve()
+    if candidate.parent != raw_root:
+        raise ValueError("Invalid document id")
+    return candidate
+
+
+def _cache_key(workspace: str, file_name: str) -> tuple[str, str]:
+    return sanitize_workspace(workspace), _safe_leaf_name(file_name)
+
+
+def _clear_workspace_cache(workspace: str) -> None:
+    workspace = sanitize_workspace(workspace)
+    for key in [key for key in _uploaded_files if key[0] == workspace]:
+        _uploaded_files.pop(key, None)
+    for key in [key for key in _chunk_cache if key[0] == workspace]:
+        _chunk_cache.pop(key, None)
+
+
+def _remove_workspace_sources(workspace: str) -> int:
+    """Remove only source and raw-text directories owned by one workspace."""
+    workspace = sanitize_workspace(workspace)
+    removed_files = 0
+    for root, target in (
+        (UPLOAD_DIR.resolve(), _workspace_upload_dir(workspace)),
+        (RAW_TEXT_DIR.resolve(), _workspace_raw_text_dir(workspace)),
+    ):
+        resolved = target.resolve()
+        if resolved.parent != root:
+            raise RuntimeError(f"Refusing to remove unsafe workspace source path: {resolved}")
+        if resolved.exists():
+            removed_files += sum(1 for path in resolved.rglob("*") if path.is_file())
+            shutil.rmtree(resolved)
+    _clear_workspace_cache(workspace)
+    return removed_files
 
 
 def _session_path(session_id: str) -> Path:
@@ -99,7 +204,7 @@ def _session_path(session_id: str) -> Path:
 
 
 DEFAULT_ANSWER_SYSTEM_PROMPT = (
-    "你是通达信系统技术支持知识库助手。必须使用简体中文回答。"
+    "你是严谨的知识库问答助手。必须使用简体中文回答。"
     "只依据给定参考资料回答；资料不足时明确说“知识库上下文不足”。"
     "参考资料只作为依据，不要把原文逐条搬运成答案。"
     "你需要先理解用户问题，再综合多条资料，按原因、链路、排查步骤或结论组织成通顺、有逻辑的说明。"
@@ -108,6 +213,58 @@ DEFAULT_ANSWER_SYSTEM_PROMPT = (
     "不要复述大段原始脚本，不要输出孤立的编号或字母。"
     "引用资料时在相关句子末尾使用 [数字] 标记，数字必须来自参考资料编号。"
 )
+_LEGACY_TDX_PROMPT_PREFIX = "你是通达信系统技术支持知识库助手"
+
+
+def _workspace_settings_path(workspace: str) -> Path:
+    workspace = sanitize_workspace(workspace)
+    root = WORKSPACE_SETTINGS_DIR.resolve()
+    path = (root / f"{workspace}.json").resolve()
+    if path.parent != root:
+        raise ValueError("Invalid workspace settings path")
+    return path
+
+
+def _load_workspace_settings(workspace: str) -> dict[str, Any]:
+    workspace = sanitize_workspace(workspace)
+    path = _workspace_settings_path(workspace)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {"workspace": workspace, **data}
+        except Exception:
+            logger.exception("Failed to read workspace settings for {}", workspace)
+
+    prompt = DEFAULT_ANSWER_SYSTEM_PROMPT
+    default_workspace = sanitize_workspace(
+        get_config().get("lightrag", {}).get("workspace", DEFAULT_WORKSPACE)
+    )
+    if workspace == default_workspace:
+        configured = str(
+            get_config().get("answer_generation", {}).get("system_prompt") or ""
+        ).strip()
+        if configured and not configured.startswith(_LEGACY_TDX_PROMPT_PREFIX):
+            prompt = configured
+    return {"workspace": workspace, "answer_system_prompt": prompt}
+
+
+def _save_workspace_settings(workspace: str, settings: dict[str, Any]) -> dict[str, Any]:
+    workspace = sanitize_workspace(workspace)
+    current = _load_workspace_settings(workspace)
+    prompt = str(settings.get("answer_system_prompt") or "").strip()
+    current["answer_system_prompt"] = prompt or DEFAULT_ANSWER_SYSTEM_PROMPT
+    current["workspace"] = workspace
+    current["updated_at"] = _task_now()
+    path = _workspace_settings_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    temp_path.write_text(
+        json.dumps(current, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temp_path.replace(path)
+    return current
 
 # --- Pydantic Models ---
 
@@ -155,6 +312,7 @@ class RecallTestResponse(BaseModel):
     metadata: dict[str, Any] = {}
 
 class ModelConfig(BaseModel):
+    workspace: str = DEFAULT_WORKSPACE
     embed_model: str = "BAAI/bge-large-zh-v1.5"
     embed_base_url: str = "https://api.siliconflow.cn/v1"
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
@@ -364,6 +522,7 @@ class ChatSendResponse(BaseModel):
 
 class ChatSession(BaseModel):
     id: str
+    workspace: str = DEFAULT_WORKSPACE
     title: str
     messages: list[ChatMessage]
     created_at: str
@@ -371,6 +530,7 @@ class ChatSession(BaseModel):
 
 class ChatSessionListItem(BaseModel):
     id: str
+    workspace: str = DEFAULT_WORKSPACE
     title: str
     message_count: int
     created_at: str
@@ -387,7 +547,11 @@ def _load_session(session_id: str) -> dict | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        data["workspace"] = sanitize_workspace(data.get("workspace") or DEFAULT_WORKSPACE)
+        return data
     except Exception:
         return None
 
@@ -686,7 +850,7 @@ def _clean_excerpt_for_answer(excerpt: str, max_chars: int = 420) -> str:
             continue
         if re.match(r"^%[a-z0-9_]+%", lower) or re.match(r"^[a-z]:\\", lower):
             continue
-        if lower.startswith(("/cygdrive/", "rsync ", "%command%")):
+        if lower.startswith(("/cygdrive/", "%command%")):
             continue
         if re.fullmatch(r"[\|\-\s:]+", line):
             continue
@@ -737,51 +901,8 @@ def _fallback_answer_from_citations(question: str, citations_data: list[dict]) -
     if not citations_data:
         return "未检索到相关文档，知识库上下文不足，无法基于当前资料回答。"
 
-    def ref_with(*keywords: str) -> str:
-        for citation in citations_data:
-            blob = (
-                f"{citation.get('doc_name', '')}\n"
-                f"{citation.get('excerpt', '')}\n"
-                f"{citation.get('file_path', '')}"
-            ).lower()
-            if all(k.lower() in blob for k in keywords):
-                return f"[{citation.get('index')}]"
-        return f"[{citations_data[0].get('index', 1)}]"
-
-    q = question.lower()
-    if "rsync" in q:
-        arch_ref = ref_with("三层架构")
-        client_ref = ref_with("cwrsync", "客户端")
-        server_ref = ref_with("rsyncd.conf")
-        script_ref = ref_with("password-file")
-        path_ref = ref_with("部署路径")
-        return (
-            "根据当前知识库，Rsync 部署可以按这条主线处理：\n\n"
-            f"1. 先确认同步架构：通达信总部作为 Rsync 服务端，券商 Windows 落地服务器先向总部拉取数据，再作为服务端向 Linux 主站分发。{arch_ref}\n"
-            f"2. 在 Windows 落地服务器部署 cwRsync 客户端，用它主动拉取通达信服务端的数据；路径通常要按 Cygwin 格式处理。{client_ref}\n"
-            f"3. 如果还要向下游 Linux 主站分发，需要配置 cwRsyncServer，重点检查 rsyncd.conf、监听端口、auth users、secrets file 和模块 path。{server_ref}\n"
-            f"4. 同步脚本里重点核对服务端 IP、端口、模块名、用户、密码文件、目标路径、timeout、临时目录和带宽限制等参数。{script_ref}\n"
-            f"5. 部署后优先排查端口连通性、账号密码、密码文件权限、路径转换、模块名是否一致，以及服务端是否已放通来源 IP。{server_ref}\n\n"
-            f"如果是 agghost 文件模式，还要确认部署路径和程序名与启动脚本、crontab 中保持一致。{path_ref}"
-        )
-
-    if any(term in question for term in ("新闻资讯", "资讯数据", "数据不全", "客户端不显示新闻")):
-        client_ref = ref_with("客户端", "infohost")
-        infohost_ref = ref_with("infohost", "本地")
-        zxdbtools_ref = ref_with("zxdbtools", "导出")
-        uts_ref = ref_with("uts", "数据库")
-        return (
-            "根据当前资料，这个问题更像是新闻资讯数据链路中的某一段没有产出或没有被客户端读到。\n\n"
-            f"资料里能串起来的链路是：总部数据先同步到本地 SQL Server，再由 zxdbtools 从数据库导出成本地资讯文件，"
-            f"infohost 负责读取这些本地资讯文件，最后客户端从 infohost 获取并展示新闻资讯。{uts_ref}{zxdbtools_ref}{infohost_ref}{client_ref}\n\n"
-            "因此“客户端不显示”或“新闻资讯数据不全”可以优先按这个顺序排查：\n\n"
-            f"1. 先看本地 SQL Server 的资讯数据是否完整；如果这里已经缺数据，问题在上游同步或数据源侧。{uts_ref}\n"
-            f"2. 再看 zxdbtools 是否把数据库中的资讯数据完整导出到本地文件；如果导出文件缺失或内容不全，客户端侧不会有完整数据。{zxdbtools_ref}\n"
-            f"3. 然后看 infohost 是否能读取到本地资讯文件；如果 infohost 读不到，客户端即使连接正常也无法展示。{infohost_ref}\n"
-            f"4. 最后检查客户端到 infohost 的获取链路和展示逻辑，确认客户端实际取到的是哪一份资讯数据。{client_ref}"
-        )
-
     facts: list[str] = []
+    seen: set[str] = set()
     for citation in citations_data[:6]:
         cleaned = _clean_excerpt_for_answer(citation.get("excerpt", ""), max_chars=320)
         if not cleaned:
@@ -789,36 +910,24 @@ def _fallback_answer_from_citations(question: str, citations_data: list[dict]) -
         pieces = re.split(r"(?<=[。！？])\s+|\n+", cleaned)
         for piece in pieces:
             piece = piece.strip(" -；;")
-            if 18 <= len(piece) <= 180:
+            normalized = re.sub(r"\s+", "", piece)
+            if 18 <= len(piece) <= 180 and normalized not in seen:
+                seen.add(normalized)
                 facts.append(f"{piece}[{citation.get('index')}]")
                 break
 
     if not facts:
-        return "已检索到相关文档，但可用于生成答案的上下文不足。建议在“上下文预览”中查看原始召回内容。"
+        return (
+            "已检索到相关资料，但回答生成服务未能形成可靠答案。"
+            "为避免把原文片段误当成结论，本次不做额外推断，请查看下方引用或稍后重试。"
+        )
 
-    joined = "；".join(facts[:5])
+    joined = "；".join(facts[:4])
     return (
-        "根据当前知识库，可以归纳出下面的判断：\n\n"
-        f"相关资料共同指向这些信息：{joined}。这些内容说明问题需要结合前后链路一起看，而不是只看单个文本块。\n\n"
-        "建议按“数据来源是否完整、同步或生成任务是否成功、服务端是否读取到结果、客户端是否正常获取和展示”的顺序排查。"
+        "回答生成出现异常。根据当前知识库中能够直接确认的资料，"
+        f"相关信息为：{joined}。以上仅保留资料明确表达的内容，不补充资料之外的推断。"
     )
 
-
-_OUT_OF_SCOPE_PATTERNS = [
-    r"(天气|气温|下雨|降雨|刮风|台风|空气质量|穿什么衣服)",
-    r"(现在几点|几点了|今天几号|星期几|当前时间|北京时间)",
-    r"(热搜|最新消息|实时新闻|今日新闻|国际新闻|娱乐新闻|体育新闻|汇率|股价|股票价格|实时行情)",
-    r"(讲个笑话|写首诗|翻译|润色|闲聊)",
-]
-
-_DOMAIN_TERMS = {
-    "rsync", "cwrsync", "rsyncd", "cygwin", "agghost", "infocenter", "infohost",
-    "tdx", "通达信", "行情", "行情系统", "f10", "客户端", "服务端", "主站", "券商",
-    "交易", "柜台", "接口", "脚本", "日志", "配置", "部署", "安装", "同步", "连接",
-    "排查", "端口", "密码", "权限", "目录", "路径", "模块", "数据", "文件", "linux",
-    "windows", "tp", "ts", "资讯", "新闻资讯", "infohost", "zxdbtools", "数据库", "导出",
-    "本地文件", "数据不全", "显示",
-}
 
 _QUERY_STOP_TERMS = {
     "今天", "现在", "一下", "一个", "这个", "那个", "什么", "怎么", "怎样", "如何",
@@ -826,18 +935,9 @@ _QUERY_STOP_TERMS = {
 }
 
 
-def _contains_out_of_scope_intent(question: str) -> bool:
-    q = question.strip().lower()
-    return any(re.search(pattern, q, flags=re.IGNORECASE) for pattern in _OUT_OF_SCOPE_PATTERNS)
-
-
 def _extract_relevance_terms(text: str) -> set[str]:
     lowered = text.lower()
     terms = set(re.findall(r"[a-z0-9_+\-.]{2,}", lowered))
-
-    for term in _DOMAIN_TERMS:
-        if term.lower() in lowered:
-            terms.add(term.lower())
 
     for word in re.findall(r"[\u4e00-\u9fff]{2,}", text):
         if word in _QUERY_STOP_TERMS:
@@ -882,14 +982,7 @@ def _citations_are_relevant(question: str, citations_data: list[dict], history: 
         return False
 
     ctx = _relevance_context_text(citations_data)
-    domain_hits = {t for t in q_terms if t in {d.lower() for d in _DOMAIN_TERMS} and t in ctx}
-    if domain_hits:
-        return True
-
     overlap = {term for term in q_terms if len(term) >= 2 and term in ctx}
-    if _contains_out_of_scope_intent(question):
-        return len(overlap) >= 3
-
     long_question_terms = {term for term in q_terms if len(term) >= 3}
     long_overlap = {term for term in long_question_terms if term in ctx}
     if long_overlap:
@@ -903,6 +996,7 @@ def _build_answer_messages(
     question: str,
     citations_data: list[dict],
     history: list[dict],
+    workspace: str = DEFAULT_WORKSPACE,
 ) -> list[dict]:
     context_parts = []
     for citation in citations_data[:6]:
@@ -914,8 +1008,10 @@ def _build_answer_messages(
             f"#chunk{citation.get('chunk_index', 0)}\n{excerpt}"
         )
     context = "\n\n---\n\n".join(context_parts) if context_parts else "（未检索到相关文档）"
-    answer_cfg = get_config().get("answer_generation", {})
-    system = str(answer_cfg.get("system_prompt") or DEFAULT_ANSWER_SYSTEM_PROMPT)
+    system = str(
+        _load_workspace_settings(workspace).get("answer_system_prompt")
+        or DEFAULT_ANSWER_SYSTEM_PROMPT
+    )
     user = (
         f"问题：{question}\n\n"
         f"参考资料：\n{context}\n\n"
@@ -932,6 +1028,7 @@ async def _generate_answer_text(
     question: str,
     citations_data: list[dict],
     history: list[dict],
+    workspace: str = DEFAULT_WORKSPACE,
 ) -> str:
     if not citations_data:
         return "未检索到相关文档，知识库上下文不足，无法基于当前资料回答。"
@@ -948,7 +1045,12 @@ async def _generate_answer_text(
     )
     try:
         response = await backend.chat(
-            messages=_build_answer_messages(question, citations_data, history),
+            messages=_build_answer_messages(
+                question,
+                citations_data,
+                history,
+                workspace,
+            ),
             temperature=0.1,
             top_p=min(runtime_chat.get("top_p", 0.9), 0.85),
             max_tokens=min(runtime_chat.get("max_tokens", 4096), 900),
@@ -1102,19 +1204,20 @@ async def _empty_async_iter():
         yield ""
 
 
-def _list_sessions() -> list[dict]:
+def _list_sessions(workspace: str | None = None) -> list[dict]:
     """List all sessions sorted by updated_at descending."""
+    workspace_filter = sanitize_workspace(workspace) if workspace else None
     sessions = []
     for p in sorted(SESSIONS_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
         s = _load_session(p.stem)
-        if s:
+        if s and (workspace_filter is None or s.get("workspace") == workspace_filter):
             sessions.append(s)
     return sessions
 
 # --- State ---
 
-_uploaded_files: dict[str, Document] = {}
-_chunk_cache: dict[str, list[dict]] = {}
+_uploaded_files: dict[tuple[str, str], Document] = {}
+_chunk_cache: dict[tuple[str, str], list[dict]] = {}
 _index_tasks: dict[str, dict[str, Any]] = {}
 _index_task_lock = asyncio.Lock()
 _index_write_lock = asyncio.Lock()
@@ -1216,23 +1319,38 @@ def _public_index_task(task: dict[str, Any]) -> dict[str, Any]:
 
 
 def _load_doc_for_index(doc_name: str, workspace: str) -> Document:
+    workspace = sanitize_workspace(workspace)
     doc_name = _safe_leaf_name(doc_name)
     manifest = get_lightrag_service(workspace)._load_manifest()
-    registered = any(
-        item.get("doc_name") == doc_name
-        for item in manifest.get("documents", {}).values()
-        if isinstance(item, dict)
+    match = next(
+        (
+            (doc_id, item)
+            for doc_id, item in manifest.get("documents", {}).items()
+            if isinstance(item, dict) and item.get("doc_name") == doc_name
+        ),
+        None,
     )
-    if not registered:
+    if match is None:
         raise FileNotFoundError(f"文件未登记在当前知识库: {doc_name}")
-    doc = _uploaded_files.get(doc_name)
+    doc_id, manifest_item = match
+    key = _cache_key(workspace, doc_name)
+    doc = _uploaded_files.get(key)
     if doc is not None:
         return doc
-    file_path = _resolve_upload_path(doc_name)
+    file_path = _resolve_upload_path(doc_name, workspace, migrate_legacy=True)
     if not file_path.exists():
         raise FileNotFoundError(f"文件不存在: {doc_name}")
     doc = DocumentLoader().load_document(file_path)
-    _uploaded_files[doc_name] = doc
+    doc.metadata["lightrag_doc_id"] = doc_id
+    raw_text_path = _resolve_raw_text_path(workspace, doc_id)
+    if raw_text_path.exists():
+        doc.raw_text = raw_text_path.read_text(encoding="utf-8")
+        doc.metadata["raw_text_path"] = str(raw_text_path)
+    elif manifest_item.get("raw_text_path"):
+        legacy_raw_path = Path(str(manifest_item["raw_text_path"]))
+        if legacy_raw_path.exists():
+            doc.raw_text = legacy_raw_path.read_text(encoding="utf-8")
+    _uploaded_files[key] = doc
     return doc
 
 
@@ -1255,7 +1373,11 @@ def _workspace_doc_names_for_rebuild(workspace: str) -> list[str]:
         if Path(doc_name).suffix.lower() not in supported_exts:
             continue
         try:
-            source_path = _resolve_upload_path(doc_name)
+            source_path = _resolve_upload_path(
+                doc_name,
+                workspace,
+                migrate_legacy=True,
+            )
         except ValueError:
             logger.warning("Skipping rebuild source with invalid file name: {}", doc_name)
             continue
@@ -1265,6 +1387,100 @@ def _workspace_doc_names_for_rebuild(workspace: str) -> list[str]:
         seen.add(doc_name)
         doc_names.append(doc_name)
     return doc_names
+
+
+def _active_workspace_rebuild(workspace: str) -> dict[str, Any] | None:
+    workspace = sanitize_workspace(workspace)
+    return next(
+        (
+            task
+            for task in _index_tasks.values()
+            if task.get("workspace") == workspace
+            and task.get("kind") == "rebuild"
+            and task.get("status") in {"queued", "running"}
+        ),
+        None,
+    )
+
+
+def _ensure_workspace_available(workspace: str) -> None:
+    task = _active_workspace_rebuild(workspace)
+    if task:
+        raise HTTPException(
+            409,
+            f"Knowledge base is rebuilding ({task['task_id']}): {task.get('message', '')}",
+        )
+
+
+async def _start_workspace_rebuild(
+    req: RebuildIndexRequest,
+    *,
+    reason: str,
+    allow_empty: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    req.workspace = sanitize_workspace(req.workspace)
+    existing = _active_workspace_rebuild(req.workspace)
+    if existing:
+        return existing, {"already_running": True}
+
+    doc_names = _workspace_doc_names_for_rebuild(req.workspace)
+    if not doc_names and not allow_empty:
+        raise HTTPException(400, "No uploaded documents registered in this workspace to rebuild")
+
+    batch_req = BatchIndexRequest(
+        workspace=req.workspace,
+        doc_names=doc_names,
+        separators=req.separators,
+        chunk_size=req.chunk_size,
+        chunk_overlap=req.chunk_overlap,
+    )
+    task = await _create_index_task("rebuild", doc_names, req.workspace)
+    await _update_index_task(task["task_id"], message=f"准备重建：{reason}")
+    try:
+        async with _index_write_lock:
+            service = get_lightrag_service(req.workspace)
+            clear_result = await service.clear_workspace(preserve_manifest=True)
+            reset_lightrag_service(req.workspace)
+            _clear_workspace_cache(req.workspace)
+            logger.info(
+                "Cleared LightRAG workspace before rebuild ({}): {}",
+                reason,
+                clear_result,
+            )
+    except Exception as exc:
+        await _update_index_task(
+            task["task_id"],
+            status="failed",
+            message=f"重建准备失败: {exc}",
+            errors=[{"doc_name": "", "status": "error", "error": str(exc)}],
+        )
+        raise
+
+    if doc_names:
+        asyncio.create_task(_run_index_task(task["task_id"], batch_req))
+    else:
+        service = get_lightrag_service(req.workspace)
+        graph_replay = await service.replay_graph_audit()
+        replay_errors = graph_replay.get("errors") or []
+        await _update_index_task(
+            task["task_id"],
+            status="failed" if replay_errors else "succeeded",
+            current=0,
+            message=(
+                f"知识库已清空，但人工图谱修改恢复失败: {len(replay_errors)} 项"
+                if replay_errors
+                else "知识库已清空，无剩余文档需要重建"
+            ),
+            errors=[
+                {
+                    "doc_name": "",
+                    "status": "error",
+                    "error": f"人工图谱修改恢复失败: {replay_errors}",
+                }
+            ] if replay_errors else [],
+            graph_replay=graph_replay,
+        )
+    return _index_tasks[task["task_id"]], clear_result
 
 
 async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -> None:
@@ -1343,7 +1559,7 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                     logger.exception("LightRAG index task failed for {}", doc_name)
                     try:
                         if doc is None:
-                            doc = _uploaded_files.get(doc_name)
+                            doc = _uploaded_files.get(_cache_key(workspace, doc_name))
                         if doc is not None:
                             service.mark_document_status(doc, status="failed", indexed=False, error_msg=error_msg)
                     except Exception:
@@ -1362,12 +1578,30 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                     message=f"已完成 {idx + 1}/{len(doc_names)}",
                 )
 
-        if errors and len(errors) == len(doc_names):
+        task_kind = _index_tasks.get(task_id, {}).get("kind")
+        graph_replay = None
+        document_error_count = len(errors)
+        if task_kind == "rebuild" and not errors:
+            await _update_index_task(task_id, message="正在恢复人工图谱修改")
+            graph_replay = await service.replay_graph_audit()
+            if graph_replay.get("errors"):
+                replay_error = {
+                    "doc_name": "",
+                    "status": "error",
+                    "error": f"人工图谱修改恢复失败: {graph_replay['errors']}",
+                }
+                errors.append(replay_error)
+                results.append(replay_error)
+
+        if document_error_count and document_error_count == len(doc_names):
             status = "failed"
-            message = f"索引失败: {len(errors)} 个文档失败"
+            message = f"索引失败: {document_error_count} 个文档失败"
         elif errors:
             status = "partial"
-            message = f"索引部分完成: {len(results) - len(errors)} 成功, {len(errors)} 失败"
+            message = (
+                f"索引部分完成: {len(doc_names) - document_error_count} 个文档成功，"
+                f"{document_error_count} 个文档失败，另有 {len(errors) - document_error_count} 个图谱恢复错误"
+            )
         else:
             status = "succeeded"
             message = f"索引完成: {len(results)} 个文档"
@@ -1380,6 +1614,7 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
             results=results,
             errors=errors,
             message=message,
+            graph_replay=graph_replay,
         )
     except Exception as exc:
         logger.exception("Index task crashed: {}", task_id)
@@ -1428,14 +1663,16 @@ async def delete_workspace(workspace: str):
     result = await service.clear_workspace()
     if service.manifest_path.exists():
         service.manifest_path.unlink()
+    removed_uploads = _remove_workspace_sources(workspace)
     reset_lightrag_service(workspace)
-    return {"deleted": workspace, **result}
+    return {"deleted": workspace, "removed_uploads": removed_uploads, **result}
 
 
 @app.post("/api/kb/upload")
 async def upload_document(file: UploadFile = File(...), workspace: str = Query(DEFAULT_WORKSPACE)):
     """Upload a document for preview before indexing."""
     workspace = sanitize_workspace(workspace)
+    _ensure_workspace_available(workspace)
     if not file.filename:
         raise HTTPException(400, "No filename provided")
 
@@ -1450,15 +1687,22 @@ async def upload_document(file: UploadFile = File(...), workspace: str = Query(D
         raise HTTPException(400, f"Unsupported file type: {ext}")
 
     # Save to upload dir
-    dest = _resolve_upload_path(safe_name)
+    dest = _resolve_upload_path(safe_name, workspace, create_dir=True)
     content = await file.read()
     dest.write_bytes(content)
 
     # Parse document
     try:
         doc = loader.load_document(dest)
-        _uploaded_files[safe_name] = doc
-        item = get_lightrag_service(workspace).register_upload(doc)
+        key = _cache_key(workspace, safe_name)
+        service = get_lightrag_service(workspace)
+        item = service.register_upload(doc)
+        raw_text_path = _resolve_raw_text_path(workspace, item["doc_id"], create_dir=True)
+        raw_text_path.write_text(doc.raw_text, encoding="utf-8")
+        doc.metadata["lightrag_doc_id"] = item["doc_id"]
+        doc.metadata["raw_text_path"] = str(raw_text_path)
+        item = service.register_upload(doc)
+        _uploaded_files[key] = doc
         return {
             "file_name": safe_name,
             "workspace": workspace,
@@ -1478,7 +1722,13 @@ async def preview_chunks(req: ChunkPreviewRequest):
         req.file_name = _safe_leaf_name(req.file_name)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    doc = _uploaded_files.get(req.file_name)
+    key = _cache_key(req.workspace, req.file_name)
+    doc = _uploaded_files.get(key)
+    if doc is None:
+        try:
+            doc = _load_doc_for_index(req.file_name, req.workspace)
+        except (FileNotFoundError, ValueError):
+            doc = None
     if doc is None:
         raise HTTPException(404, f"File '{req.file_name}' not uploaded yet")
 
@@ -1494,7 +1744,7 @@ async def preview_chunks(req: ChunkPreviewRequest):
         for c in chunks
     ]
     # Cache for indexing
-    _chunk_cache[req.file_name] = [
+    _chunk_cache[key] = [
         {"index": c.chunk_index, "text": c.text} for c in chunks
     ]
     return result
@@ -1505,17 +1755,22 @@ async def index_document(req: IndexRequest):
     """Create a background task to index a document into LightRAG."""
     try:
         req.file_name = _safe_leaf_name(req.file_name)
-        file_path = _resolve_upload_path(req.file_name)
+        file_path = _resolve_upload_path(
+            req.file_name,
+            req.workspace,
+            migrate_legacy=True,
+        )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     req.workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(req.workspace)
     manifest = get_lightrag_service(req.workspace)._load_manifest()
     registered = any(
         item.get("doc_name") == req.file_name
         for item in manifest.get("documents", {}).values()
         if isinstance(item, dict)
     )
-    if not registered or (req.file_name not in _uploaded_files and not file_path.exists()):
+    if not registered or (_cache_key(req.workspace, req.file_name) not in _uploaded_files and not file_path.exists()):
         raise HTTPException(404, f"File '{req.file_name}' not uploaded yet")
 
     task = await _create_index_task("single", [req.file_name], req.workspace)
@@ -1532,6 +1787,8 @@ async def list_documents(workspace: str = Query(DEFAULT_WORKSPACE)):
 @app.delete("/api/kb/documents/{doc_name}")
 async def delete_document(doc_name: str, workspace: str = Query(DEFAULT_WORKSPACE)):
     """Delete a document from LightRAG by doc_id or uploaded file name."""
+    workspace = sanitize_workspace(workspace)
+    _ensure_workspace_available(workspace)
     service = get_lightrag_service(workspace)
     try:
         result = await service.delete_document(doc_name)
@@ -1540,12 +1797,41 @@ async def delete_document(doc_name: str, workspace: str = Query(DEFAULT_WORKSPAC
     except Exception as e:
         logger.exception("LightRAG delete failed for {}", doc_name)
         raise HTTPException(500, f"LightRAG delete failed: {e}")
-    _uploaded_files.pop(result["doc_name"], None)
+    _uploaded_files.pop(_cache_key(workspace, result["doc_name"]), None)
+    _chunk_cache.pop(_cache_key(workspace, result["doc_name"]), None)
+    for source_path in (
+        _resolve_upload_path(result["doc_name"], workspace),
+        _resolve_raw_text_path(workspace, result["doc_id"]),
+    ):
+        try:
+            if source_path.is_file():
+                source_path.unlink()
+        except OSError as exc:
+            logger.warning("Failed to remove deleted document source {}: {}", source_path, exc)
     graph_residuals = service.find_graph_references(
         doc_id=result["doc_id"],
         doc_name=result["doc_name"],
     )
-    return {"deleted": 1, **result, "graph_residuals": graph_residuals}
+    cleanup_task = None
+    cleanup_error = ""
+    if graph_residuals.get("has_residuals") or not graph_residuals.get("checked", False):
+        rebuild_req = RebuildIndexRequest(workspace=workspace)
+        try:
+            cleanup_task, _clear_result = await _start_workspace_rebuild(
+                rebuild_req,
+                reason=f"删除文档 {result['doc_name']} 后自动清理图谱",
+                allow_empty=True,
+            )
+        except Exception as exc:
+            cleanup_error = str(exc)
+            logger.exception("Document deleted but automatic graph cleanup failed to start")
+    return {
+        "deleted": 1,
+        **result,
+        "graph_residuals": graph_residuals,
+        "cleanup_task": _public_index_task(cleanup_task) if cleanup_task else None,
+        "cleanup_error": cleanup_error,
+    }
 
 
 class BatchDeleteRequest(BaseModel):
@@ -1576,6 +1862,8 @@ class RawTextUpdateRequest(BaseModel):
 @app.post("/api/kb/batch-delete")
 async def batch_delete(req: BatchDeleteRequest):
     """Delete multiple documents at once."""
+    req.workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(req.workspace)
     deleted = 0
     errors = []
     residual_items = []
@@ -1583,7 +1871,17 @@ async def batch_delete(req: BatchDeleteRequest):
     for doc_name in req.doc_names:
         try:
             result = await service.delete_document(doc_name)
-            _uploaded_files.pop(result["doc_name"], None)
+            _uploaded_files.pop(_cache_key(req.workspace, result["doc_name"]), None)
+            _chunk_cache.pop(_cache_key(req.workspace, result["doc_name"]), None)
+            for source_path in (
+                _resolve_upload_path(result["doc_name"], req.workspace),
+                _resolve_raw_text_path(req.workspace, result["doc_id"]),
+            ):
+                try:
+                    if source_path.is_file():
+                        source_path.unlink()
+                except OSError as exc:
+                    logger.warning("Failed to remove batch-deleted source {}: {}", source_path, exc)
             residual_items.append(
                 {
                     "doc_name": result["doc_name"],
@@ -1598,6 +1896,23 @@ async def batch_delete(req: BatchDeleteRequest):
             logger.info("Batch-delete: removed LightRAG doc '{}'", doc_name)
         except Exception as e:
             errors.append({"doc_name": doc_name, "error": str(e)})
+    cleanup_task = None
+    cleanup_error = ""
+    needs_cleanup = any(
+        item.get("has_residuals") or not item.get("checked", False)
+        for item in residual_items
+    )
+    if needs_cleanup:
+        rebuild_req = RebuildIndexRequest(workspace=req.workspace)
+        try:
+            cleanup_task, _clear_result = await _start_workspace_rebuild(
+                rebuild_req,
+                reason="批量删除文档后自动清理图谱",
+                allow_empty=True,
+            )
+        except Exception as exc:
+            cleanup_error = str(exc)
+            logger.exception("Documents deleted but automatic graph cleanup failed to start")
     return {
         "deleted_chunks": deleted,
         "doc_count": len(req.doc_names),
@@ -1606,6 +1921,8 @@ async def batch_delete(req: BatchDeleteRequest):
             "has_residuals": any(item.get("has_residuals") for item in residual_items),
             "items": residual_items,
         },
+        "cleanup_task": _public_index_task(cleanup_task) if cleanup_task else None,
+        "cleanup_error": cleanup_error,
     }
 
 
@@ -1619,6 +1936,7 @@ async def batch_index(req: BatchIndexRequest):
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     req.workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(req.workspace)
     task = await _create_index_task("batch", list(req.doc_names), req.workspace)
     asyncio.create_task(_run_index_task(task["task_id"], req))
     return _public_index_task(task)
@@ -1627,28 +1945,10 @@ async def batch_index(req: BatchIndexRequest):
 @app.post("/api/kb/rebuild")
 async def rebuild_index(req: RebuildIndexRequest):
     """Clear current workspace index and rebuild only that workspace's registered documents."""
-    req.workspace = sanitize_workspace(req.workspace)
-    doc_names = _workspace_doc_names_for_rebuild(req.workspace)
-    if not doc_names:
-        raise HTTPException(400, "No uploaded documents registered in this workspace to rebuild")
-
-    async with _index_write_lock:
-        service = get_lightrag_service(req.workspace)
-        clear_result = await service.clear_workspace()
-        reset_lightrag_service(req.workspace)
-        _uploaded_files.clear()
-        _chunk_cache.clear()
-        logger.info("Cleared LightRAG workspace before rebuild: {}", clear_result)
-
-    batch_req = BatchIndexRequest(
-        doc_names=doc_names,
-        separators=req.separators,
-        chunk_size=req.chunk_size,
-        chunk_overlap=req.chunk_overlap,
+    task, clear_result = await _start_workspace_rebuild(
+        req,
+        reason="用户请求",
     )
-    batch_req.workspace = sanitize_workspace(req.workspace)
-    task = await _create_index_task("rebuild", doc_names, batch_req.workspace)
-    asyncio.create_task(_run_index_task(task["task_id"], batch_req))
     return {**_public_index_task(task), "clear_result": clear_result}
 
 
@@ -1668,19 +1968,11 @@ async def clear_knowledge_base(req: ClearKnowledgeBaseRequest):
         service = get_lightrag_service(req.workspace)
         result = await service.clear_workspace()
         reset_lightrag_service(req.workspace)
-        _uploaded_files.clear()
-        _chunk_cache.clear()
+        _clear_workspace_cache(req.workspace)
 
         removed_uploads = 0
         if req.clear_uploads:
-            upload_root = UPLOAD_DIR.resolve()
-            for path in list(UPLOAD_DIR.iterdir()):
-                resolved = path.resolve()
-                if upload_root not in resolved.parents:
-                    continue
-                if path.is_file():
-                    path.unlink()
-                    removed_uploads += 1
+            removed_uploads = _remove_workspace_sources(req.workspace)
 
     return {**result, "removed_uploads": removed_uploads}
 
@@ -1719,60 +2011,79 @@ async def cancel_index_task(task_id: str):
 
 
 @app.get("/api/kb/documents/{doc_name}/raw-text")
-async def get_document_raw_text(doc_name: str):
+async def get_document_raw_text(
+    doc_name: str,
+    workspace: str = Query(DEFAULT_WORKSPACE),
+):
     """Get the raw parsed text of a document (for preview/editing before chunking)."""
     try:
         doc_name = _safe_leaf_name(doc_name)
+        workspace = sanitize_workspace(workspace)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    # 1) Check in-memory cache (freshly uploaded)
-    doc = _uploaded_files.get(doc_name)
-    if doc is not None:
+    try:
+        key = _cache_key(workspace, doc_name)
+        source = "cache" if key in _uploaded_files else "disk"
+        doc = _load_doc_for_index(doc_name, workspace)
         return {
             "file_name": doc.file_name,
             "file_type": doc.file_type,
             "char_count": len(doc.raw_text),
             "raw_text": doc.raw_text,
-            "source": "cache",
+            "source": source,
+            "workspace": workspace,
         }
-
-    # 2) Check if indexed — re-parse from disk
-    file_path = _resolve_upload_path(doc_name)
-    if file_path.exists():
-        try:
-            loader = DocumentLoader()
-            doc = loader.load_document(file_path)
-            _uploaded_files[doc_name] = doc
-            return {
-                "file_name": doc.file_name,
-                "file_type": doc.file_type,
-                "char_count": len(doc.raw_text),
-                "raw_text": doc.raw_text,
-                "source": "disk",
-            }
-        except Exception as e:
-            raise HTTPException(500, f"Re-parse failed: {e}")
-
-    raise HTTPException(404, f"Document '{doc_name}' not found in uploads or cache")
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"Re-parse failed: {exc}")
 
 
 @app.put("/api/kb/documents/{doc_name}/raw-text")
-async def update_document_raw_text(doc_name: str, req: RawTextUpdateRequest):
-    """Update the raw text of a cached document (user-edited before chunking)."""
+async def update_document_raw_text(
+    doc_name: str,
+    req: RawTextUpdateRequest,
+    workspace: str = Query(DEFAULT_WORKSPACE),
+):
+    """Persist edited parsed text and invalidate derived LightRAG data."""
     try:
         doc_name = _safe_leaf_name(doc_name)
+        workspace = sanitize_workspace(workspace)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    doc = _uploaded_files.get(doc_name)
-    if doc is None:
-        raise HTTPException(404, f"Document '{doc_name}' not in cache — upload it first")
-
-    doc.raw_text = req.raw_text
-    logger.info(f"Updated raw_text for '{doc_name}': {len(req.raw_text)} chars")
+    if not req.raw_text.strip():
+        raise HTTPException(400, "Raw text cannot be empty")
+    _ensure_workspace_available(workspace)
+    try:
+        doc = _load_doc_for_index(doc_name, workspace)
+        service = get_lightrag_service(workspace)
+        invalidated = await service.invalidate_document(doc_name)
+        raw_text_path = _resolve_raw_text_path(
+            workspace,
+            invalidated["doc_id"],
+            create_dir=True,
+        )
+        raw_text_path.write_text(req.raw_text, encoding="utf-8")
+        doc.raw_text = req.raw_text
+        doc.metadata["lightrag_doc_id"] = invalidated["doc_id"]
+        doc.metadata["raw_text_path"] = str(raw_text_path)
+        service.register_upload(doc)
+        _uploaded_files[_cache_key(workspace, doc_name)] = doc
+        _chunk_cache.pop(_cache_key(workspace, doc_name), None)
+    except KeyError:
+        raise HTTPException(404, f"Document '{doc_name}' not found in workspace '{workspace}'")
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc))
+    except Exception as exc:
+        logger.exception("Failed to update raw text for {}", doc_name)
+        raise HTTPException(500, f"Raw text update failed: {exc}")
+    logger.info("Updated raw_text for '{}' in '{}': {} chars", doc_name, workspace, len(req.raw_text))
     return {
         "file_name": doc_name,
+        "workspace": workspace,
         "char_count": len(req.raw_text),
-        "message": "原始文本已更新，请重新预览分块",
+        "index_invalidated": True,
+        "message": "原始文本已保存，旧索引已移除，请重新预览并索引",
     }
 
 
@@ -1783,6 +2094,8 @@ async def get_document_chunks(doc_name: str, workspace: str = Query(DEFAULT_WORK
         doc_name = _safe_leaf_name(doc_name)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    workspace = sanitize_workspace(workspace)
+    _ensure_workspace_available(workspace)
     service = get_lightrag_service(workspace)
     chunks = await service.get_document_chunks(doc_name)
     if chunks:
@@ -1796,14 +2109,20 @@ async def get_document_chunks(doc_name: str, workspace: str = Query(DEFAULT_WORK
     file_path = Path(item.get("file_path") or "")
     if not file_path.exists():
         try:
-            file_path = _resolve_upload_path(item.get("doc_name", doc_name))
+            file_path = _resolve_upload_path(
+                item.get("doc_name", doc_name),
+                workspace,
+                migrate_legacy=True,
+            )
         except ValueError:
             return {"doc_name": item.get("doc_name", doc_name), "total": 0, "chunks": []}
     if not file_path.exists():
         return {"doc_name": item.get("doc_name", doc_name), "total": 0, "chunks": []}
 
     try:
-        doc = _uploaded_files.get(item.get("doc_name", doc_name)) or DocumentLoader().load_document(file_path)
+        doc = _uploaded_files.get(_cache_key(workspace, item.get("doc_name", doc_name)))
+        if doc is None:
+            doc = _load_doc_for_index(item.get("doc_name", doc_name), workspace)
         chunking = item.get("chunking") or {}
         cfg = get_config()
         default_chunking = cfg.get("chunking", {})
@@ -1836,6 +2155,8 @@ async def get_document_chunks(doc_name: str, workspace: str = Query(DEFAULT_WORK
 @app.post("/api/recall/test", response_model=RecallTestResponse)
 async def recall_test(req: RecallTestRequest):
     """Preview LightRAG context with QueryParam(only_need_context=True)."""
+    req.workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(req.workspace)
     try:
         async with _rag_query_lock:
             result = await get_lightrag_service(req.workspace).preview_context(
@@ -1867,6 +2188,8 @@ async def recall_test(req: RecallTestRequest):
 @app.post("/api/search")
 async def search(req: SearchRequest):
     """Full LightRAG search with answer generation."""
+    req.workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(req.workspace)
     try:
         answer = await get_lightrag_service(req.workspace).query(
             req.query,
@@ -1889,12 +2212,14 @@ async def search(req: SearchRequest):
 # --- Model Config Endpoints ---
 
 @app.get("/api/models/config")
-async def get_model_config():
-    """Get legacy model configuration plus current answer prompt."""
+async def get_model_config(workspace: str = Query(DEFAULT_WORKSPACE)):
+    """Get generation parameters and the selected workspace answer prompt."""
+    workspace = sanitize_workspace(workspace)
     cfg = get_config()
     sf = cfg.get("siliconflow", {})
     runtime = get_runtime_model_config(cfg)
     return ModelConfig(
+        workspace=workspace,
         embed_model=runtime["embedding"]["model"],
         embed_base_url=runtime["embedding"]["base_url"],
         rerank_model=runtime["rerank"]["model"],
@@ -1902,16 +2227,19 @@ async def get_model_config():
         chat_temperature=sf.get("chat_temperature", 0.7),
         chat_top_p=sf.get("chat_top_p", 0.9),
         chat_max_tokens=sf.get("chat_max_tokens", 4096),
-        answer_system_prompt=cfg.get("answer_generation", {}).get(
-            "system_prompt",
+        answer_system_prompt=_load_workspace_settings(workspace).get(
+            "answer_system_prompt",
             DEFAULT_ANSWER_SYSTEM_PROMPT,
         ),
     )
 
 
 @app.put("/api/models/config")
-async def update_model_config(config: ModelConfig):
-    """Update legacy generation parameters and answer prompt.
+async def update_model_config(
+    config: ModelConfig,
+    workspace: str = Query(DEFAULT_WORKSPACE),
+):
+    """Update global generation parameters and a workspace-specific answer prompt.
 
     Model endpoints/keys/models are managed by /api/model-profiles and
     /api/model-bindings. This endpoint is kept for compatibility.
@@ -1927,12 +2255,13 @@ async def update_model_config(config: ModelConfig):
     sf["chat_top_p"] = config.chat_top_p
     sf["chat_max_tokens"] = config.chat_max_tokens
 
-    answer_generation = yaml_config.setdefault("answer_generation", {})
-    answer_generation["system_prompt"] = config.answer_system_prompt.strip() or DEFAULT_ANSWER_SYSTEM_PROMPT
-
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         yaml.safe_dump(yaml_config, f, allow_unicode=True, default_flow_style=False)
 
+    _save_workspace_settings(
+        workspace,
+        {"answer_system_prompt": config.answer_system_prompt},
+    )
     # Config changed: rebuild the LightRAG adapter on the next request.
     reset_config()
     reset_lightrag_service()
@@ -2057,11 +2386,18 @@ async def test_embed(req: EmbedTestRequest):
 
 # --- Chat Endpoints ---
 
-def _ensure_session(session_id: Optional[str], first_message: str) -> tuple[str, dict]:
+def _ensure_session(
+    session_id: Optional[str],
+    first_message: str,
+    workspace: str = DEFAULT_WORKSPACE,
+) -> tuple[str, dict]:
     """Get or create a session, return (session_id, session_dict)."""
+    workspace = sanitize_workspace(workspace)
     if session_id:
         s = _load_session(session_id)
         if s:
+            if s.get("workspace") != workspace:
+                raise ValueError("Chat session belongs to a different workspace")
             return session_id, s
 
     # Create new session
@@ -2070,6 +2406,7 @@ def _ensure_session(session_id: Optional[str], first_message: str) -> tuple[str,
     title = first_message[:40] + ("..." if len(first_message) > 40 else "")
     session = {
         "id": sid,
+        "workspace": workspace,
         "title": title,
         "messages": [],
         "created_at": now,
@@ -2083,6 +2420,8 @@ def _ensure_session(session_id: Optional[str], first_message: str) -> tuple[str,
 async def chat_send(req: ChatSendRequest):
     """Send a message in a chat session and get AI response with RAG context."""
     now = datetime.now(timezone.utc).isoformat()
+    req.workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(req.workspace)
     service = get_lightrag_service(req.workspace)
 
     # Critical section 1 (per-session lock): ensure session + read history.
@@ -2090,13 +2429,16 @@ async def chat_send(req: ChatSendRequest):
     # new session (no session_id) there is nothing to race against.
     if req.session_id:
         async with _get_session_lock(req.session_id):
-            sid, session = _ensure_session(req.session_id, req.message)
+            try:
+                sid, session = _ensure_session(req.session_id, req.message, req.workspace)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc))
             raw_history: list[dict] = [
                 {"role": m["role"], "content": m["content"]}
                 for m in session.get("messages", [])
             ]
     else:
-        sid, session = _ensure_session(req.session_id, req.message)
+        sid, session = _ensure_session(req.session_id, req.message, req.workspace)
         raw_history: list[dict] = [
             {"role": m["role"], "content": m["content"]}
             for m in session.get("messages", [])
@@ -2124,7 +2466,12 @@ async def chat_send(req: ChatSendRequest):
             logger.info("Retrieved citations rejected as irrelevant for query: {}", req.message)
             citations_data = []
         if citations_data:
-            ai_text = await _generate_answer_text(req.message, citations_data, history)
+            ai_text = await _generate_answer_text(
+                req.message,
+                citations_data,
+                history,
+                req.workspace,
+            )
 
     if not citations_data:
         ai_text = "未检索到相关文档，知识库上下文不足，无法基于当前资料回答。"
@@ -2185,18 +2532,23 @@ async def chat_send(req: ChatSendRequest):
 async def chat_send_stream(req: ChatSendRequest):
     """Send a message and stream the AI response via SSE."""
     now = datetime.now(timezone.utc).isoformat()
+    req.workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(req.workspace)
     service = get_lightrag_service(req.workspace)
 
     # Critical section 1 (per-session lock): ensure session + read history.
     if req.session_id:
         async with _get_session_lock(req.session_id):
-            sid, session = _ensure_session(req.session_id, req.message)
+            try:
+                sid, session = _ensure_session(req.session_id, req.message, req.workspace)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc))
             raw_history: list[dict] = [
                 {"role": m["role"], "content": m["content"]}
                 for m in session.get("messages", [])
             ]
     else:
-        sid, session = _ensure_session(req.session_id, req.message)
+        sid, session = _ensure_session(req.session_id, req.message, req.workspace)
         raw_history: list[dict] = [
             {"role": m["role"], "content": m["content"]}
             for m in session.get("messages", [])
@@ -2238,7 +2590,12 @@ async def chat_send_stream(req: ChatSendRequest):
 
         try:
             try:
-                full_text = await _generate_answer_text(req.message, citations_data, history)
+                full_text = await _generate_answer_text(
+                    req.message,
+                    citations_data,
+                    history,
+                    req.workspace,
+                )
                 for i in range(0, len(full_text), 80):
                     token = full_text[i:i + 80]
                     yield f"data: {json.dumps({'token': token}, ensure_ascii=False)}\n\n"
@@ -2295,12 +2652,14 @@ async def chat_send_stream(req: ChatSendRequest):
 
 
 @app.get("/api/chat/sessions", response_model=list[ChatSessionListItem])
-async def list_chat_sessions():
-    """List all chat sessions."""
-    sessions = _list_sessions()
+async def list_chat_sessions(workspace: str = Query(DEFAULT_WORKSPACE)):
+    """List chat sessions owned by one workspace."""
+    workspace = sanitize_workspace(workspace)
+    sessions = _list_sessions(workspace)
     return [
         ChatSessionListItem(
             id=s["id"],
+            workspace=s.get("workspace", DEFAULT_WORKSPACE),
             title=s.get("title", ""),
             message_count=len(s.get("messages", [])),
             created_at=s.get("created_at", ""),
@@ -2311,15 +2670,21 @@ async def list_chat_sessions():
 
 
 @app.get("/api/chat/sessions/{session_id}", response_model=ChatSession)
-async def get_chat_session(session_id: str):
+async def get_chat_session(
+    session_id: str,
+    workspace: str = Query(DEFAULT_WORKSPACE),
+):
     """Get a single chat session with full messages."""
     if not _SESSION_ID_RE.fullmatch(session_id.lower()):
         raise HTTPException(400, "Invalid session id")
     s = _load_session(session_id)
     if not s:
         raise HTTPException(404, "Session not found")
+    if s.get("workspace") != sanitize_workspace(workspace):
+        raise HTTPException(404, "Session not found in current workspace")
     return ChatSession(
         id=s["id"],
+        workspace=s.get("workspace", DEFAULT_WORKSPACE),
         title=s.get("title", ""),
         messages=[ChatMessage(**m) for m in s.get("messages", [])],
         created_at=s.get("created_at", ""),
@@ -2328,25 +2693,37 @@ async def get_chat_session(session_id: str):
 
 
 @app.delete("/api/chat/sessions/{session_id}")
-async def delete_chat_session(session_id: str):
+async def delete_chat_session(
+    session_id: str,
+    workspace: str = Query(DEFAULT_WORKSPACE),
+):
     """Delete a chat session."""
     try:
         path = _session_path(session_id)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    session = _load_session(session_id)
+    if session and session.get("workspace") != sanitize_workspace(workspace):
+        raise HTTPException(404, "Session not found in current workspace")
     if path.exists():
         path.unlink()
         logger.info(f"Deleted chat session: {session_id}")
     return {"deleted": session_id}
 
 
+class ChatSessionCreateRequest(BaseModel):
+    workspace: str = DEFAULT_WORKSPACE
+
+
 @app.post("/api/chat/sessions")
-async def create_chat_session():
+async def create_chat_session(req: ChatSessionCreateRequest):
     """Create a new empty chat session."""
+    workspace = sanitize_workspace(req.workspace)
     sid = uuid.uuid4().hex[:12]
     now = datetime.now(timezone.utc).isoformat()
     session = {
         "id": sid,
+        "workspace": workspace,
         "title": "新对话",
         "messages": [],
         "created_at": now,
@@ -2355,6 +2732,7 @@ async def create_chat_session():
     _save_session(sid, session)
     return {
         "id": sid,
+        "workspace": workspace,
         "title": "新对话",
         "message_count": 0,
         "created_at": now,
@@ -2419,6 +2797,8 @@ async def system_stats(workspace: str = Query(DEFAULT_WORKSPACE)):
 @app.get("/api/graph")
 async def get_graph(limit: int = Query(200, ge=1, le=1000), workspace: str = Query(DEFAULT_WORKSPACE)):
     """Return LightRAG entity-relation graph extracted from GraphML."""
+    workspace = sanitize_workspace(workspace)
+    _ensure_workspace_available(workspace)
     return get_lightrag_service(workspace).read_graph(limit=limit, include_isolated=True)
 
 
@@ -2603,6 +2983,7 @@ async def delete_graph_rule_template(template_id: str):
 @app.post("/api/graph/governance/apply-template", response_model=GraphGovernanceConfig)
 async def apply_graph_rule_template(req: GraphRuleTemplateApplyRequest):
     workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(workspace)
     try:
         return get_lightrag_service(workspace).apply_graph_rule_template(req.template_id)
     except KeyError:
@@ -2612,6 +2993,7 @@ async def apply_graph_rule_template(req: GraphRuleTemplateApplyRequest):
 @app.put("/api/graph/governance/config", response_model=GraphGovernanceConfig)
 async def update_graph_governance_config(req: GraphGovernanceUpdate):
     workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(workspace)
     service = get_lightrag_service(workspace)
     return service.save_graph_governance(
         {
@@ -2630,6 +3012,7 @@ async def update_graph_governance_config(req: GraphGovernanceUpdate):
 @app.post("/api/graph/governance/references")
 async def upload_graph_reference(file: UploadFile = File(...), workspace: str = Query(DEFAULT_WORKSPACE)):
     workspace = sanitize_workspace(workspace)
+    _ensure_workspace_available(workspace)
     content = await _read_governance_reference_upload(file)
     if not content.strip():
         raise HTTPException(400, "Reference file is empty")
@@ -2640,6 +3023,7 @@ async def upload_graph_reference(file: UploadFile = File(...), workspace: str = 
 @app.delete("/api/graph/governance/references/{ref_id}")
 async def delete_graph_reference(ref_id: str, workspace: str = Query(DEFAULT_WORKSPACE)):
     workspace = sanitize_workspace(workspace)
+    _ensure_workspace_available(workspace)
     try:
         return get_lightrag_service(workspace).delete_graph_reference(ref_id)
     except KeyError:
@@ -2649,6 +3033,7 @@ async def delete_graph_reference(ref_id: str, workspace: str = Query(DEFAULT_WOR
 @app.post("/api/graph/governance/suggest", response_model=GraphSuggestResponse)
 async def suggest_graph_changes(req: GraphSuggestRequest):
     req.workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(req.workspace)
     async with _rag_query_lock:
         return await _generate_graph_suggestions(req)
 
@@ -2656,6 +3041,7 @@ async def suggest_graph_changes(req: GraphSuggestRequest):
 @app.post("/api/graph/governance/apply")
 async def apply_graph_changes(req: GraphApplyChangesRequest):
     workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(workspace)
     service = get_lightrag_service(workspace)
     results = []
     async with _rag_query_lock:
@@ -2672,6 +3058,7 @@ async def apply_graph_changes(req: GraphApplyChangesRequest):
 @app.post("/api/graph/entities")
 async def create_graph_entity(req: GraphEntityCreateRequest):
     workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(workspace)
     data = _graph_payload_without_empty(
         {
             "description": req.description,
@@ -2691,6 +3078,7 @@ async def create_graph_entity(req: GraphEntityCreateRequest):
 @app.put("/api/graph/entities")
 async def update_graph_entity(req: GraphEntityUpdateRequest):
     workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(workspace)
     async with _rag_query_lock:
         try:
             result = await get_lightrag_service(workspace).edit_graph_entity(
@@ -2707,6 +3095,7 @@ async def update_graph_entity(req: GraphEntityUpdateRequest):
 @app.delete("/api/graph/entities/{entity_name}")
 async def delete_graph_entity(entity_name: str, workspace: str = Query(DEFAULT_WORKSPACE)):
     workspace = sanitize_workspace(workspace)
+    _ensure_workspace_available(workspace)
     async with _rag_query_lock:
         try:
             result = await get_lightrag_service(workspace).delete_graph_entity(entity_name)
@@ -2718,6 +3107,7 @@ async def delete_graph_entity(entity_name: str, workspace: str = Query(DEFAULT_W
 @app.post("/api/graph/relations")
 async def create_graph_relation(req: GraphRelationCreateRequest):
     workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(workspace)
     data = _graph_payload_without_empty(
         {
             "description": req.description,
@@ -2742,6 +3132,7 @@ async def create_graph_relation(req: GraphRelationCreateRequest):
 @app.put("/api/graph/relations")
 async def update_graph_relation(req: GraphRelationUpdateRequest):
     workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(workspace)
     async with _rag_query_lock:
         try:
             result = await get_lightrag_service(workspace).edit_graph_relation(
@@ -2757,6 +3148,7 @@ async def update_graph_relation(req: GraphRelationUpdateRequest):
 @app.delete("/api/graph/relations")
 async def delete_graph_relation(req: GraphRelationDeleteRequest):
     workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(workspace)
     async with _rag_query_lock:
         try:
             result = await get_lightrag_service(workspace).delete_graph_relation(
@@ -2771,6 +3163,7 @@ async def delete_graph_relation(req: GraphRelationDeleteRequest):
 @app.post("/api/graph/entities/merge")
 async def merge_graph_entities(req: GraphEntityMergeRequest):
     workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(workspace)
     async with _rag_query_lock:
         try:
             result = await get_lightrag_service(workspace).merge_graph_entities(
@@ -2790,7 +3183,12 @@ async def health():
 
 def main():
     """Entry point for `python -m src.api.server`."""
-    uvicorn.run("src.api.server:app", host="0.0.0.0", port=8101, reload=True)
+    uvicorn.run(
+        "src.api.server:app",
+        host=os.environ.get("TDX_HOST", "127.0.0.1"),
+        port=8101,
+        reload=True,
+    )
 
 
 if __name__ == "__main__":

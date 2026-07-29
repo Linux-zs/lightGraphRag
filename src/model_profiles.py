@@ -1,24 +1,36 @@
 """Model provider profiles and per-purpose model bindings.
 
-API keys are stored under data/secrets, which is ignored by git. The public
-profile store only keeps non-sensitive metadata and cached model ids.
+API keys are encrypted at rest under data/secrets. Windows uses the current
+user's DPAPI protection; other platforms use a permission-restricted local
+Fernet key. The public profile store only keeps non-sensitive metadata.
 """
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
+import ipaddress
 import json
+import os
+from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
+from cryptography.fernet import Fernet
 
 from src.config_loader import get_config
 
 
 DEFAULT_PROFILE_ID = "siliconflow-default"
 DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
+_BLOCKED_MODEL_HOSTS = {
+    "169.254.169.254",
+    "metadata.google.internal",
+    "metadata.azure.internal",
+}
 
 
 def _now_iso() -> str:
@@ -35,7 +47,91 @@ def _profiles_path(config: dict[str, Any] | None = None) -> Path:
 
 
 def _keys_path(config: dict[str, Any] | None = None) -> Path:
+    return _data_dir(config) / "secrets" / "model_keys.enc"
+
+
+def _legacy_keys_path(config: dict[str, Any] | None = None) -> Path:
     return _data_dir(config) / "secrets" / "model_keys.json"
+
+
+def _fallback_key_path(config: dict[str, Any] | None = None) -> Path:
+    return _data_dir(config) / "secrets" / ".model_keys.key"
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [
+        ("cbData", wintypes.DWORD),
+        ("pbData", ctypes.POINTER(ctypes.c_char)),
+    ]
+
+
+def _dpapi_transform(data: bytes, *, protect: bool) -> bytes:
+    buffer = ctypes.create_string_buffer(data)
+    input_blob = _DataBlob(
+        len(data),
+        ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)),
+    )
+    output_blob = _DataBlob()
+    crypt32 = ctypes.windll.crypt32
+    if protect:
+        ok = crypt32.CryptProtectData(
+            ctypes.byref(input_blob),
+            ctypes.c_wchar_p("LightGraphRAG model keys"),
+            None,
+            None,
+            None,
+            0x1,
+            ctypes.byref(output_blob),
+        )
+    else:
+        ok = crypt32.CryptUnprotectData(
+            ctypes.byref(input_blob),
+            None,
+            None,
+            None,
+            None,
+            0x1,
+            ctypes.byref(output_blob),
+        )
+    if not ok:
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(output_blob.pbData, output_blob.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(output_blob.pbData)
+
+
+def _fallback_fernet(config: dict[str, Any] | None = None) -> Fernet:
+    key_path = _fallback_key_path(config)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    if key_path.exists():
+        key = key_path.read_bytes().strip()
+    else:
+        key = Fernet.generate_key()
+        temp_path = key_path.with_suffix(f".{os.getpid()}.tmp")
+        temp_path.write_bytes(key)
+        try:
+            os.chmod(temp_path, 0o600)
+        except OSError:
+            pass
+        temp_path.replace(key_path)
+    return Fernet(key)
+
+
+def _encrypt_keys(data: bytes, config: dict[str, Any] | None = None) -> bytes:
+    if os.name == "nt":
+        return b"DPAPI1" + _dpapi_transform(data, protect=True)
+    return b"FERNET1" + _fallback_fernet(config).encrypt(data)
+
+
+def _decrypt_keys(data: bytes, config: dict[str, Any] | None = None) -> bytes:
+    if data.startswith(b"DPAPI1"):
+        if os.name != "nt":
+            raise RuntimeError("DPAPI-protected model keys can only be read on Windows")
+        return _dpapi_transform(data[6:], protect=False)
+    if data.startswith(b"FERNET1"):
+        return _fallback_fernet(config).decrypt(data[7:])
+    raise ValueError("Unknown model key storage format")
 
 
 def _new_id(name: str, api_base: str) -> str:
@@ -58,6 +154,31 @@ def _auth_headers(api_key: str, *, json_content: bool = False) -> dict[str, str]
     if key:
         headers["Authorization"] = f"Bearer {key}"
     return headers
+
+
+def _normalize_api_base(api_base: str) -> str:
+    value = str(api_base or "").strip().rstrip("/")
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("API 地址必须是有效的 http:// 或 https:// 地址")
+    if parsed.username or parsed.password:
+        raise ValueError("API 地址不能包含用户名或密码")
+    host = parsed.hostname.lower()
+    if host in _BLOCKED_MODEL_HOSTS:
+        raise ValueError("该 API 地址指向受保护的主机")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None:
+        if address.is_link_local or address.is_multicast or address.is_unspecified:
+            raise ValueError("该 API 地址指向不允许的网络地址")
+        allow_private = os.environ.get("TDX_ALLOW_PRIVATE_MODEL_HOSTS", "") == "1"
+        if address.is_private and not address.is_loopback and not allow_private:
+            raise ValueError(
+                "私有网络模型地址默认禁用；确认可信后设置 TDX_ALLOW_PRIVATE_MODEL_HOSTS=1"
+            )
+    return value
 
 
 def _require_api_key(profile: dict[str, Any]) -> str:
@@ -136,12 +257,47 @@ def _save_store(data: dict[str, Any], config: dict[str, Any] | None = None) -> N
 
 
 def _load_keys(config: dict[str, Any] | None = None) -> dict[str, str]:
-    data = _load_json(_keys_path(config), {})
-    return {str(k): str(v) for k, v in data.items() if isinstance(v, str)}
+    encrypted_path = _keys_path(config)
+    if encrypted_path.exists():
+        try:
+            payload = json.loads(
+                _decrypt_keys(encrypted_path.read_bytes(), config).decode("utf-8")
+            )
+            if isinstance(payload, dict):
+                return {
+                    str(k): str(v)
+                    for k, v in payload.items()
+                    if isinstance(v, str)
+                }
+        except Exception as exc:
+            raise RuntimeError(f"Failed to decrypt model API keys: {exc}") from exc
+
+    legacy_path = _legacy_keys_path(config)
+    keys = _load_json(legacy_path, {})
+    clean = {str(k): str(v) for k, v in keys.items() if isinstance(v, str)}
+    cfg = config or get_config()
+    configured_default = str(cfg.get("siliconflow", {}).get("api_key") or "").strip()
+    if configured_default and not clean.get(DEFAULT_PROFILE_ID):
+        clean[DEFAULT_PROFILE_ID] = configured_default
+    if clean:
+        _save_keys(clean, config)
+        if legacy_path.exists():
+            legacy_path.unlink()
+    return clean
 
 
 def _save_keys(keys: dict[str, str], config: dict[str, Any] | None = None) -> None:
-    _save_json(_keys_path(config), keys)
+    path = _keys_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(keys, ensure_ascii=False).encode("utf-8")
+    encrypted = _encrypt_keys(payload, config)
+    temp_path = path.with_suffix(f".{os.getpid()}.tmp")
+    temp_path.write_bytes(encrypted)
+    try:
+        os.chmod(temp_path, 0o600)
+    except OSError:
+        pass
+    temp_path.replace(path)
 
 
 def _public_profile(profile: dict[str, Any], keys: dict[str, str]) -> dict[str, Any]:
@@ -184,7 +340,11 @@ def upsert_profile(payload: dict[str, Any], config: dict[str, Any] | None = None
         **(existing or {}),
         "id": profile_id,
         "name": payload.get("name") or (existing or {}).get("name") or "模型连接",
-        "api_base": (payload.get("api_base") or (existing or {}).get("api_base") or DEFAULT_BASE_URL).rstrip("/"),
+        "api_base": _normalize_api_base(
+            payload.get("api_base")
+            or (existing or {}).get("api_base")
+            or DEFAULT_BASE_URL
+        ),
         "api_type": payload.get("api_type") or (existing or {}).get("api_type") or "openai_compatible",
         "models_cache": payload.get("models_cache", (existing or {}).get("models_cache", [])),
         "last_used_at": (existing or {}).get("last_used_at", ""),
@@ -236,9 +396,10 @@ def get_runtime_model_config(config: dict[str, Any] | None = None) -> dict[str, 
         try:
             profile = get_profile_with_key(profile_id, cfg)
         except KeyError:
+            keys = _load_keys(cfg)
             profile = {
                 "api_base": sf.get("base_url", DEFAULT_BASE_URL),
-                "api_key": sf.get("api_key", ""),
+                "api_key": keys.get(DEFAULT_PROFILE_ID, ""),
                 "name": "Fallback",
             }
         return {**binding, **profile}
@@ -276,9 +437,7 @@ def get_runtime_model_config(config: dict[str, Any] | None = None) -> dict[str, 
 
 
 async def discover_models(api_base: str, api_key: str, timeout: int = 30) -> list[dict[str, Any]]:
-    normalized_base = api_base.strip().rstrip("/")
-    if not normalized_base:
-        raise ValueError("API 地址不能为空")
+    normalized_base = _normalize_api_base(api_base)
     headers = _auth_headers(api_key)
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:

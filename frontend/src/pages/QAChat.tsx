@@ -210,7 +210,7 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
   const loadActiveSession = useCallback(async (id: string) => {
     setLoadingSession(true)
     try {
-      const data = await getChatSession(id)
+      const data = await getChatSession(id, workspace)
       setMessages(data.messages)
       const restoredCitations: CitationMap = new Map()
       const restoredEvidence: EvidenceMap = new Map()
@@ -232,7 +232,7 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
     } finally {
       setLoadingSession(false)
     }
-  }, [])
+  }, [workspace])
 
   useEffect(() => {
     if (activeId) {

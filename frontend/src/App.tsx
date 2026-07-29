@@ -35,20 +35,28 @@ export default function App() {
     } catch {/* ignore */}
   }
 
-  const loadChatSessions = async () => {
+  const loadChatSessions = async (targetWorkspace = workspace) => {
     try {
-      const data = await listChatSessions()
+      const data = await listChatSessions(targetWorkspace)
       setChatSessions(data)
     } catch {/* ignore */}
   }
 
   useEffect(() => {
     loadWorkspaces()
-    loadChatSessions()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  useEffect(() => {
+    setActiveChatId(null)
+    setChatSessions([])
+    void loadChatSessions(workspace)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspace])
+
   const handleWorkspaceChange = (next: string) => {
+    if (next === workspace) return
+    setActiveChatId(null)
     setWorkspace(next)
     localStorage.setItem('tdx_workspace', next)
   }
@@ -63,7 +71,7 @@ export default function App() {
 
   const handleNewChat = async () => {
     try {
-      const created = await createChatSession()
+      const created = await createChatSession(workspace)
       setChatSessions((prev) => [created, ...prev])
       setActiveChatId(created.id)
       setPage('chat')
@@ -77,7 +85,7 @@ export default function App() {
 
   const handleDeleteChat = async (id: string) => {
     try {
-      await deleteChatSession(id)
+      await deleteChatSession(id, workspace)
       setChatSessions((prev) => prev.filter((item) => item.id !== id))
       if (activeChatId === id) {
         setActiveChatId(null)
@@ -111,7 +119,7 @@ export default function App() {
       {page === 'kb' && <KBManagement workspace={workspace} />}
       {page === 'recall' && <RecallTest workspace={workspace} />}
       {page === 'graph' && <GraphPage workspace={workspace} />}
-      {page === 'models' && <ModelSettings />}
+      {page === 'models' && <ModelSettings workspace={workspace} />}
       {page === 'dashboard' && <Dashboard workspace={workspace} onWorkspaceChanged={loadWorkspaces} />}
     </Layout>
   )

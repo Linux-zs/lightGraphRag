@@ -140,6 +140,9 @@ def sanitize_workspace(workspace: str | None) -> str:
 
 def stable_doc_id(doc: Document) -> str:
     """Create a stable LightRAG doc id from the uploaded file identity."""
+    explicit = str(doc.metadata.get("lightrag_doc_id") or "").strip()
+    if explicit:
+        return explicit
     digest = hashlib.md5(
         f"{Path(doc.file_path).as_posix()}|{doc.file_name}".encode("utf-8")
     ).hexdigest()[:16]
@@ -389,6 +392,16 @@ class LightRAGService:
             json.dumps(manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+    def _manifest_doc_id(self, doc: Document, manifest: dict[str, Any]) -> str:
+        explicit = str(doc.metadata.get("lightrag_doc_id") or "").strip()
+        if explicit:
+            return explicit
+        for doc_id, item in manifest.get("documents", {}).items():
+            if isinstance(item, dict) and item.get("doc_name") == doc.file_name:
+                doc.metadata["lightrag_doc_id"] = doc_id
+                return doc_id
+        return stable_doc_id(doc)
 
     def _default_graph_governance(self) -> dict[str, Any]:
         template = TDX_GRAPH_RULE_TEMPLATE if self.workspace == DEFAULT_WORKSPACE else GENERAL_GRAPH_RULE_TEMPLATE
@@ -809,8 +822,9 @@ class LightRAGService:
         return self._jsonable(result)
 
     def register_upload(self, doc: Document) -> dict[str, Any]:
-        doc_id = stable_doc_id(doc)
         manifest = self._load_manifest()
+        doc_id = self._manifest_doc_id(doc, manifest)
+        doc.metadata["lightrag_doc_id"] = doc_id
         existing = manifest["documents"].get(doc_id, {})
         item = {
             **existing,
@@ -818,6 +832,7 @@ class LightRAGService:
             "doc_name": doc.file_name,
             "file_type": doc.file_type,
             "file_path": doc.file_path,
+            "raw_text_path": doc.metadata.get("raw_text_path", existing.get("raw_text_path", "")),
             "char_count": len(doc.raw_text),
             "indexed": existing.get("indexed", False),
             "status": existing.get("status", "uploaded"),
@@ -839,8 +854,9 @@ class LightRAGService:
         chunk_count: int | None = None,
     ) -> dict[str, Any]:
         """Update manifest status for UI-visible indexing progress."""
-        doc_id = stable_doc_id(doc)
         manifest = self._load_manifest()
+        doc_id = self._manifest_doc_id(doc, manifest)
+        doc.metadata["lightrag_doc_id"] = doc_id
         existing = manifest["documents"].get(doc_id, {})
         item = {
             **existing,
@@ -848,6 +864,7 @@ class LightRAGService:
             "doc_name": doc.file_name,
             "file_type": doc.file_type,
             "file_path": doc.file_path,
+            "raw_text_path": doc.metadata.get("raw_text_path", existing.get("raw_text_path", "")),
             "char_count": len(doc.raw_text),
             "status": status,
             "updated_at": _now_iso(),
@@ -886,18 +903,22 @@ class LightRAGService:
         if guidance:
             rag.addon_params["entity_types_guidance"] = guidance
 
-        doc_id = stable_doc_id(doc)
-        self.register_upload(doc)
+        registered = self.register_upload(doc)
+        doc_id = registered["doc_id"]
+        doc.metadata["lightrag_doc_id"] = doc_id
         manifest = self._load_manifest()
         item = manifest["documents"].get(doc_id, {})
         try:
             existing_status = await self.get_doc_status(doc_id)
             if existing_status is not None:
-                try:
-                    await rag.adelete_by_doc_id(doc_id)
-                    logger.info("Removed existing LightRAG doc before re-index: {}", doc_id)
-                except Exception as exc:
-                    logger.warning("Failed to remove existing LightRAG doc {} before re-index: {}", doc_id, exc)
+                deletion = await rag.adelete_by_doc_id(doc_id)
+                deletion_status = str(getattr(deletion, "status", "") or "").lower()
+                if deletion_status not in {"success", "not_found"}:
+                    message = getattr(deletion, "message", "") or str(deletion)
+                    raise RuntimeError(
+                        f"Existing LightRAG document could not be removed before re-index: {message}"
+                    )
+                logger.info("Removed existing LightRAG doc before re-index: {}", doc_id)
             result = await rag.ainsert(doc.raw_text, ids=[doc_id], file_paths=[doc.file_path])
             status = await self.get_doc_status(doc_id)
             if status and status.status == "failed":
@@ -927,6 +948,7 @@ class LightRAGService:
                     "doc_name": doc.file_name,
                     "file_type": doc.file_type,
                     "file_path": doc.file_path,
+                    "raw_text_path": doc.metadata.get("raw_text_path", item.get("raw_text_path", "")),
                     "char_count": len(doc.raw_text),
                     "indexed": True,
                     "status": status.status if status else "indexed",
@@ -1239,12 +1261,63 @@ class LightRAGService:
             raise KeyError(doc_name_or_id)
 
         item = docs[match_id]
+        existing_status = await self.get_doc_status(match_id)
         deletion = None
-        if item.get("indexed"):
+        if item.get("indexed") or existing_status is not None:
             deletion = await self.rag.adelete_by_doc_id(match_id)
+            deletion_status = str(getattr(deletion, "status", "") or "").lower()
+            if deletion_status not in {"success", "not_found"}:
+                message = getattr(deletion, "message", "") or str(deletion)
+                raise RuntimeError(f"LightRAG document deletion was not completed: {message}")
         removed = docs.pop(match_id)
         self._save_manifest(manifest)
-        return {"doc_id": match_id, "doc_name": removed.get("doc_name", doc_name_or_id), "deletion": str(deletion)}
+        return {
+            "doc_id": match_id,
+            "doc_name": removed.get("doc_name", doc_name_or_id),
+            "file_path": removed.get("file_path", ""),
+            "raw_text_path": removed.get("raw_text_path", ""),
+            "deletion": str(deletion),
+        }
+
+    async def invalidate_document(self, doc_name_or_id: str) -> dict[str, Any]:
+        """Remove derived LightRAG data while preserving the uploaded document."""
+        await self.get_rag()
+        manifest = self._load_manifest()
+        docs = manifest["documents"]
+        match_id = next(
+            (
+                doc_id
+                for doc_id, item in docs.items()
+                if doc_id == doc_name_or_id or item.get("doc_name") == doc_name_or_id
+            ),
+            None,
+        )
+        if match_id is None:
+            raise KeyError(doc_name_or_id)
+
+        item = docs[match_id]
+        existing_status = await self.get_doc_status(match_id)
+        deletion = None
+        if item.get("indexed") or existing_status is not None:
+            deletion = await self.rag.adelete_by_doc_id(match_id)
+            deletion_status = str(getattr(deletion, "status", "") or "").lower()
+            if deletion_status not in {"success", "not_found"}:
+                message = getattr(deletion, "message", "") or str(deletion)
+                raise RuntimeError(f"LightRAG document invalidation was not completed: {message}")
+
+        item.update(
+            {
+                "indexed": False,
+                "status": "uploaded",
+                "chunk_count": 0,
+                "chunks_list": [],
+                "error_msg": "",
+                "updated_at": _now_iso(),
+            }
+        )
+        docs[match_id] = item
+        self._save_manifest(manifest)
+        return {"doc_id": match_id, "doc_name": item.get("doc_name", doc_name_or_id), "deletion": str(deletion)}
 
     def _query_param(
         self,
@@ -1418,8 +1491,89 @@ class LightRAGService:
             "metadata": raw.get("metadata") or {},
         }
 
-    async def clear_workspace(self) -> dict[str, Any]:
+    async def replay_graph_audit(self) -> dict[str, Any]:
+        """Replay manual graph governance operations after a full rebuild."""
+        rag = await self.get_rag()
+        config = self.load_graph_governance()
+        entries = list(reversed(config.get("audit_log") or []))
+        applied = 0
+        skipped = 0
+        errors: list[dict[str, str]] = []
+        replayable = {
+            "create_entity",
+            "edit_entity",
+            "delete_entity",
+            "create_relation",
+            "edit_relation",
+            "delete_relation",
+            "merge_entities",
+        }
+        for entry in entries:
+            action = str(entry.get("action") or "")
+            if action not in replayable:
+                continue
+            payload = entry.get("payload") or {}
+            try:
+                if action == "create_entity":
+                    await rag.acreate_entity(
+                        entity_name=payload["entity_name"],
+                        entity_data=payload.get("entity_data") or {},
+                    )
+                elif action == "edit_entity":
+                    await rag.aedit_entity(
+                        entity_name=payload["entity_name"],
+                        updated_data=payload.get("updated_data") or {},
+                        allow_rename=bool(payload.get("allow_rename", True)),
+                        allow_merge=bool(payload.get("allow_merge", False)),
+                    )
+                elif action == "delete_entity":
+                    await rag.adelete_by_entity(payload["entity_name"])
+                elif action == "create_relation":
+                    await rag.acreate_relation(
+                        source_entity=payload["source_entity"],
+                        target_entity=payload["target_entity"],
+                        relation_data=payload.get("relation_data") or {},
+                    )
+                elif action == "edit_relation":
+                    await rag.aedit_relation(
+                        source_entity=payload["source_entity"],
+                        target_entity=payload["target_entity"],
+                        updated_data=payload.get("updated_data") or {},
+                    )
+                elif action == "delete_relation":
+                    await rag.adelete_by_relation(
+                        payload["source_entity"],
+                        payload["target_entity"],
+                    )
+                elif action == "merge_entities":
+                    await rag.amerge_entities(
+                        source_entities=payload.get("source_entities") or [],
+                        target_entity=payload["target_entity"],
+                        target_entity_data=payload.get("target_entity_data") or {},
+                    )
+                applied += 1
+            except Exception as exc:
+                if action.startswith("delete_") and "not found" in str(exc).lower():
+                    skipped += 1
+                    continue
+                errors.append(
+                    {
+                        "audit_id": str(entry.get("id") or ""),
+                        "action": action,
+                        "error": str(exc),
+                    }
+                )
+        return {
+            "workspace": self.workspace,
+            "total": len([e for e in entries if e.get("action") in replayable]),
+            "applied": applied,
+            "skipped": skipped,
+            "errors": errors,
+        }
+
+    async def clear_workspace(self, *, preserve_manifest: bool = False) -> dict[str, Any]:
         """Clear current LightRAG workspace and manifest without deleting uploads."""
+        preserved_manifest = self._load_manifest() if preserve_manifest else {"documents": {}}
         if self._rag is not None:
             for method_name in ("finalize_storages", "afinalize_storages", "close"):
                 method = getattr(self._rag, method_name, None)
@@ -1447,7 +1601,7 @@ class LightRAGService:
         if self.manifest_path.exists():
             self.manifest_path.unlink()
             removed_manifest = True
-        self._save_manifest({"documents": {}})
+        self._save_manifest(preserved_manifest)
 
         return {
             "workspace": self.workspace,
@@ -1455,6 +1609,7 @@ class LightRAGService:
             "manifest_path": str(self.manifest_path),
             "removed_workspace": removed_workspace,
             "removed_manifest": removed_manifest,
+            "preserved_manifest": preserve_manifest,
         }
 
     async def list_documents(self) -> list[dict[str, Any]]:

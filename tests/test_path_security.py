@@ -34,8 +34,9 @@ def test_resolve_upload_path_stays_under_upload_root(tmp_path, monkeypatch):
 
     resolved = server._resolve_upload_path("文档.txt")
 
-    assert resolved == (upload_dir / "文档.txt").resolve()
-    assert resolved.parent == upload_dir.resolve()
+    workspace_dir = (upload_dir / "tdx_default").resolve()
+    assert resolved == (workspace_dir / "文档.txt").resolve()
+    assert resolved.parent == workspace_dir
 
 
 @pytest.mark.parametrize("session_id", ["../secrets", r"..\model_profiles", "abc", "g" * 12])

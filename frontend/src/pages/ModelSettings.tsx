@@ -20,7 +20,7 @@ import {
 } from '../api'
 
 const DEFAULT_ANSWER_SYSTEM_PROMPT =
-  '你是通达信系统技术支持知识库助手。必须使用简体中文回答。' +
+  '你是严谨的知识库问答助手。必须使用简体中文回答。' +
   '只依据给定参考资料回答；资料不足时明确说“知识库上下文不足”。' +
   '参考资料只作为依据，不要把原文逐条搬运成答案。' +
   '你需要先理解用户问题，再综合多条资料，按原因、链路、排查步骤或结论组织成通顺、有逻辑的说明。' +
@@ -30,6 +30,7 @@ const DEFAULT_ANSWER_SYSTEM_PROMPT =
   '引用资料时在相关句子末尾使用 [数字] 标记，数字必须来自参考资料编号。'
 
 const DEFAULT_CONFIG: ModelConfig = {
+  workspace: 'tdx_default',
   embed_model: 'BAAI/bge-large-zh-v1.5',
   embed_base_url: 'https://api.siliconflow.cn/v1',
   rerank_model: 'BAAI/bge-reranker-v2-m3',
@@ -78,7 +79,11 @@ function friendlyError(error: unknown): string {
   return message
 }
 
-export default function ModelSettings() {
+interface Props {
+  workspace: string
+}
+
+export default function ModelSettings({ workspace }: Props) {
   const [profiles, setProfiles] = useState<ModelProfile[]>([])
   const [bindings, setBindings] = useState<ModelBindings>(DEFAULT_BINDINGS)
   const [config, setConfig] = useState<ModelConfig>(DEFAULT_CONFIG)
@@ -109,7 +114,7 @@ export default function ModelSettings() {
       const [profileData, bindingData, modelConfig] = await Promise.all([
         listModelProfiles(),
         getModelBindings(),
-        getModelConfig(),
+        getModelConfig(workspace),
       ])
       setProfiles(profileData)
       setBindings(bindingData)
@@ -123,7 +128,8 @@ export default function ModelSettings() {
 
   useEffect(() => {
     loadAll()
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspace])
 
   const updateBinding = (purpose: keyof ModelBindings, patch: Partial<ModelBinding>) => {
     setBindings((prev) => ({
@@ -245,8 +251,8 @@ export default function ModelSettings() {
     setSaving(true)
     setMessage('')
     try {
-      await updateModelConfig(config)
-      setMessage('生成参数和问答提示词已保存')
+      await updateModelConfig(config, workspace)
+      setMessage(`生成参数和知识库 ${workspace} 的问答提示词已保存`)
     } catch (e) {
       setMessage(`保存失败: ${(e as Error).message}`)
     } finally {
@@ -552,7 +558,7 @@ export default function ModelSettings() {
           <div>
             <h3 className="text-sm font-semibold text-gray-800">问答提示词</h3>
             <p className="text-sm text-gray-500 mt-1">
-              控制最终回答风格；参考资料会另行拼接到用户消息中。
+              当前知识库：{workspace}。控制该知识库的最终回答风格；参考资料会另行拼接到用户消息中。
             </p>
           </div>
           <button

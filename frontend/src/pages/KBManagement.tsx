@@ -133,13 +133,24 @@ export default function KBManagement({ workspace }: Props) {
     return `${formatTaskMessage(task)}: ${ok} 成功${fail > 0 ? `, ${fail} 失败` : ''}`
   }
 
-  const formatGraphResidualWarning = (docName: string, residuals?: GraphDeleteResiduals) => {
+  const formatGraphResidualWarning = (
+    docName: string,
+    residuals?: GraphDeleteResiduals,
+    cleanupTask?: IndexTask | null,
+    cleanupError?: string,
+  ) => {
     if (!residuals) return ''
+    if (cleanupError) {
+      return `已删除 ${docName}，但自动图谱清理启动失败：${cleanupError}`
+    }
+    if (cleanupTask) {
+      return `已删除 ${docName}，检测到图谱残留并已启动自动重建任务 ${cleanupTask.task_id}`
+    }
     if (!residuals.checked) {
-      return `已删除 ${docName}，但图谱残留检查失败：${residuals.error || '未知错误'}。建议重建当前知识库索引。`
+      return `已删除 ${docName}，但图谱残留检查失败：${residuals.error || '未知错误'}`
     }
     if (!residuals.has_residuals) return ''
-    return `已删除 ${docName} 的文档索引，但知识图谱仍检测到 ${residuals.node_count} 个实体 / ${residuals.edge_count} 条关系引用该文档。建议重建当前知识库索引以清理残留。`
+    return `已删除 ${docName} 的文档索引，但仍检测到 ${residuals.node_count} 个实体 / ${residuals.edge_count} 条关系引用该文档`
   }
 
   const batchMessageTone = batchMsg.includes('失败') || batchMsg.includes('取消')
@@ -348,8 +359,23 @@ export default function KBManagement({ workspace }: Props) {
     setBatchMsg('')
     try {
       const result = await deleteDocument(docName, workspace)
-      const residualWarning = formatGraphResidualWarning(result.doc_name, result.graph_residuals)
+      const residualWarning = formatGraphResidualWarning(
+        result.doc_name,
+        result.graph_residuals,
+        result.cleanup_task,
+        result.cleanup_error,
+      )
       setBatchMsg(residualWarning || `已删除文档: ${result.doc_name}`)
+      if (result.cleanup_task) {
+        setBatchIndexTask(result.cleanup_task)
+        setBatchIndexing(!isTaskTerminal(result.cleanup_task))
+        if (!isTaskTerminal(result.cleanup_task)) {
+          void pollIndexTask(result.cleanup_task.task_id, setBatchIndexTask, (finalTask) => {
+            setBatchIndexing(false)
+            setBatchMsg(`删除后的图谱清理：${formatTaskMessage(finalTask)}`)
+          })
+        }
+      }
       setCheckedDocs((prev) => {
         const next = new Set(prev)
         next.delete(docName)
@@ -387,11 +413,27 @@ export default function KBManagement({ workspace }: Props) {
       const result = await batchDeleteDocuments([...checkedDocs], workspace)
       const residualItems = result.graph_residuals?.items.filter((item) => item.has_residuals || !item.checked) || []
       const errorSuffix = result.errors?.length ? `，${result.errors.length} 个失败` : ''
-      if (residualItems.length > 0) {
+      if (result.cleanup_error) {
+        setBatchMsg(
+          `批量删除完成: ${result.deleted_chunks} 个文档${errorSuffix}，但自动图谱清理启动失败：${result.cleanup_error}`,
+        )
+      } else if (result.cleanup_task) {
+        setBatchMsg(
+          `批量删除完成: ${result.deleted_chunks} 个文档${errorSuffix}，已启动自动图谱重建任务 ${result.cleanup_task.task_id}`,
+        )
+        setBatchIndexTask(result.cleanup_task)
+        setBatchIndexing(!isTaskTerminal(result.cleanup_task))
+        if (!isTaskTerminal(result.cleanup_task)) {
+          void pollIndexTask(result.cleanup_task.task_id, setBatchIndexTask, (finalTask) => {
+            setBatchIndexing(false)
+            setBatchMsg(`删除后的图谱清理：${formatTaskMessage(finalTask)}`)
+          })
+        }
+      } else if (residualItems.length > 0) {
         const nodes = residualItems.reduce((sum, item) => sum + (item.node_count || 0), 0)
         const edges = residualItems.reduce((sum, item) => sum + (item.edge_count || 0), 0)
         setBatchMsg(
-          `批量删除完成: ${result.deleted_chunks} 个文档，提交 ${result.doc_count} 个${errorSuffix}。其中 ${residualItems.length} 个文档存在图谱残留，共 ${nodes} 个实体 / ${edges} 条关系。建议重建当前知识库索引。`,
+          `批量删除完成: ${result.deleted_chunks} 个文档，提交 ${result.doc_count} 个${errorSuffix}。其中 ${residualItems.length} 个文档存在图谱残留，共 ${nodes} 个实体 / ${edges} 条关系。`,
         )
       } else {
         setBatchMsg(`批量删除完成: ${result.deleted_chunks} 个文档，提交 ${result.doc_count} 个${errorSuffix}`)
@@ -527,7 +569,7 @@ export default function KBManagement({ workspace }: Props) {
     setRawTextLoading(true)
     setRawTextMsg('')
     try {
-      const data = await getDocumentRawText(docName)
+      const data = await getDocumentRawText(docName, workspace)
       setRawTextContent(data.raw_text)
     } catch (e: unknown) {
       setRawTextMsg(`加载原始文本失败: ${(e as Error).message}`)
@@ -542,8 +584,9 @@ export default function KBManagement({ workspace }: Props) {
     setRawTextSaving(true)
     setRawTextMsg('')
     try {
-      const data = await updateDocumentRawText(rawTextDocName, rawTextContent)
-      setRawTextMsg(`已保存 (${data.char_count} 字符)，请重新预览切分`)
+      const data = await updateDocumentRawText(rawTextDocName, rawTextContent, workspace)
+      setRawTextMsg(`已保存 (${data.char_count} 字符)，旧索引已移除，请重新预览并索引`)
+      await loadDocs()
     } catch (e: unknown) {
       setRawTextMsg(`保存失败: ${(e as Error).message}`)
     } finally {
@@ -963,7 +1006,7 @@ export default function KBManagement({ workspace }: Props) {
                   </div>
                 </div>
                 <p className="text-xs text-amber-600 px-6 pb-2 bg-gray-50">
-                  ⚠️ 修改后需要重新"预览切分"才能生效
+                  修改后旧索引会立即移除，需要重新预览并确认索引。
                 </p>
               </>
             )}

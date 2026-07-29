@@ -81,6 +81,7 @@ export interface RecallTestResponse {
 }
 
 export interface ModelConfig {
+  workspace: string
   embed_model: string
   embed_base_url: string
   rerank_model: string
@@ -195,13 +196,18 @@ export interface BatchGraphDeleteResiduals {
   items: Array<GraphDeleteResiduals & { doc_name: string; doc_id: string }>
 }
 
+export interface DocumentDeleteCleanup {
+  cleanup_task?: IndexTask | null
+  cleanup_error?: string
+}
+
 export function deleteDocument(docName: string, workspace = 'tdx_default') {
   return request<{
     deleted: number
     doc_id: string
     doc_name: string
     graph_residuals: GraphDeleteResiduals
-  }>(
+  } & DocumentDeleteCleanup>(
     `/kb/documents/${encodeURIComponent(docName)}?workspace=${encodeURIComponent(workspace)}`,
     { method: 'DELETE' },
   )
@@ -213,6 +219,8 @@ export function batchDeleteDocuments(docNames: string[], workspace = 'tdx_defaul
     doc_count: number
     errors?: Array<{ doc_name: string; error: string }>
     graph_residuals?: BatchGraphDeleteResiduals
+    cleanup_task?: IndexTask | null
+    cleanup_error?: string
   }>(
     '/kb/batch-delete',
     { method: 'POST', body: JSON.stringify({ workspace, doc_names: docNames }) },
@@ -281,15 +289,15 @@ export interface RawTextResponse {
   source: string
 }
 
-export function getDocumentRawText(docName: string) {
+export function getDocumentRawText(docName: string, workspace = 'tdx_default') {
   return request<RawTextResponse>(
-    `/kb/documents/${encodeURIComponent(docName)}/raw-text`,
+    `/kb/documents/${encodeURIComponent(docName)}/raw-text?workspace=${encodeURIComponent(workspace)}`,
   )
 }
 
-export function updateDocumentRawText(docName: string, raw_text: string) {
+export function updateDocumentRawText(docName: string, raw_text: string, workspace = 'tdx_default') {
   return request<{ file_name: string; char_count: number; message: string }>(
-    `/kb/documents/${encodeURIComponent(docName)}/raw-text`,
+    `/kb/documents/${encodeURIComponent(docName)}/raw-text?workspace=${encodeURIComponent(workspace)}`,
     { method: 'PUT', body: JSON.stringify({ raw_text }) },
   )
 }
@@ -352,15 +360,18 @@ export function search(params: {
 
 // --- Models ---
 
-export function getModelConfig() {
-  return request<ModelConfig>('/models/config')
+export function getModelConfig(workspace = 'tdx_default') {
+  return request<ModelConfig>(`/models/config?workspace=${encodeURIComponent(workspace)}`)
 }
 
-export function updateModelConfig(config: ModelConfig) {
-  return request<{ status: string }>('/models/config', {
+export function updateModelConfig(config: ModelConfig, workspace = 'tdx_default') {
+  return request<{ status: string }>(
+    `/models/config?workspace=${encodeURIComponent(workspace)}`,
+    {
     method: 'PUT',
     body: JSON.stringify(config),
-  })
+    },
+  )
 }
 
 export function testEmbed(text: string) {
@@ -845,6 +856,7 @@ export interface ChatSendResponse {
 
 export interface ChatSession {
   id: string
+  workspace: string
   title: string
   messages: ChatMessage[]
   created_at: string
@@ -853,6 +865,7 @@ export interface ChatSession {
 
 export interface ChatSessionListItem {
   id: string
+  workspace: string
   title: string
   message_count: number
   created_at: string
@@ -891,20 +904,28 @@ export function chatSendStream(params: {
   })
 }
 
-export function listChatSessions() {
-  return request<ChatSessionListItem[]>('/chat/sessions')
+export function listChatSessions(workspace = 'tdx_default') {
+  return request<ChatSessionListItem[]>(`/chat/sessions?workspace=${encodeURIComponent(workspace)}`)
 }
 
-export function getChatSession(sessionId: string) {
-  return request<ChatSession>('/chat/sessions/' + sessionId)
+export function getChatSession(sessionId: string, workspace = 'tdx_default') {
+  return request<ChatSession>(
+    `/chat/sessions/${encodeURIComponent(sessionId)}?workspace=${encodeURIComponent(workspace)}`,
+  )
 }
 
-export function deleteChatSession(sessionId: string) {
-  return request<{ deleted: string }>('/chat/sessions/' + sessionId, {
+export function deleteChatSession(sessionId: string, workspace = 'tdx_default') {
+  return request<{ deleted: string }>(
+    `/chat/sessions/${encodeURIComponent(sessionId)}?workspace=${encodeURIComponent(workspace)}`,
+    {
     method: 'DELETE',
-  })
+    },
+  )
 }
 
-export function createChatSession() {
-  return request<ChatSessionListItem>('/chat/sessions', { method: 'POST' })
+export function createChatSession(workspace = 'tdx_default') {
+  return request<ChatSessionListItem>('/chat/sessions', {
+    method: 'POST',
+    body: JSON.stringify({ workspace }),
+  })
 }
