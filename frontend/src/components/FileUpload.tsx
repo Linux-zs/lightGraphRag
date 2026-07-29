@@ -2,7 +2,7 @@ import { useRef, useState } from 'react'
 
 interface Props {
   onUpload: (file: File) => Promise<void>
-  onMultiUpload?: (files: FileList) => Promise<void>
+  onMultiUpload?: (files: File[]) => Promise<void>
   accept?: string
   uploading?: boolean
 }
@@ -16,12 +16,13 @@ export default function FileUpload({ onUpload, onMultiUpload, accept = ACCEPT_TY
 
   const handleFiles = async (files: FileList) => {
     setError('')
-    if (files.length === 0) return
+    const selectedFiles = Array.from(files).filter((file): file is File => file instanceof File)
+    if (selectedFiles.length === 0) return
     try {
-      if (files.length > 1 && onMultiUpload) {
-        await onMultiUpload(files)
+      if (selectedFiles.length > 1 && onMultiUpload) {
+        await onMultiUpload(selectedFiles)
       } else {
-        await onUpload(files[0])
+        await onUpload(selectedFiles[0])
       }
     } catch (e: unknown) {
       setError((e as Error).message || 'Upload failed')

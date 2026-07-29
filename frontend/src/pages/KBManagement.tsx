@@ -117,7 +117,7 @@ export default function KBManagement({ workspace }: Props) {
   }
 
   /** Upload multiple files sequentially */
-  const handleMultiUpload = async (files: FileList) => {
+  const handleMultiUpload = async (files: File[]) => {
     setUploading(true)
     setBatchMsg('')
     let lastData: UploadedFile | null = null
@@ -125,6 +125,11 @@ export default function KBManagement({ workspace }: Props) {
     const total = files.length
     for (let i = 0; i < total; i++) {
       const file = files[i]
+      if (!file) {
+        failures.push(`第 ${i + 1} 个文件: 文件对象为空`)
+        setBatchMsg(`上传失败 (${i + 1}/${total}) 第 ${i + 1} 个文件: 文件对象为空`)
+        continue
+      }
       try {
         const data = await uploadDocument(file, workspace)
         lastData = data
