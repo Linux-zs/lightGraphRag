@@ -216,7 +216,8 @@ export interface IndexTaskResult {
 
 export interface IndexTask {
   task_id: string
-  kind: 'single' | 'batch'
+  kind: 'single' | 'batch' | 'rebuild'
+  workspace?: string
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'partial' | 'cancelled'
   doc_names: string[]
   total: number

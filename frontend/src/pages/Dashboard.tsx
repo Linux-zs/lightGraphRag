@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   clearKnowledgeBase,
   getIndexTask,
   getSystemStats,
+  listIndexTasks,
   rebuildIndex,
   IndexTask,
   SystemStats,
@@ -20,39 +21,95 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
   const [opMsg, setOpMsg] = useState('')
   const [operating, setOperating] = useState(false)
   const [rebuildTask, setRebuildTask] = useState<IndexTask | null>(null)
+  const pollingTaskIdRef = useRef<string | null>(null)
+  const mountedRef = useRef(true)
 
   useEffect(() => {
+    mountedRef.current = true
     loadStats()
+    restoreRebuildTask()
+    return () => {
+      mountedRef.current = false
+      pollingTaskIdRef.current = null
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspace])
 
-  const loadStats = async () => {
+  const loadStats = useCallback(async () => {
     setLoading(true)
     setError('')
     try {
       const data = await getSystemStats(workspace)
+      if (!mountedRef.current) return
       setStats(data)
     } catch (e: unknown) {
+      if (!mountedRef.current) return
       setError((e as Error).message || '加载失败')
     } finally {
-      setLoading(false)
+      if (mountedRef.current) setLoading(false)
     }
-  }
+  }, [workspace])
 
   const isTaskTerminal = (task: IndexTask) =>
     ['succeeded', 'failed', 'partial', 'cancelled'].includes(task.status)
 
-  const pollTask = async (taskId: string) => {
+  const taskTone = (task: IndexTask) => {
+    if (task.status === 'failed' || task.status === 'partial') return 'red'
+    if (task.status === 'cancelled') return 'gray'
+    if (isTaskTerminal(task)) return 'green'
+    return 'primary'
+  }
+
+  const formatTaskTime = (iso?: string) => {
+    if (!iso) return ''
+    try {
+      return new Date(iso).toLocaleTimeString('zh-CN', { hour12: false })
+    } catch {
+      return ''
+    }
+  }
+
+  const pollTask = useCallback(async (taskId: string) => {
+    if (pollingTaskIdRef.current === taskId) return
+    pollingTaskIdRef.current = taskId
     let task = await getIndexTask(taskId)
+    if (!mountedRef.current || pollingTaskIdRef.current !== taskId) return
     setRebuildTask(task)
+    setOperating(!isTaskTerminal(task))
     while (!isTaskTerminal(task)) {
       await new Promise((resolve) => setTimeout(resolve, 1500))
       task = await getIndexTask(taskId)
+      if (!mountedRef.current || pollingTaskIdRef.current !== taskId) return
       setRebuildTask(task)
     }
+    if (!mountedRef.current || pollingTaskIdRef.current !== taskId) return
+    setOperating(false)
     setOpMsg(task.message)
     await loadStats()
-  }
+  }, [loadStats])
+
+  const restoreRebuildTask = useCallback(async () => {
+    try {
+      const tasks = await listIndexTasks()
+      if (!mountedRef.current) return
+      const task = tasks.find((item) => item.workspace === workspace && item.kind === 'rebuild')
+      if (!task) {
+        setRebuildTask(null)
+        setOperating(false)
+        return
+      }
+      setRebuildTask(task)
+      setOperating(!isTaskTerminal(task))
+      if (isTaskTerminal(task)) {
+        setOpMsg(task.message || '')
+      } else {
+        setOpMsg(`已恢复重建任务: ${task.task_id}`)
+        void pollTask(task.task_id)
+      }
+    } catch {
+      // Task recovery is best-effort; stats still load independently.
+    }
+  }, [workspace, pollTask])
 
   const handleClear = async () => {
     const confirmed = window.confirm('确认清空 LightRAG 索引？上传的原始文档会保留。')
@@ -60,6 +117,7 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
     setOperating(true)
     setOpMsg('')
     setRebuildTask(null)
+    pollingTaskIdRef.current = null
     try {
       const result = await clearKnowledgeBase(false, workspace)
       setOpMsg(`已清空索引: ${result.workspace}`)
@@ -78,6 +136,7 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
     setOperating(true)
     setOpMsg('')
     setRebuildTask(null)
+    pollingTaskIdRef.current = null
     try {
       const task = await rebuildIndex({
         workspace,
@@ -196,13 +255,27 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
         </div>
 
         {rebuildTask && (
-          <div className="mt-4 rounded-lg border border-primary-200 bg-primary-50 p-3">
+          <div className={`mt-4 rounded-lg border p-3 ${
+            taskTone(rebuildTask) === 'red'
+              ? 'border-red-200 bg-red-50'
+              : taskTone(rebuildTask) === 'green'
+                ? 'border-green-200 bg-green-50'
+                : taskTone(rebuildTask) === 'gray'
+                  ? 'border-gray-200 bg-gray-50'
+                  : 'border-primary-200 bg-primary-50'
+          }`}>
             <div className="flex items-center justify-between text-sm">
-              <span className="font-medium text-gray-800">任务 {rebuildTask.task_id}</span>
+              <span className="font-medium text-gray-800">重建任务 {rebuildTask.task_id}</span>
               <span className="text-xs text-gray-500">{rebuildTask.status}</span>
             </div>
             <div className="text-xs text-gray-500 mt-1">
               {rebuildTask.message}，进度 {rebuildTask.current}/{rebuildTask.total}
+            </div>
+            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-gray-400">
+              {rebuildTask.current_doc && <span>当前文档：{rebuildTask.current_doc}</span>}
+              {rebuildTask.timeout_seconds && <span>单文档超时：{rebuildTask.timeout_seconds}s</span>}
+              {rebuildTask.updated_at && <span>最后更新：{formatTaskTime(rebuildTask.updated_at)}</span>}
+              {isTaskTerminal(rebuildTask) && rebuildTask.updated_at && <span>完成时间：{formatTaskTime(rebuildTask.updated_at)}</span>}
             </div>
             <div className="mt-3 h-2 rounded-full bg-white overflow-hidden border border-gray-100">
               <div
@@ -217,8 +290,12 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
               />
             </div>
             {rebuildTask.errors.length > 0 && (
-              <div className="mt-2 text-xs text-red-700">
-                {rebuildTask.errors[0].doc_name}: {rebuildTask.errors[0].error}
+              <div className="mt-2 space-y-1">
+                {rebuildTask.errors.slice(0, 3).map((err) => (
+                  <div key={`${err.doc_name}-${err.error}`} className="text-xs text-red-700">
+                    {err.doc_name || '任务'}: {err.error}
+                  </div>
+                ))}
               </div>
             )}
           </div>

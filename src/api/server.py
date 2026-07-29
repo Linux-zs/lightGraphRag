@@ -1191,6 +1191,32 @@ def _load_doc_for_index(doc_name: str) -> Document:
     return doc
 
 
+def _workspace_doc_names_for_rebuild(workspace: str) -> list[str]:
+    """Return only documents registered in the selected workspace manifest."""
+    service = get_lightrag_service(workspace)
+    manifest = service._load_manifest()
+    loader = DocumentLoader()
+    supported_exts = set(loader._ext_to_parser.keys())
+    doc_names: list[str] = []
+    seen: set[str] = set()
+    items = sorted(
+        manifest.get("documents", {}).values(),
+        key=lambda item: str(item.get("updated_at", "")),
+    )
+    for item in items:
+        doc_name = Path(str(item.get("doc_name") or "")).name
+        if not doc_name or doc_name in seen:
+            continue
+        if Path(doc_name).suffix.lower() not in supported_exts:
+            continue
+        if not (UPLOAD_DIR / doc_name).exists():
+            logger.warning("Skipping rebuild source missing from upload dir: {}", doc_name)
+            continue
+        seen.add(doc_name)
+        doc_names.append(doc_name)
+    return doc_names
+
+
 async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -> None:
     doc_names = [req.file_name] if isinstance(req, IndexRequest) else list(req.doc_names)
     workspace = sanitize_workspace(req.workspace)
@@ -1503,17 +1529,11 @@ async def batch_index(req: BatchIndexRequest):
 
 @app.post("/api/kb/rebuild")
 async def rebuild_index(req: RebuildIndexRequest):
-    """Clear LightRAG index and rebuild from uploaded source files."""
+    """Clear current workspace index and rebuild only that workspace's registered documents."""
     req.workspace = sanitize_workspace(req.workspace)
-    loader = DocumentLoader()
-    supported_exts = set(loader._ext_to_parser.keys())
-    doc_names = [
-        p.name
-        for p in sorted(UPLOAD_DIR.iterdir())
-        if p.is_file() and p.suffix.lower() in supported_exts
-    ]
+    doc_names = _workspace_doc_names_for_rebuild(req.workspace)
     if not doc_names:
-        raise HTTPException(400, "No uploaded documents to rebuild")
+        raise HTTPException(400, "No uploaded documents registered in this workspace to rebuild")
 
     async with _index_write_lock:
         service = get_lightrag_service(req.workspace)
@@ -1530,7 +1550,7 @@ async def rebuild_index(req: RebuildIndexRequest):
         chunk_overlap=req.chunk_overlap,
     )
     batch_req.workspace = sanitize_workspace(req.workspace)
-    task = await _create_index_task("batch", doc_names, batch_req.workspace)
+    task = await _create_index_task("rebuild", doc_names, batch_req.workspace)
     asyncio.create_task(_run_index_task(task["task_id"], batch_req))
     return {**_public_index_task(task), "clear_result": clear_result}
 
