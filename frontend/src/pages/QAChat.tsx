@@ -28,6 +28,7 @@ function renderTextWithCitations(
   text: string,
   onCitationClick: (num: number) => void,
   isHighlighted: (num: number) => boolean,
+  validCitationNumbers?: Set<number>,
 ): ReactNode {
   // Fast path: no citation markers in this text segment
   if (!/\[\d+\]/.test(text)) {
@@ -49,6 +50,10 @@ function renderTextWithCitations(
       )
     }
     const num = parseInt(match[1], 10)
+    if (validCitationNumbers && !validCitationNumbers.has(num)) {
+      lastIndex = match.index + match[0].length
+      continue
+    }
     parts.push(
       <sup
         key={`cite-${keyIdx++}`}
@@ -56,13 +61,13 @@ function renderTextWithCitations(
           e.stopPropagation()
           onCitationClick(num)
         }}
-        className={`inline-flex items-center justify-center min-w-[1.2em] h-[1.2em] px-0.5 mx-0.5 text-[0.65em] font-bold rounded cursor-pointer align-super transition-colors select-none ${
+        className={`inline-flex items-center justify-center min-w-[1.65em] h-[1.25em] px-1 mx-0.5 text-[0.62em] font-bold rounded-full cursor-pointer align-super transition-colors select-none tabular-nums ${
           isHighlighted(num)
             ? 'bg-amber-500 text-white ring-2 ring-amber-300'
             : 'bg-primary-500 text-white hover:bg-primary-600'
         }`}
       >
-        {num}
+        [{num}]
       </sup>,
     )
     lastIndex = match.index + match[0].length
@@ -89,12 +94,13 @@ function processChildren(
   children: ReactNode,
   onCitationClick: (num: number) => void,
   isHighlighted: (num: number) => boolean,
+  validCitationNumbers?: Set<number>,
 ): ReactNode {
   if (children == null || typeof children === 'boolean') {
     return children
   }
   if (typeof children === 'string') {
-    return renderTextWithCitations(children, onCitationClick, isHighlighted)
+    return renderTextWithCitations(children, onCitationClick, isHighlighted, validCitationNumbers)
   }
   if (typeof children === 'number') {
     return children
@@ -104,7 +110,7 @@ function processChildren(
       if (typeof child === 'string') {
         return (
           <Fragment key={`child-${i}`}>
-            {renderTextWithCitations(child, onCitationClick, isHighlighted)}
+            {renderTextWithCitations(child, onCitationClick, isHighlighted, validCitationNumbers)}
           </Fragment>
         )
       }
@@ -112,6 +118,30 @@ function processChildren(
     })
   }
   return children
+}
+
+function normalizeCitations(citations: Citation[] | undefined): Citation[] {
+  if (!Array.isArray(citations)) return []
+  const seen = new Set<string>()
+  return citations
+    .filter((citation) => citation && typeof citation.index === 'number')
+    .filter((citation) => {
+      const key = `${citation.doc_name}|${citation.chunk_index}|${citation.excerpt}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    .sort((a, b) => a.index - b.index)
+}
+
+function citationSummary(citations: Citation[]) {
+  const docs = Array.from(new Set(citations.map((c) => c.doc_name).filter(Boolean)))
+  const firstDoc = docs[0] || 'LightRAG'
+  return {
+    docCount: docs.length,
+    chunkCount: citations.length,
+    firstDoc,
+  }
 }
 
 interface Props {
@@ -130,7 +160,9 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
   const [sending, setSending] = useState(false)
   const [loadingSession, setLoadingSession] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
   const streamingRef = useRef(false)
+  const [copiedMsgIndex, setCopiedMsgIndex] = useState<number | null>(null)
 
   /** Tracks which citation is currently highlighted (after clicking a superscript). */
   const [highlightedCitation, setHighlightedCitation] = useState<{
@@ -184,7 +216,7 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
       const restoredEvidence: EvidenceMap = new Map()
       data.messages.forEach((msg, idx) => {
         if (msg.role === 'assistant' && msg.citations) {
-          restoredCitations.set(idx, msg.citations)
+          restoredCitations.set(idx, normalizeCitations(msg.citations))
         }
         if (msg.role === 'assistant' && msg.evidence) {
           restoredEvidence.set(idx, msg.evidence)
@@ -256,6 +288,27 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
       return next
     })
   }, [])
+
+  const handleCopyAnswer = useCallback(async (msgIndex: number, content: string) => {
+    try {
+      await navigator.clipboard.writeText(content)
+      setCopiedMsgIndex(msgIndex)
+      setTimeout(() => {
+        setCopiedMsgIndex((prev) => (prev === msgIndex ? null : prev))
+      }, 1500)
+    } catch {
+      setCopiedMsgIndex(null)
+    }
+  }, [])
+
+  const handleReuseQuestion = useCallback((msgIndex: number) => {
+    const previousUser = [...messages.slice(0, msgIndex)]
+      .reverse()
+      .find((message) => message.role === 'user')
+    if (!previousUser) return
+    setInput(previousUser.content)
+    setTimeout(() => inputRef.current?.focus(), 0)
+  }, [messages])
 
   /**
    * Open the chunk-preview modal for a specific document + chunk.
@@ -359,7 +412,7 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
             const data = JSON.parse(dataLines.join('\n'))
 
             if (eventType === 'citations') {
-              const cites = Array.isArray(data) ? data : (data.citations || [])
+              const cites = normalizeCitations(Array.isArray(data) ? data : (data.citations || []))
               const rawEvidence = Array.isArray(data) ? null : data.evidence
               const evidence: EvidenceChain = {
                 nodes: Array.isArray(rawEvidence?.nodes) ? rawEvidence.nodes : [],
@@ -368,7 +421,7 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
               }
               setCitationsByIndex((prev) => {
                 const next = new Map(prev)
-                next.set(asstIdx, cites as Citation[])
+                next.set(asstIdx, cites)
                 return next
               })
               setEvidenceByIndex((prev) => {
@@ -381,7 +434,7 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
                 if (updated[asstIdx]) {
                   updated[asstIdx] = {
                     ...updated[asstIdx],
-                    citations: cites as Citation[],
+                    citations: cites,
                     evidence,
                   }
                 }
@@ -467,10 +520,10 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
    * - non-empty citations  → always show the full citation list with [数字] badges
    */
   const renderCitations = (msgIndex: number) => {
-    const cites = citationsByIndex.get(msgIndex)
+    const cites = normalizeCitations(citationsByIndex.get(msgIndex))
 
     // Historical messages (loaded from server) don't carry citation data
-    if (cites === undefined) return null
+    if (!citationsByIndex.has(msgIndex)) return null
 
     // No references were retrieved for this answer (not collapsible)
     if (cites.length === 0) {
@@ -484,6 +537,7 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
     }
 
     const isExpanded = expandedCitations.has(msgIndex)
+    const summary = citationSummary(cites)
 
     return (
       <div className="mt-3 pt-3 border-t border-gray-100">
@@ -491,21 +545,25 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
           onClick={() => toggleCitationExpand(msgIndex)}
           className="w-full flex items-center gap-2 text-xs font-medium text-gray-500 hover:text-gray-800 transition-colors"
         >
-          <span className="inline-block h-3 w-3 rounded-full border border-gray-400" />
+          <span className="inline-flex h-4 w-4 items-center justify-center rounded border border-gray-300 text-[10px] text-gray-400">
+            #
+          </span>
           <span>引用文档</span>
-          <span className="text-gray-400">({cites.length})</span>
+          <span className="text-gray-400">
+            {summary.docCount} 个文档 · {summary.chunkCount} 条片段 · {summary.firstDoc}
+          </span>
           <span className="ml-auto text-gray-400">{isExpanded ? '▲' : '▼'}</span>
         </button>
         {isExpanded && (
           <div className="space-y-2 max-h-64 overflow-y-auto pr-1 mt-2">
-            {cites.map((c, ci) => {
-              const num = ci + 1
+            {cites.map((c) => {
+              const num = c.index
               const isHighlighted =
                 highlightedCitation?.msgIndex === msgIndex &&
                 highlightedCitation?.num === num
               return (
                 <div
-                  key={ci}
+                  key={`${c.index}-${c.doc_name}-${c.chunk_index}`}
                   data-citation-key={`cite-${msgIndex}-${num}`}
                   className={`rounded-lg px-3 py-2 text-xs transition-all duration-300 border ${
                     isHighlighted
@@ -604,6 +662,43 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
     )
   }
 
+  const renderAssistantActions = (msg: ChatMessage, msgIndex: number) => {
+    const cites = normalizeCitations(citationsByIndex.get(msgIndex))
+    const evidence = evidenceByIndex.get(msgIndex)
+    const hasEvidence = Boolean(evidence && (evidence.nodes.length > 0 || evidence.edges.length > 0))
+
+    return (
+      <div className="mt-3 flex flex-wrap items-center gap-1.5 text-xs text-gray-400">
+        <button
+          onClick={() => handleCopyAnswer(msgIndex, msg.content)}
+          className="rounded-lg px-2 py-1 hover:bg-gray-100 hover:text-gray-700"
+        >
+          {copiedMsgIndex === msgIndex ? '已复制' : '复制'}
+        </button>
+        <button
+          onClick={() => toggleCitationExpand(msgIndex)}
+          disabled={cites.length === 0}
+          className="rounded-lg px-2 py-1 hover:bg-gray-100 hover:text-gray-700 disabled:cursor-not-allowed disabled:text-gray-300"
+        >
+          查看上下文
+        </button>
+        <button
+          onClick={() => toggleEvidenceExpand(msgIndex)}
+          disabled={!hasEvidence}
+          className="rounded-lg px-2 py-1 hover:bg-gray-100 hover:text-gray-700 disabled:cursor-not-allowed disabled:text-gray-300"
+        >
+          查看证据链
+        </button>
+        <button
+          onClick={() => handleReuseQuestion(msgIndex)}
+          className="rounded-lg px-2 py-1 hover:bg-gray-100 hover:text-gray-700"
+        >
+          重新提问
+        </button>
+      </div>
+    )
+  }
+
   const renderSettingsPanel = () => (
     <div className="px-6 py-3 border-t border-gray-100 bg-gray-50 space-y-3">
       <div className="flex items-center justify-between">
@@ -654,6 +749,29 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
     </div>
   )
 
+  const renderRetrievalStatusBar = () => (
+    <div className="px-4 pt-2 shrink-0">
+      <button
+        onClick={() => setShowSettings(true)}
+        className="mx-auto flex max-w-3xl flex-wrap items-center gap-2 rounded-full border border-gray-200 bg-white px-3 py-1.5 text-xs text-gray-500 shadow-sm transition-colors hover:border-gray-300 hover:text-gray-800"
+      >
+        <span className="font-medium text-gray-700">检索</span>
+        <span>知识库: {workspace}</span>
+        <span className="text-gray-300">·</span>
+        <span>mode {mode}</span>
+        <span className="text-gray-300">·</span>
+        <span>topK {topK}</span>
+        <span className="text-gray-300">·</span>
+        <span>chunk {chunkTopK}</span>
+        <span className="text-gray-300">·</span>
+        <span className={enableRerank ? 'text-emerald-600' : 'text-gray-400'}>
+          rerank {enableRerank ? '开' : '关'}
+        </span>
+        <span className="ml-auto text-gray-400">设置</span>
+      </button>
+    </div>
+  )
+
   const isStreamingMsg = (msg: ChatMessage, i: number) =>
     msg.role === 'assistant' && streamingRef.current && i === messages.length - 1
 
@@ -666,9 +784,12 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
     const isCiteHighlighted = (num: number) =>
       highlightedCitation?.msgIndex === msgIndex &&
       highlightedCitation?.num === num
+    const validCitationNumbers = new Set(
+      normalizeCitations(citationsByIndex.get(msgIndex)).map((citation) => citation.index),
+    )
 
     const process = (children: ReactNode) =>
-      processChildren(children, onCiteClick, isCiteHighlighted)
+      processChildren(children, onCiteClick, isCiteHighlighted, validCitationNumbers)
 
     return (
       <div className="prose prose-sm max-w-none prose-headings:text-gray-800 prose-p:text-gray-700 prose-code:text-primary-700 prose-code:bg-gray-200 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-xs prose-pre:bg-gray-800 prose-pre:text-gray-100 prose-a:text-primary-600 prose-strong:text-gray-800 prose-li:text-gray-700">
@@ -754,6 +875,7 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
                   <p className="text-[10px] mt-2 text-gray-400">
                     {formatTime(msg.timestamp)}
                   </p>
+                  {msg.role === 'assistant' && !isStreamingMsg(msg, i) && renderAssistantActions(msg, i)}
                   {msg.role === 'assistant' && renderCitations(i)}
                   {msg.role === 'assistant' && renderEvidence(i)}
                 </div>
@@ -768,20 +890,14 @@ export default function QAChat({ workspace, sessions, activeId, setActiveId, rel
         {showSettings ? (
           renderSettingsPanel()
         ) : (
-          <div className="px-6 pt-2 shrink-0">
-            <button
-              onClick={() => setShowSettings(true)}
-              className="text-xs text-gray-400 hover:text-gray-700 transition-colors"
-            >
-              检索设置
-            </button>
-          </div>
+          renderRetrievalStatusBar()
         )}
 
         {/* Input */}
         <div className="px-4 py-4 shrink-0">
           <div className="mx-auto max-w-3xl flex gap-3 rounded-3xl border border-gray-200 bg-white px-3 py-2 shadow-sm">
             <input
+              ref={inputRef}
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
