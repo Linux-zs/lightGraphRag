@@ -1,0 +1,166 @@
+# TDX System Component Graph Skeleton
+# 14 components + 13 dependency edges
+# Edge direction: source → target means "target depends on source"
+# Backward traversal (target → source) finds upstream root causes
+
+components:
+  行情源:
+    category: "数据源"
+    description: "行情数据来源，提供实时市场行情数据"
+    properties:
+      type: "external"
+      critical: true
+
+  行情系统:
+    category: "核心系统"
+    description: "行情处理与分发核心系统"
+    properties:
+      type: "core"
+      critical: true
+
+  DTF转发:
+    category: "传输层"
+    description: "DTF数据转发服务，负责行情数据转发"
+    properties:
+      type: "relay"
+      critical: true
+
+  TP接入:
+    category: "接入层"
+    description: "TP接入服务，处理客户端连接接入"
+    properties:
+      type: "gateway"
+      critical: true
+
+  聚合服务器:
+    category: "服务层"
+    description: "聚合服务器，整合多源数据服务"
+    properties:
+      type: "server"
+      critical: true
+
+  客户端:
+    category: "终端"
+    description: "通达信客户端终端"
+    properties:
+      type: "client"
+      critical: false
+
+  国密系统:
+    category: "安全"
+    description: "国密算法加密系统"
+    properties:
+      type: "security"
+      critical: true
+
+  认证/加密模块:
+    category: "安全"
+    description: "认证与加密处理模块"
+    properties:
+      type: "security"
+      critical: true
+
+  反外挂系统:
+    category: "安全"
+    description: "反外挂检测与防护系统"
+    properties:
+      type: "security"
+      critical: true
+
+  交易系统:
+    category: "核心系统"
+    description: "交易处理核心系统"
+    properties:
+      type: "core"
+      critical: true
+
+  Rsync:
+    category: "同步"
+    description: "Rsync数据同步服务"
+    properties:
+      type: "sync"
+      critical: false
+
+  资讯系统:
+    category: "内容"
+    description: "资讯内容处理与管理系统"
+    properties:
+      type: "content"
+      critical: false
+
+  资讯下发:
+    category: "传输层"
+    description: "资讯数据下发服务"
+    properties:
+      type: "relay"
+      critical: false
+
+  APM:
+    category: "监控"
+    description: "应用性能监控系统"
+    properties:
+      type: "monitor"
+      critical: true
+
+edges:
+  # 行情链路
+  - source: "行情源"
+    target: "行情系统"
+    relation: "provides_data"
+
+  - source: "行情系统"
+    target: "DTF转发"
+    relation: "feeds"
+
+  - source: "DTF转发"
+    target: "TP接入"
+    relation: "delivers"
+
+  - source: "TP接入"
+    target: "聚合服务器"
+    relation: "connects"
+
+  - source: "聚合服务器"
+    target: "客户端"
+    relation: "serves"
+
+  # 安全链路
+  - source: "国密系统"
+    target: "认证/加密模块"
+    relation: "provides_crypto"
+
+  - source: "反外挂系统"
+    target: "交易系统"
+    relation: "guards"
+
+  # 同步链路
+  - source: "Rsync"
+    target: "资讯系统"
+    relation: "syncs"
+
+  - source: "Rsync"
+    target: "客户端"
+    relation: "syncs"
+
+  # 监控链路
+  - source: "APM"
+    target: "行情系统"
+    relation: "monitors"
+
+  - source: "APM"
+    target: "交易系统"
+    relation: "monitors"
+
+  # 资讯链路
+  - source: "资讯系统"
+    target: "资讯下发"
+    relation: "generates"
+
+  - source: "资讯下发"
+    target: "客户端"
+    relation: "pushes"
+
+  # 行情→交易交叉
+  - source: "行情系统"
+    target: "交易系统"
+    relation: "provides_market_data"
