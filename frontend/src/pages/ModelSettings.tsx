@@ -3,6 +3,7 @@ import {
   discoverModels,
   discoverProfileModels,
   DiscoveredModel,
+  deleteModelProfile,
   getModelBindings,
   getModelConfig,
   listModelProfiles,
@@ -165,6 +166,32 @@ export default function ModelSettings() {
       setMessage(`刷新模型失败: ${(e as Error).message}`)
     } finally {
       setTesting('')
+    }
+  }
+
+  const editProfile = (profile: ModelProfile) => {
+    setProfileDraft({
+      id: profile.id,
+      name: profile.name,
+      api_base: profile.api_base,
+      api_key: '',
+    })
+    setMessage('已载入连接档案；如需替换 API Key，请重新输入后保存')
+  }
+
+  const removeProfile = async (profile: ModelProfile) => {
+    const ok = window.confirm(`确认删除连接档案“${profile.name}”？相关绑定会回退到默认连接。`)
+    if (!ok) return
+    setSaving(true)
+    setMessage('')
+    try {
+      await deleteModelProfile(profile.id)
+      await loadAll()
+      setMessage('连接档案已删除')
+    } catch (e) {
+      setMessage(`删除连接失败: ${(e as Error).message}`)
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -359,12 +386,26 @@ export default function ModelSettings() {
                         Key: {profile.has_api_key ? profile.api_key_preview : '未保存'} · 模型 {profile.models_cache?.length || 0}
                       </div>
                     </div>
-                    <button
-                      onClick={() => refreshProfileModels(profile.id)}
-                      className="shrink-0 rounded border border-gray-300 px-2 py-1 text-xs text-gray-600 hover:bg-gray-50"
-                    >
-                      刷新
-                    </button>
+                    <div className="shrink-0 flex gap-1">
+                      <button
+                        onClick={() => refreshProfileModels(profile.id)}
+                        className="rounded border border-gray-300 px-2 py-1 text-xs text-gray-600 hover:bg-gray-50"
+                      >
+                        刷新
+                      </button>
+                      <button
+                        onClick={() => editProfile(profile)}
+                        className="rounded border border-gray-300 px-2 py-1 text-xs text-gray-600 hover:bg-gray-50"
+                      >
+                        编辑
+                      </button>
+                      <button
+                        onClick={() => removeProfile(profile)}
+                        className="rounded border border-red-200 px-2 py-1 text-xs text-red-600 hover:bg-red-50"
+                      >
+                        删除
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -372,7 +413,19 @@ export default function ModelSettings() {
           </div>
 
           <div className="rounded-lg border border-gray-200 bg-white p-4">
-            <h3 className="text-sm font-semibold text-gray-800">新增或更新连接</h3>
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-gray-800">
+                {profileDraft.id ? '更新连接' : '新增连接'}
+              </h3>
+              {profileDraft.id && (
+                <button
+                  onClick={() => setProfileDraft({ id: '', name: 'SiliconFlow', api_base: 'https://api.siliconflow.cn/v1', api_key: '' })}
+                  className="text-xs text-gray-500 hover:text-gray-800"
+                >
+                  取消编辑
+                </button>
+              )}
+            </div>
             <div className="mt-3 space-y-3">
               <input
                 value={profileDraft.name}
