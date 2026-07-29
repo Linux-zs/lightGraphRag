@@ -27,6 +27,11 @@ class SiliconFlowBackend(LLMBackend):
         self.timeout = config.get("timeout", 30)
         self._client: httpx.AsyncClient | None = None
         self._sync_client: httpx.Client | None = None
+        self.last_stream_finish_reason = ""
+        self.last_stream_usage: dict[str, Any] = {}
+        self.last_stream_done_received = False
+        self.last_stream_chunks = 0
+        self.last_stream_chars = 0
 
     def _get_async_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -109,6 +114,11 @@ class SiliconFlowBackend(LLMBackend):
             "frequency_penalty": frequency_penalty,
             "presence_penalty": presence_penalty,
         }
+        self.last_stream_finish_reason = ""
+        self.last_stream_usage = {}
+        self.last_stream_done_received = False
+        self.last_stream_chunks = 0
+        self.last_stream_chars = 0
         try:
             async with client.stream("POST", "/chat/completions", json=payload) as resp:
                 resp.raise_for_status()
@@ -117,15 +127,34 @@ class SiliconFlowBackend(LLMBackend):
                         continue
                     data_str = line[6:]  # strip "data: "
                     if data_str.strip() == "[DONE]":
+                        self.last_stream_done_received = True
                         break
                     try:
                         data = json.loads(data_str)
-                        delta = data.get("choices", [{}])[0].get("delta", {})
+                        choice = data.get("choices", [{}])[0]
+                        finish_reason = choice.get("finish_reason")
+                        if finish_reason is not None:
+                            self.last_stream_finish_reason = str(finish_reason)
+                        if isinstance(data.get("usage"), dict):
+                            self.last_stream_usage = data["usage"]
+                        delta = choice.get("delta", {})
                         content = delta.get("content", "")
                         if content:
+                            self.last_stream_chunks += 1
+                            self.last_stream_chars += len(content)
                             yield content
                     except (json.JSONDecodeError, KeyError, IndexError):
                         continue
+                logger.info(
+                    "chat_stream_complete model={} finish_reason={} done_received={} "
+                    "chunks={} chars={} usage={}",
+                    self.chat_model,
+                    self.last_stream_finish_reason or "missing",
+                    self.last_stream_done_received,
+                    self.last_stream_chunks,
+                    self.last_stream_chars,
+                    self.last_stream_usage,
+                )
         except Exception as e:
             detail = f"{type(e).__name__}: {e!r}"
             if isinstance(e, httpx.HTTPStatusError):

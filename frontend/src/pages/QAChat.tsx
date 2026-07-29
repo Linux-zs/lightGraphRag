@@ -212,6 +212,7 @@ export default function QAChat({
   const [evidenceByIndex, setEvidenceByIndex] = useState<EvidenceMap>(new Map())
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
+  const [generationStatus, setGenerationStatus] = useState('')
   const [loadingSession, setLoadingSession] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -452,6 +453,7 @@ export default function QAChat({
     if (!text || sending) return
     setInput('')
     setSending(true)
+    setGenerationStatus('')
     streamingRef.current = true
 
     const now = new Date().toISOString()
@@ -561,7 +563,10 @@ export default function QAChat({
                 }
                 return updated
               })
+            } else if (eventType === 'status') {
+              setGenerationStatus(data.message || '正在重新生成完整回答…')
             } else if (eventType === 'done') {
+              setGenerationStatus('')
               sessionIdFromStream = data.session_id
               if (data.content) fullContent = data.content
               setMessages((prev) => {
@@ -572,6 +577,7 @@ export default function QAChat({
                 return updated
               })
             } else if (eventType === 'error') {
+              setGenerationStatus('')
               fullContent = `[回答生成失败: ${data.error}]`
               setMessages((prev) => {
                 const updated = [...prev]
@@ -587,6 +593,7 @@ export default function QAChat({
         }
       }
     } catch (e: unknown) {
+      setGenerationStatus('')
       const errContent = `发送失败: ${(e as Error).message}`
       setMessages((prev) => {
         const updated = [...prev]
@@ -598,6 +605,7 @@ export default function QAChat({
     } finally {
       streamingRef.current = false
       setSending(false)
+      setGenerationStatus('')
 
       // Refresh sessions after streaming completes
       const finalSessionId = sessionIdFromStream || activeId
@@ -1076,6 +1084,12 @@ export default function QAChat({
                     </button>
                   )}
                   {msg.role === 'assistant' && !isStreamingMsg(msg, i) && renderAssistantActions(msg, i)}
+                  {msg.role === 'assistant' && isStreamingMsg(msg, i) && generationStatus && (
+                    <p className="mt-3 inline-flex items-center gap-2 rounded-md bg-amber-50 px-2.5 py-1.5 text-xs text-amber-700">
+                      <span className="h-3 w-3 animate-spin rounded-full border-2 border-amber-500 border-t-transparent" />
+                      {generationStatus}
+                    </p>
+                  )}
                   {msg.role === 'assistant' && renderCitations(i)}
                   {msg.role === 'assistant' && renderEvidence(i)}
                 </div>

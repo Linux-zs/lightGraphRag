@@ -1248,7 +1248,12 @@ def _strip_lightrag_noise(text: str) -> str:
     if not text:
         return ""
     cleaned = text.replace("\ufffd", "")
-    cleaned = re.sub(r"\n\s*assistant\s*$.*", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(
+        r"^\s*(?:assistant|user|system)\s*$.*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
     cleaned = re.sub(r"\n\s*#+\s*References\s*$.*", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
     cleaned = re.sub(r"\n\s*Reference\s*$.*", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
@@ -1312,6 +1317,12 @@ def _generated_answer_quality_issues(text: str) -> list[str]:
         return ["empty"]
     if _is_contaminated_text(text):
         issues.append("contaminated")
+    if re.search(
+        r"^\s*(?:assistant|user|system)\s*$",
+        text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    ):
+        issues.append("role_marker")
 
     compact = re.sub(r"\s+", " ", text)
     if re.search(r"(?:^|\s)(?:[1DzZ])(?:\s+(?:[1DzZ])){12,}(?:\s|$)", compact):
@@ -1334,8 +1345,17 @@ def _generated_answer_quality_issues(text: str) -> list[str]:
 
     if len(re.findall(r"^\s*#{1,6}\s*$", text, flags=re.MULTILINE)) >= 3:
         issues.append("empty_markdown_headings")
+    headings = [
+        re.sub(r"\s+", "", heading).lower()
+        for heading in re.findall(r"^\s*#{1,6}\s+(.+?)\s*$", text, flags=re.MULTILINE)
+    ]
+    if any(headings.count(heading) >= 3 for heading in set(headings)):
+        issues.append("repeated_heading")
     if text.count("```") % 2 == 1:
         issues.append("unclosed_code_fence")
+    tail = text.rstrip()
+    if re.search(r"(?:^|\n)\s*(?:#{1,6}\s+[^\n]+|\d+[.、)]?|[-*+])\s*$", tail):
+        issues.append("incomplete_tail")
 
     return list(dict.fromkeys(issues))
 
@@ -1520,60 +1540,85 @@ async def _generate_answer_text(
         }
     )
     try:
-        response = await backend.chat(
-            messages=_build_answer_messages(
+        base_temperature = (
+            settings.temperature
+            if settings is not None
+            else float(runtime_chat.get("temperature", 0.7))
+        )
+        base_top_p = (
+            settings.top_p
+            if settings is not None
+            else float(runtime_chat.get("top_p", 0.9))
+        )
+        max_tokens = (
+            settings.max_tokens
+            if settings is not None
+            else int(runtime_chat.get("max_tokens", 4096))
+        )
+        base_frequency_penalty = (
+            settings.frequency_penalty
+            if settings is not None
+            else float(runtime_chat.get("frequency_penalty", 0.3))
+        )
+        base_presence_penalty = (
+            settings.presence_penalty
+            if settings is not None
+            else float(runtime_chat.get("presence_penalty", 0.2))
+        )
+        for attempt in range(2):
+            messages = _build_answer_messages(
                 question,
                 citations_data,
                 history,
                 workspace,
-            ),
-            temperature=(
-                settings.temperature
-                if settings is not None
-                else float(runtime_chat.get("temperature", 0.7))
-            ),
-            top_p=(
-                settings.top_p
-                if settings is not None
-                else float(runtime_chat.get("top_p", 0.9))
-            ),
-            max_tokens=(
-                settings.max_tokens
-                if settings is not None
-                else int(runtime_chat.get("max_tokens", 4096))
-            ),
-            frequency_penalty=(
-                settings.frequency_penalty
-                if settings is not None
-                else float(runtime_chat.get("frequency_penalty", 0.3))
-            ),
-            presence_penalty=(
-                settings.presence_penalty
-                if settings is not None
-                else float(runtime_chat.get("presence_penalty", 0.2))
-            ),
-        )
-        ai_text = _strip_lightrag_noise(_strip_citation_section(response.content))
-        issues = _generated_answer_quality_issues(ai_text)
-        if issues:
-            salvaged, remaining = _salvage_generated_answer(ai_text)
-            logger.warning(
-                "answer_quality_check path=nonstream action={} issues={} remaining={} length={}",
-                "salvaged" if salvaged and not remaining else "fallback",
-                ",".join(issues),
-                ",".join(remaining) or "none",
-                len(ai_text),
             )
-            if salvaged and not remaining:
-                return salvaged
-            return _fallback_answer_from_citations(question, citations_data)
-        if not re.search(r"\[\d+\]", ai_text):
-            logger.info(
-                "answer_quality_check path=nonstream action=preserved "
-                "issues=missing_inline_citation length={}",
-                len(ai_text),
+            if attempt:
+                messages[-1]["content"] += (
+                    "\n\n请重新生成一个完整答案。不要输出 assistant/user/system 角色名，"
+                    "不要重复标题，不要以孤立序号或未完成标题结尾。"
+                    "参考资料中的年份、时长和数量必须逐字保留，不得缩写或改写。"
+                    "先在内部检查答案完整性，再一次性给出最终正文。"
+                )
+            response = await backend.chat(
+                messages=messages,
+                temperature=base_temperature if attempt == 0 else min(base_temperature, 0.3),
+                top_p=base_top_p if attempt == 0 else min(base_top_p, 0.8),
+                max_tokens=max_tokens,
+                frequency_penalty=base_frequency_penalty if attempt == 0 else 0.0,
+                presence_penalty=base_presence_penalty if attempt == 0 else 0.0,
             )
-        return ai_text
+            ai_text = _strip_lightrag_noise(_strip_citation_section(response.content))
+            issues = _generated_answer_quality_issues(ai_text)
+            if issues:
+                salvaged, remaining = _salvage_generated_answer(ai_text)
+                action = (
+                    "salvaged"
+                    if salvaged and not remaining
+                    else ("retry" if attempt == 0 else "fallback")
+                )
+                logger.warning(
+                    "answer_quality_check path=nonstream action={} attempt={} "
+                    "issues={} remaining={} length={}",
+                    action,
+                    attempt + 1,
+                    ",".join(issues),
+                    ",".join(remaining) or "none",
+                    len(ai_text),
+                )
+                if salvaged and not remaining:
+                    return salvaged
+                if attempt == 0:
+                    continue
+                return _fallback_answer_from_citations(question, citations_data)
+            if not re.search(r"\[\d+\]", ai_text):
+                logger.info(
+                    "answer_quality_check path=nonstream action=preserved attempt={} "
+                    "issues=missing_inline_citation length={}",
+                    attempt + 1,
+                    len(ai_text),
+                )
+            return ai_text
+        return _fallback_answer_from_citations(question, citations_data)
     except Exception as e:
         logger.warning(f"Answer generation failed; using citation fallback: {e}")
         return _fallback_answer_from_citations(question, citations_data)
@@ -3604,7 +3649,7 @@ async def chat_send_stream(req: ChatSendRequest):
                 issues = _generated_answer_quality_issues(final_text)
                 if issues:
                     salvaged, remaining = _salvage_generated_answer(final_text)
-                    action = "salvaged" if salvaged and not remaining else "fallback"
+                    action = "salvaged" if salvaged and not remaining else "retry"
                     logger.warning(
                         "answer_quality_check path=stream action={} session_id={} "
                         "workspace={} model={} issues={} remaining={} length={}",
@@ -3616,11 +3661,24 @@ async def chat_send_stream(req: ChatSendRequest):
                         ",".join(remaining) or "none",
                         len(final_text),
                     )
-                    final_text = (
-                        salvaged
-                        if salvaged and not remaining
-                        else _fallback_answer_from_citations(req.message, citations_data)
-                    )
+                    if salvaged and not remaining:
+                        final_text = salvaged
+                    else:
+                        yield (
+                            "event: status\ndata: "
+                            + json.dumps(
+                                {"message": "模型提前结束，正在重新生成完整回答…"},
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
+                        )
+                        final_text = await _generate_answer_text(
+                            req.message,
+                            citations_data,
+                            history,
+                            req.workspace,
+                            chat_settings,
+                        )
                 elif citations_data and not re.search(r"\[\d+\]", final_text):
                     logger.info(
                         "answer_quality_check path=stream action=preserved session_id={} "

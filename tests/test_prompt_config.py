@@ -81,6 +81,61 @@ def test_missing_inline_citation_does_not_replace_good_answer(monkeypatch):
     assert answer == "这是模型组织后的正常回答，没有行内引用编号。"
 
 
+def test_incomplete_answer_is_retried_with_conservative_parameters(monkeypatch):
+    calls = []
+
+    class FakeBackend:
+        def __init__(self, _config):
+            pass
+
+        async def chat(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return SimpleNamespace(content="### 原因\n已有正常说明。\n\n### 排查步骤\n1")
+            return SimpleNamespace(content="### 原因\n已有正常说明。\n\n### 排查步骤\n1. 检查供应商状态。[1]")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(server, "SiliconFlowBackend", FakeBackend)
+    monkeypatch.setattr(
+        server,
+        "get_runtime_model_config",
+        lambda _cfg: {
+            "chat": {
+                "base_url": "http://127.0.0.1/v1",
+                "api_key": "",
+                "model": "test-chat",
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "frequency_penalty": 0.3,
+                "presence_penalty": 0.2,
+            }
+        },
+    )
+    monkeypatch.setattr(server, "get_config", lambda: {})
+
+    answer = asyncio.run(
+        server._generate_answer_text(
+            "问题",
+            [{"index": 1, "doc_name": "a.txt", "chunk_index": 0, "excerpt": "参考资料"}],
+            [],
+        )
+    )
+
+    assert len(calls) == 2
+    assert calls[1]["temperature"] == 0.3
+    assert calls[1]["frequency_penalty"] == 0.0
+    assert answer.endswith("检查供应商状态。[1]")
+
+
+def test_role_marker_tail_is_removed_and_marked_incomplete():
+    cleaned = server._strip_lightrag_noise(
+        "### 原因\n正常内容。\n\nassistant\n### 原因\n重复内容。"
+    )
+    assert cleaned == "### 原因\n正常内容。"
+
+
 def test_prompt_templates_can_be_created_updated_and_deleted(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "PROMPT_TEMPLATES_PATH", tmp_path / "templates.json")
 
