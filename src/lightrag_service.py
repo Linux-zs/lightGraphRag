@@ -46,6 +46,65 @@ GRAPH_CATEGORY_MAP = {
     "process": "传输",
 }
 
+TDX_GRAPH_RULE_TEMPLATE = {
+    "id": "tdx_ops",
+    "name": "通达信运维知识库",
+    "description": "适合通达信部署、运维、同步链路、服务排查类文档。",
+    "entity_types": ["产品", "模块", "服务", "配置项", "故障现象", "排查步骤", "文件", "数据库"],
+    "relation_types": ["依赖于", "部署在", "读取", "写入", "同步到", "导致", "排查", "包含"],
+    "aliases_text": "",
+    "extraction_prompt": (
+        "请从通达信运维/部署文档中抽取稳定、可复用的业务实体和技术实体。"
+        "优先抽取系统、模块、服务、配置项、文件、数据库、故障现象和排查动作；"
+        "关系应表达真实依赖、数据流向、部署位置、读写关系、故障原因和排查路径。"
+        "不要把普通段落标题、孤立编号、无意义变量值抽成实体。"
+    ),
+    "built_in": True,
+    "created_at": "",
+    "updated_at": "",
+}
+
+GENERAL_GRAPH_RULE_TEMPLATE = {
+    "id": "general_knowledge",
+    "name": "通用知识库",
+    "description": "适合非特定行业文档，保守抽取人物、组织、地点、概念、事件、物品和因果关系。",
+    "entity_types": ["人物", "组织", "地点", "概念", "事件", "物品", "问题", "结论"],
+    "relation_types": ["属于", "包含", "影响", "导致", "关联", "发生在", "参与", "说明"],
+    "aliases_text": "",
+    "extraction_prompt": (
+        "请从当前文档中抽取对理解内容有帮助的稳定实体和关系。"
+        "实体应是文档主题中的人物、组织、地点、概念、事件、物品、问题或结论；"
+        "关系应表达包含、影响、导致、关联、时间地点、参与者或解释说明。"
+        "不要因为模板中出现某个类型就强行抽取；不要把普通句子、孤立编号、页眉页脚或无意义短语抽成实体。"
+    ),
+    "built_in": True,
+    "created_at": "",
+    "updated_at": "",
+}
+
+SUPPLY_CHAIN_GRAPH_RULE_TEMPLATE = {
+    "id": "supply_chain",
+    "name": "供应链/风险分析",
+    "description": "适合供应链、药品、库存、生产、采购、断供风险类资料。",
+    "entity_types": ["机构", "产品", "原料", "供应商", "生产环节", "库存", "风险", "原因", "措施"],
+    "relation_types": ["采购", "供应", "生产", "储备", "依赖", "导致", "缓解", "影响"],
+    "aliases_text": "",
+    "extraction_prompt": (
+        "请围绕供应链和风险分析抽取实体关系。优先抽取机构、产品、原料、供应商、生产环节、库存状态、风险因素和缓解措施；"
+        "关系应体现采购、供应、生产、储备、依赖、导致、缓解和影响。"
+        "不要把普通段落标题或没有业务含义的编号抽成实体。"
+    ),
+    "built_in": True,
+    "created_at": "",
+    "updated_at": "",
+}
+
+BUILTIN_GRAPH_RULE_TEMPLATES = [
+    TDX_GRAPH_RULE_TEMPLATE,
+    GENERAL_GRAPH_RULE_TEMPLATE,
+    SUPPLY_CHAIN_GRAPH_RULE_TEMPLATE,
+]
+
 
 @dataclass
 class LightRAGQueryResult:
@@ -145,6 +204,10 @@ class LightRAGService:
     @property
     def graph_reference_dir(self) -> Path:
         return self.data_dir / "graph_governance_refs" / self.workspace
+
+    @property
+    def graph_rule_templates_path(self) -> Path:
+        return self.data_dir / "graph_rule_templates.json"
 
     async def get_rag(self) -> LightRAG:
         if self._rag is not None:
@@ -326,17 +389,15 @@ class LightRAGService:
         )
 
     def _default_graph_governance(self) -> dict[str, Any]:
+        template = TDX_GRAPH_RULE_TEMPLATE if self.workspace == DEFAULT_WORKSPACE else GENERAL_GRAPH_RULE_TEMPLATE
         return {
             "workspace": self.workspace,
-            "entity_types": ["产品", "模块", "服务", "配置项", "故障现象", "排查步骤", "文件", "数据库"],
-            "relation_types": ["依赖于", "部署在", "读取", "写入", "同步到", "导致", "排查", "包含"],
-            "aliases_text": "",
-            "extraction_prompt": (
-                "请从通达信运维/部署文档中抽取稳定、可复用的业务实体和技术实体。"
-                "优先抽取系统、模块、服务、配置项、文件、数据库、故障现象和排查动作；"
-                "关系应表达真实依赖、数据流向、部署位置、读写关系、故障原因和排查路径。"
-                "不要把普通段落标题、孤立编号、无意义变量值抽成实体。"
-            ),
+            "rule_template_id": template["id"],
+            "rule_template_name": template["name"],
+            "entity_types": list(template["entity_types"]),
+            "relation_types": list(template["relation_types"]),
+            "aliases_text": template["aliases_text"],
+            "extraction_prompt": template["extraction_prompt"],
             "reference_files": [],
             "updated_at": _now_iso(),
             "audit_log": [],
@@ -356,6 +417,8 @@ class LightRAGService:
             return default
         merged = {**default, **data}
         merged["workspace"] = self.workspace
+        merged["rule_template_id"] = str(merged.get("rule_template_id") or default["rule_template_id"])
+        merged["rule_template_name"] = str(merged.get("rule_template_name") or default["rule_template_name"])
         merged["entity_types"] = list(merged.get("entity_types") or [])
         merged["relation_types"] = list(merged.get("relation_types") or [])
         merged["reference_files"] = list(merged.get("reference_files") or [])
@@ -369,6 +432,8 @@ class LightRAGService:
             "relation_types",
             "aliases_text",
             "extraction_prompt",
+            "rule_template_id",
+            "rule_template_name",
             "reference_files",
             "audit_log",
         }
@@ -383,6 +448,104 @@ class LightRAGService:
             encoding="utf-8",
         )
         return current
+
+    def _load_custom_graph_rule_templates(self) -> list[dict[str, Any]]:
+        if not self.graph_rule_templates_path.exists():
+            return []
+        try:
+            data = json.loads(self.graph_rule_templates_path.read_text(encoding="utf-8"))
+            templates = data.get("templates") if isinstance(data, dict) else data
+            if isinstance(templates, list):
+                return [item for item in templates if isinstance(item, dict)]
+        except Exception:
+            logger.exception("Failed to read graph rule templates")
+        return []
+
+    def _save_custom_graph_rule_templates(self, templates: list[dict[str, Any]]) -> None:
+        self.graph_rule_templates_path.parent.mkdir(parents=True, exist_ok=True)
+        self.graph_rule_templates_path.write_text(
+            json.dumps({"templates": templates}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def list_graph_rule_templates(self) -> list[dict[str, Any]]:
+        custom = self._load_custom_graph_rule_templates()
+        builtin_ids = {item["id"] for item in BUILTIN_GRAPH_RULE_TEMPLATES}
+        clean_custom = [
+            {**item, "built_in": False}
+            for item in custom
+            if item.get("id") and item.get("id") not in builtin_ids
+        ]
+        return [dict(item) for item in BUILTIN_GRAPH_RULE_TEMPLATES] + clean_custom
+
+    def save_graph_rule_template(self, template: dict[str, Any]) -> dict[str, Any]:
+        template_id = str(template.get("id") or "").strip()
+        if not template_id:
+            template_id = "rule_" + hashlib.md5(
+                f"{template.get('name', 'rule')}|{_now_iso()}".encode("utf-8")
+            ).hexdigest()[:12]
+        if template_id in {item["id"] for item in BUILTIN_GRAPH_RULE_TEMPLATES}:
+            raise ValueError("Built-in graph rule templates cannot be overwritten")
+        now = _now_iso()
+        custom = self._load_custom_graph_rule_templates()
+        existing = next((item for item in custom if item.get("id") == template_id), {})
+        saved = {
+            **existing,
+            "id": template_id,
+            "name": str(template.get("name") or existing.get("name") or "自定义抽取规则").strip(),
+            "description": str(template.get("description") or existing.get("description") or "").strip(),
+            "entity_types": [str(item).strip() for item in template.get("entity_types", existing.get("entity_types", [])) if str(item).strip()],
+            "relation_types": [str(item).strip() for item in template.get("relation_types", existing.get("relation_types", [])) if str(item).strip()],
+            "aliases_text": str(template.get("aliases_text", existing.get("aliases_text", ""))),
+            "extraction_prompt": str(template.get("extraction_prompt", existing.get("extraction_prompt", ""))),
+            "built_in": False,
+            "created_at": existing.get("created_at", now),
+            "updated_at": now,
+        }
+        custom = [saved if item.get("id") == template_id else item for item in custom]
+        if not any(item.get("id") == template_id for item in custom):
+            custom.insert(0, saved)
+        self._save_custom_graph_rule_templates(custom)
+        return saved
+
+    def delete_graph_rule_template(self, template_id: str) -> dict[str, Any]:
+        if template_id in {item["id"] for item in BUILTIN_GRAPH_RULE_TEMPLATES}:
+            raise ValueError("Built-in graph rule templates cannot be deleted")
+        custom = self._load_custom_graph_rule_templates()
+        next_custom = [item for item in custom if item.get("id") != template_id]
+        if len(next_custom) == len(custom):
+            raise KeyError(template_id)
+        self._save_custom_graph_rule_templates(next_custom)
+        return {"deleted": template_id}
+
+    def apply_graph_rule_template(self, template_id: str) -> dict[str, Any]:
+        template = next((item for item in self.list_graph_rule_templates() if item.get("id") == template_id), None)
+        if template is None:
+            raise KeyError(template_id)
+        cfg = self.save_graph_governance(
+            {
+                "rule_template_id": template["id"],
+                "rule_template_name": template["name"],
+                "entity_types": list(template.get("entity_types") or []),
+                "relation_types": list(template.get("relation_types") or []),
+                "aliases_text": str(template.get("aliases_text") or ""),
+                "extraction_prompt": str(template.get("extraction_prompt") or ""),
+            }
+        )
+        self.append_graph_audit("apply_rule_template", {"template_id": template_id, "template_name": template["name"]})
+        return self.load_graph_governance()
+
+    def graph_governance_summary(self) -> dict[str, Any]:
+        cfg = self.load_graph_governance()
+        prompt = str(cfg.get("extraction_prompt") or "")
+        return {
+            "rule_template_id": cfg.get("rule_template_id", ""),
+            "rule_template_name": cfg.get("rule_template_name", ""),
+            "entity_type_count": len(cfg.get("entity_types") or []),
+            "relation_type_count": len(cfg.get("relation_types") or []),
+            "extraction_prompt_preview": prompt[:180] + ("..." if len(prompt) > 180 else ""),
+            "updated_at": cfg.get("updated_at", ""),
+        }
 
     def add_graph_reference(self, file_name: str, content: str) -> dict[str, Any]:
         ref_id = hashlib.md5(f"{file_name}|{_now_iso()}".encode("utf-8")).hexdigest()[:12]
@@ -602,6 +765,7 @@ class LightRAGService:
             "indexed": existing.get("indexed", False),
             "status": existing.get("status", "uploaded"),
             "chunk_count": existing.get("chunk_count", 0),
+            "graph_rule": existing.get("graph_rule") or self.graph_governance_summary(),
             "updated_at": _now_iso(),
         }
         manifest["documents"][doc_id] = item
@@ -692,6 +856,7 @@ class LightRAGService:
                         "chunk_overlap": chunk_overlap,
                         "separators": separators,
                     },
+                    "graph_rule": self.graph_governance_summary(),
                     "updated_at": _now_iso(),
                 }
                 )
@@ -716,6 +881,7 @@ class LightRAGService:
                         "chunk_overlap": chunk_overlap,
                         "separators": separators,
                     },
+                    "graph_rule": self.graph_governance_summary(),
                     "last_insert_result": result,
                     "updated_at": _now_iso(),
                 }

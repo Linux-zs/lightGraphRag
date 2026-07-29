@@ -2,10 +2,12 @@ import { useEffect, useMemo, useState } from 'react'
 import GraphView from '../components/GraphView'
 import {
   applyGraphChanges,
+  applyGraphRuleTemplate,
   createGraphEntity,
   createGraphRelation,
   deleteGraphEntity,
   deleteGraphReference,
+  deleteGraphRuleTemplate,
   deleteGraphRelation,
   getGraph,
   getGraphGovernanceConfig,
@@ -14,7 +16,10 @@ import {
   GraphEdge,
   GraphGovernanceConfig,
   GraphNode,
+  GraphRuleTemplate,
+  listGraphRuleTemplates,
   mergeGraphEntities,
+  saveGraphRuleTemplate,
   suggestGraphChanges,
   updateGraphEntity,
   updateGraphGovernanceConfig,
@@ -39,6 +44,8 @@ const TABS: { key: Tab; label: string }[] = [
 
 const emptyConfig: GraphGovernanceConfig = {
   workspace: '',
+  rule_template_id: '',
+  rule_template_name: '',
   entity_types: [],
   relation_types: [],
   aliases_text: '',
@@ -88,6 +95,9 @@ export default function GraphPage({ workspace }: Props) {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [latestEvidence, setLatestEvidence] = useState<EvidenceChain | null>(null)
+  const [ruleTemplates, setRuleTemplates] = useState<GraphRuleTemplate[]>([])
+  const [selectedTemplateId, setSelectedTemplateId] = useState('')
+  const [templateName, setTemplateName] = useState('')
 
   const [entityTypesText, setEntityTypesText] = useState('')
   const [relationTypesText, setRelationTypesText] = useState('')
@@ -124,17 +134,23 @@ export default function GraphPage({ workspace }: Props) {
   const loadConfig = async () => {
     const cfg = await getGraphGovernanceConfig(workspace)
     setConfig(cfg)
+    setSelectedTemplateId(cfg.rule_template_id || '')
     setEntityTypesText(joinLines(cfg.entity_types || []))
     setRelationTypesText(joinLines(cfg.relation_types || []))
     setAliasesText(cfg.aliases_text || '')
     setExtractionPrompt(cfg.extraction_prompt || '')
   }
 
+  const loadTemplates = async () => {
+    const templates = await listGraphRuleTemplates(workspace)
+    setRuleTemplates(templates)
+  }
+
   const loadAll = async (nextLimit = limit) => {
     setLoading(true)
     setError('')
     try {
-      await Promise.all([loadGraph(nextLimit), loadConfig()])
+      await Promise.all([loadGraph(nextLimit), loadConfig(), loadTemplates()])
     } catch (e) {
       setError((e as Error).message || '加载失败')
     } finally {
@@ -227,6 +243,8 @@ export default function GraphPage({ workspace }: Props) {
   const saveRules = () => runAction(async () => {
     const cfg = await updateGraphGovernanceConfig({
       workspace,
+      rule_template_id: config.rule_template_id || selectedTemplateId,
+      rule_template_name: config.rule_template_name || '当前知识库自定义规则',
       entity_types: splitLines(entityTypesText),
       relation_types: splitLines(relationTypesText),
       aliases_text: aliasesText,
@@ -234,6 +252,54 @@ export default function GraphPage({ workspace }: Props) {
     })
     setConfig(cfg)
   }, '抽取规则已保存')
+
+  const applySelectedTemplate = () => {
+    if (!selectedTemplateId) return
+    const selected = ruleTemplates.find((item) => item.id === selectedTemplateId)
+    const ok = window.confirm(
+      `确认将“${selected?.name || selectedTemplateId}”套用到当前知识库？新规则只影响后续上传和重新索引的文档。`,
+    )
+    if (!ok) return
+    return runAction(async () => {
+      const cfg = await applyGraphRuleTemplate(workspace, selectedTemplateId)
+      setConfig(cfg)
+      setSelectedTemplateId(cfg.rule_template_id || '')
+      setEntityTypesText(joinLines(cfg.entity_types || []))
+      setRelationTypesText(joinLines(cfg.relation_types || []))
+      setAliasesText(cfg.aliases_text || '')
+      setExtractionPrompt(cfg.extraction_prompt || '')
+    }, '已套用抽取规则模板；已索引文档需要重新索引才会按新规则重建图谱')
+  }
+
+  const saveCurrentAsTemplate = () => {
+    if (!templateName.trim()) return
+    return runAction(async () => {
+      const saved = await saveGraphRuleTemplate({
+        id: '',
+        name: templateName.trim(),
+        description: `从知识库 ${workspace} 的当前抽取规则另存`,
+        entity_types: splitLines(entityTypesText),
+        relation_types: splitLines(relationTypesText),
+        aliases_text: aliasesText,
+        extraction_prompt: extractionPrompt,
+        built_in: false,
+      })
+      setTemplateName('')
+      await loadTemplates()
+      setSelectedTemplateId(saved.id)
+    }, '当前规则已另存为模板')
+  }
+
+  const removeTemplate = (template: GraphRuleTemplate) => {
+    if (template.built_in) return
+    const ok = window.confirm(`确认删除抽取规则模板“${template.name}”？不会影响已套用到知识库的规则内容。`)
+    if (!ok) return
+    return runAction(async () => {
+      await deleteGraphRuleTemplate(template.id)
+      await loadTemplates()
+      if (selectedTemplateId === template.id) setSelectedTemplateId(config.rule_template_id || '')
+    }, '抽取规则模板已删除')
+  }
 
   const handleReferenceUpload = async (file: File | null) => {
     if (!file) return
@@ -455,6 +521,60 @@ export default function GraphPage({ workspace }: Props) {
     <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_360px] gap-4">
       <div className="space-y-4">
         <div className="border border-gray-200 rounded-lg bg-white p-4">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h3 className="text-sm font-semibold text-gray-800">当前索引抽取规则</h3>
+              <p className="mt-1 text-xs text-gray-500">
+                当前知识库使用：{config.rule_template_name || '未命名规则'}。
+                后续上传和重新索引会按这里的规则引导 LightRAG 抽取实体关系。
+              </p>
+            </div>
+            <div className="shrink-0 rounded-lg bg-gray-50 px-3 py-2 text-right text-xs text-gray-500">
+              <div>实体类型 {splitLines(entityTypesText).length}</div>
+              <div>关系类型 {splitLines(relationTypesText).length}</div>
+            </div>
+          </div>
+
+          <div className="mt-4 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_auto] gap-3">
+            <select
+              value={selectedTemplateId}
+              onChange={(e) => setSelectedTemplateId(e.target.value)}
+              className="rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white"
+            >
+              <option value="">选择抽取规则模板</option>
+              {ruleTemplates.map((template) => (
+                <option key={template.id} value={template.id}>
+                  {template.name}{template.built_in ? ' / 内置' : ''}
+                </option>
+              ))}
+            </select>
+            <button
+              onClick={applySelectedTemplate}
+              disabled={!selectedTemplateId || saving}
+              className="px-4 py-2 rounded-lg bg-gray-900 text-white text-sm hover:bg-gray-700 disabled:bg-gray-300"
+            >
+              套用模板
+            </button>
+          </div>
+
+          <div className="mt-3 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_auto] gap-3">
+            <input
+              value={templateName}
+              onChange={(e) => setTemplateName(e.target.value)}
+              className="rounded-lg border border-gray-200 px-3 py-2 text-sm"
+              placeholder="将当前规则另存为模板名称"
+            />
+            <button
+              onClick={saveCurrentAsTemplate}
+              disabled={!templateName.trim() || saving}
+              className="px-4 py-2 rounded-lg border border-gray-300 text-sm text-gray-700 hover:bg-gray-50 disabled:text-gray-300"
+            >
+              另存为模板
+            </button>
+          </div>
+        </div>
+
+        <div className="border border-gray-200 rounded-lg bg-white p-4">
           <label className="block text-sm font-semibold text-gray-800 mb-2">抽取提示词</label>
           <textarea
             value={extractionPrompt}
@@ -500,6 +620,39 @@ export default function GraphPage({ workspace }: Props) {
         </button>
       </div>
       <div className="space-y-4">
+        <div className="border border-gray-200 rounded-lg bg-white p-4">
+          <h3 className="text-sm font-semibold text-gray-800">规则模板库</h3>
+          <div className="mt-3 max-h-72 overflow-y-auto divide-y divide-gray-100">
+            {ruleTemplates.map((template) => (
+              <div key={template.id} className="py-3 text-xs">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="font-medium text-gray-800">
+                      {template.name}
+                      {template.built_in && <span className="ml-2 text-[10px] text-gray-400">内置</span>}
+                    </div>
+                    <div className="mt-1 text-gray-500 leading-relaxed">{template.description || '暂无说明'}</div>
+                    <div className="mt-1 text-gray-400">
+                      实体 {template.entity_types.length} · 关系 {template.relation_types.length}
+                    </div>
+                  </div>
+                  {!template.built_in && (
+                    <button
+                      onClick={() => removeTemplate(template)}
+                      className="shrink-0 text-red-500 hover:text-red-700"
+                    >
+                      删除
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+            {ruleTemplates.length === 0 && (
+              <div className="py-6 text-xs text-gray-400">暂无规则模板</div>
+            )}
+          </div>
+        </div>
+
         <div className="border border-gray-200 rounded-lg bg-white p-4">
           <h3 className="text-sm font-semibold text-gray-800">抽取参考文件</h3>
           <p className="mt-1 text-xs text-gray-500">

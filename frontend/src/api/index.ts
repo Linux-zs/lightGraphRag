@@ -100,6 +100,7 @@ export interface DocInfo {
   indexed?: boolean
   status?: string
   error_msg?: string
+  graph_rule?: GraphRuleSummary
 }
 
 export interface WorkspaceInfo {
@@ -539,6 +540,8 @@ export function getGraph(limit = 200, workspace = 'tdx_default') {
 
 export interface GraphGovernanceConfig {
   workspace: string
+  rule_template_id: string
+  rule_template_name: string
   entity_types: string[]
   relation_types: string[]
   aliases_text: string
@@ -546,6 +549,28 @@ export interface GraphGovernanceConfig {
   reference_files: GraphReferenceFile[]
   updated_at: string
   audit_log: GraphAuditEntry[]
+}
+
+export interface GraphRuleSummary {
+  rule_template_id: string
+  rule_template_name: string
+  entity_type_count: number
+  relation_type_count: number
+  extraction_prompt_preview: string
+  updated_at: string
+}
+
+export interface GraphRuleTemplate {
+  id: string
+  name: string
+  description: string
+  entity_types: string[]
+  relation_types: string[]
+  aliases_text: string
+  extraction_prompt: string
+  built_in: boolean
+  created_at?: string
+  updated_at?: string
 }
 
 export interface GraphReferenceFile {
@@ -583,8 +608,36 @@ export function getGraphGovernanceConfig(workspace = 'tdx_default') {
   )
 }
 
+export function listGraphRuleTemplates(workspace = 'tdx_default') {
+  return request<GraphRuleTemplate[]>(
+    `/graph/rule-templates?workspace=${encodeURIComponent(workspace)}`,
+  )
+}
+
+export function saveGraphRuleTemplate(template: GraphRuleTemplate) {
+  return request<GraphRuleTemplate>('/graph/rule-templates', {
+    method: 'POST',
+    body: JSON.stringify(template),
+  })
+}
+
+export function deleteGraphRuleTemplate(templateId: string) {
+  return request<{ deleted: string }>(`/graph/rule-templates/${encodeURIComponent(templateId)}`, {
+    method: 'DELETE',
+  })
+}
+
+export function applyGraphRuleTemplate(workspace: string, templateId: string) {
+  return request<GraphGovernanceConfig>('/graph/governance/apply-template', {
+    method: 'POST',
+    body: JSON.stringify({ workspace, template_id: templateId }),
+  })
+}
+
 export function updateGraphGovernanceConfig(config: {
   workspace?: string
+  rule_template_id?: string
+  rule_template_name?: string
   entity_types: string[]
   relation_types: string[]
   aliases_text: string

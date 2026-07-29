@@ -14,9 +14,11 @@ import {
   getDocumentRawText,
   updateDocumentRawText,
   getDocumentChunks,
+  getGraphGovernanceConfig,
   ChunkPreviewItem,
   DocInfo,
   DocumentChunkItem,
+  GraphGovernanceConfig,
   IndexTask,
 } from '../api'
 
@@ -73,6 +75,7 @@ export default function KBManagement({ workspace }: Props) {
   const [chunkModalDocName, setChunkModalDocName] = useState('')
   const [chunkList, setChunkList] = useState<DocumentChunkItem[]>([])
   const [chunkLoading, setChunkLoading] = useState(false)
+  const [graphRule, setGraphRule] = useState<GraphGovernanceConfig | null>(null)
 
   const isTaskTerminal = (task: IndexTask) =>
     ['succeeded', 'failed', 'partial', 'cancelled'].includes(task.status)
@@ -212,6 +215,15 @@ export default function KBManagement({ workspace }: Props) {
       const data = await listDocuments(workspace)
       setDocs(data)
     } catch {/* ignore */}
+  }
+
+  const loadGraphRule = async () => {
+    try {
+      const data = await getGraphGovernanceConfig(workspace)
+      setGraphRule(data)
+    } catch {
+      setGraphRule(null)
+    }
   }
 
   const handleDelete = async (docName: string) => {
@@ -416,6 +428,7 @@ export default function KBManagement({ workspace }: Props) {
 
   useEffect(() => {
     loadDocs()
+    loadGraphRule()
   }, [workspace])
 
   return (
@@ -433,6 +446,27 @@ export default function KBManagement({ workspace }: Props) {
         <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide mb-4">
           上传文档
         </h3>
+        <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="font-medium text-amber-900">
+                当前图谱抽取规则：{graphRule?.rule_template_name || '加载中'}
+              </div>
+              <p className="mt-1 text-xs text-amber-800 leading-relaxed">
+                索引时 LightRAG 会按这套规则引导实体和关系抽取。切换规则后，已索引文档需要重新索引才会重建图谱。
+              </p>
+            </div>
+            <div className="shrink-0 text-right text-xs text-amber-800">
+              <div>实体类型 {graphRule?.entity_types?.length ?? 0}</div>
+              <div>关系类型 {graphRule?.relation_types?.length ?? 0}</div>
+            </div>
+          </div>
+          {graphRule?.extraction_prompt && (
+            <p className="mt-2 line-clamp-2 text-xs text-amber-700">
+              {graphRule.extraction_prompt}
+            </p>
+          )}
+        </div>
         <FileUpload onUpload={handleUpload} onMultiUpload={handleMultiUpload} uploading={uploading} />
 
         {uploaded && (
@@ -631,6 +665,7 @@ export default function KBManagement({ workspace }: Props) {
                   <th className="pb-2 font-medium text-gray-500">文档名</th>
                   <th className="pb-2 font-medium text-gray-500">类型</th>
                   <th className="pb-2 font-medium text-gray-500">块数</th>
+                  <th className="pb-2 font-medium text-gray-500">抽取规则</th>
                   <th className="pb-2 font-medium text-gray-500">状态</th>
                   <th className="pb-2 font-medium text-gray-500 text-right">操作</th>
                 </tr>
@@ -661,6 +696,14 @@ export default function KBManagement({ workspace }: Props) {
                       </span>
                     </td>
                     <td className="py-2.5 text-gray-600">{doc.chunk_count}</td>
+                    <td className="py-2.5 text-gray-600">
+                      <span
+                        title={doc.graph_rule?.extraction_prompt_preview || ''}
+                        className="text-xs bg-amber-50 text-amber-700 px-2 py-0.5 rounded"
+                      >
+                        {doc.graph_rule?.rule_template_name || graphRule?.rule_template_name || '未记录'}
+                      </span>
+                    </td>
                     <td className="py-2.5">
                       <span
                         title={(doc as DocInfo & { error_msg?: string }).error_msg || ''}

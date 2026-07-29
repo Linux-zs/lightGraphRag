@@ -215,6 +215,8 @@ class EvidenceChain(BaseModel):
 
 class GraphGovernanceConfig(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
+    rule_template_id: str = ""
+    rule_template_name: str = ""
     entity_types: list[str] = []
     relation_types: list[str] = []
     aliases_text: str = ""
@@ -225,10 +227,28 @@ class GraphGovernanceConfig(BaseModel):
 
 class GraphGovernanceUpdate(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
+    rule_template_id: str = ""
+    rule_template_name: str = ""
     entity_types: list[str] = []
     relation_types: list[str] = []
     aliases_text: str = ""
     extraction_prompt: str = ""
+
+class GraphRuleTemplate(BaseModel):
+    id: str = ""
+    name: str
+    description: str = ""
+    entity_types: list[str] = []
+    relation_types: list[str] = []
+    aliases_text: str = ""
+    extraction_prompt: str = ""
+    built_in: bool = False
+    created_at: str = ""
+    updated_at: str = ""
+
+class GraphRuleTemplateApplyRequest(BaseModel):
+    workspace: str = DEFAULT_WORKSPACE
+    template_id: str
 
 class GraphEntityCreateRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
@@ -829,7 +849,12 @@ def _citations_are_relevant(question: str, citations_data: list[dict], history: 
     if _contains_out_of_scope_intent(question):
         return len(overlap) >= 3
 
-    # Require at least two non-generic overlaps for domain-agnostic questions.
+    long_question_terms = {term for term in q_terms if len(term) >= 3}
+    long_overlap = {term for term in long_question_terms if term in ctx}
+    if long_overlap:
+        return True
+
+    # Require at least two non-generic overlaps for short or domain-agnostic questions.
     return len(overlap) >= 2
 
 
@@ -853,7 +878,8 @@ def _build_answer_messages(
     user = (
         f"问题：{question}\n\n"
         f"参考资料：\n{context}\n\n"
-        "请综合参考资料回答，不要逐条照抄资料。"
+        "请综合参考资料回答，不要逐条照抄资料，也不要把命中的文档逐个列成清单。"
+        "如果资料只是零散提到相关对象、但不能支撑问题中的因果或判断，请明确说明资料不足。"
     )
     messages = [{"role": "system", "content": system}]
     messages.extend(history[-2:])
@@ -2357,12 +2383,47 @@ async def get_graph_governance_config(workspace: str = Query(DEFAULT_WORKSPACE))
     return get_lightrag_service(workspace).load_graph_governance()
 
 
+@app.get("/api/graph/rule-templates", response_model=list[GraphRuleTemplate])
+async def list_graph_rule_templates(workspace: str = Query(DEFAULT_WORKSPACE)):
+    workspace = sanitize_workspace(workspace)
+    return get_lightrag_service(workspace).list_graph_rule_templates()
+
+
+@app.post("/api/graph/rule-templates", response_model=GraphRuleTemplate)
+async def save_graph_rule_template(req: GraphRuleTemplate):
+    try:
+        return get_lightrag_service(DEFAULT_WORKSPACE).save_graph_rule_template(req.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.delete("/api/graph/rule-templates/{template_id}")
+async def delete_graph_rule_template(template_id: str):
+    try:
+        return get_lightrag_service(DEFAULT_WORKSPACE).delete_graph_rule_template(template_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except KeyError:
+        raise HTTPException(404, "Graph rule template not found")
+
+
+@app.post("/api/graph/governance/apply-template", response_model=GraphGovernanceConfig)
+async def apply_graph_rule_template(req: GraphRuleTemplateApplyRequest):
+    workspace = sanitize_workspace(req.workspace)
+    try:
+        return get_lightrag_service(workspace).apply_graph_rule_template(req.template_id)
+    except KeyError:
+        raise HTTPException(404, "Graph rule template not found")
+
+
 @app.put("/api/graph/governance/config", response_model=GraphGovernanceConfig)
 async def update_graph_governance_config(req: GraphGovernanceUpdate):
     workspace = sanitize_workspace(req.workspace)
     service = get_lightrag_service(workspace)
     return service.save_graph_governance(
         {
+            "rule_template_id": req.rule_template_id,
+            "rule_template_name": req.rule_template_name,
             "entity_types": [item.strip() for item in req.entity_types if item.strip()],
             "relation_types": [item.strip() for item in req.relation_types if item.strip()],
             "aliases_text": req.aliases_text,
