@@ -217,10 +217,13 @@ class GraphGovernanceConfig(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
     rule_template_id: str = ""
     rule_template_name: str = ""
+    extraction_mode: str = "assist"
+    allow_other_entity_type: bool = True
     entity_types: list[str] = []
     relation_types: list[str] = []
     aliases_text: str = ""
     extraction_prompt: str = ""
+    effective_extraction_prompt: str = ""
     reference_files: list[dict[str, Any]] = []
     updated_at: str = ""
     audit_log: list[dict[str, Any]] = []
@@ -229,6 +232,8 @@ class GraphGovernanceUpdate(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
     rule_template_id: str = ""
     rule_template_name: str = ""
+    extraction_mode: str = "assist"
+    allow_other_entity_type: bool = True
     entity_types: list[str] = []
     relation_types: list[str] = []
     aliases_text: str = ""
@@ -2475,6 +2480,8 @@ async def update_graph_governance_config(req: GraphGovernanceUpdate):
         {
             "rule_template_id": req.rule_template_id,
             "rule_template_name": req.rule_template_name,
+            "extraction_mode": req.extraction_mode,
+            "allow_other_entity_type": req.allow_other_entity_type,
             "entity_types": [item.strip() for item in req.entity_types if item.strip()],
             "relation_types": [item.strip() for item in req.relation_types if item.strip()],
             "aliases_text": req.aliases_text,

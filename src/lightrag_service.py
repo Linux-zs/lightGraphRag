@@ -105,6 +105,8 @@ BUILTIN_GRAPH_RULE_TEMPLATES = [
     SUPPLY_CHAIN_GRAPH_RULE_TEMPLATE,
 ]
 
+GRAPH_EXTRACTION_MODES = {"assist", "enhanced", "strict"}
+
 
 @dataclass
 class LightRAGQueryResult:
@@ -390,10 +392,12 @@ class LightRAGService:
 
     def _default_graph_governance(self) -> dict[str, Any]:
         template = TDX_GRAPH_RULE_TEMPLATE if self.workspace == DEFAULT_WORKSPACE else GENERAL_GRAPH_RULE_TEMPLATE
-        return {
+        cfg = {
             "workspace": self.workspace,
             "rule_template_id": template["id"],
             "rule_template_name": template["name"],
+            "extraction_mode": "assist",
+            "allow_other_entity_type": True,
             "entity_types": list(template["entity_types"]),
             "relation_types": list(template["relation_types"]),
             "aliases_text": template["aliases_text"],
@@ -402,6 +406,8 @@ class LightRAGService:
             "updated_at": _now_iso(),
             "audit_log": [],
         }
+        cfg["effective_extraction_prompt"] = self.graph_extraction_guidance(config=cfg)
+        return cfg
 
     def load_graph_governance(self) -> dict[str, Any]:
         default = self._default_graph_governance()
@@ -419,10 +425,15 @@ class LightRAGService:
         merged["workspace"] = self.workspace
         merged["rule_template_id"] = str(merged.get("rule_template_id") or default["rule_template_id"])
         merged["rule_template_name"] = str(merged.get("rule_template_name") or default["rule_template_name"])
+        merged["extraction_mode"] = str(merged.get("extraction_mode") or default["extraction_mode"])
+        if merged["extraction_mode"] not in GRAPH_EXTRACTION_MODES:
+            merged["extraction_mode"] = default["extraction_mode"]
+        merged["allow_other_entity_type"] = bool(merged.get("allow_other_entity_type", True))
         merged["entity_types"] = list(merged.get("entity_types") or [])
         merged["relation_types"] = list(merged.get("relation_types") or [])
         merged["reference_files"] = list(merged.get("reference_files") or [])
         merged["audit_log"] = list(merged.get("audit_log") or [])
+        merged["effective_extraction_prompt"] = self.graph_extraction_guidance(config=merged)
         return merged
 
     def save_graph_governance(self, config: dict[str, Any]) -> dict[str, Any]:
@@ -434,6 +445,8 @@ class LightRAGService:
             "extraction_prompt",
             "rule_template_id",
             "rule_template_name",
+            "extraction_mode",
+            "allow_other_entity_type",
             "reference_files",
             "audit_log",
         }
@@ -443,11 +456,12 @@ class LightRAGService:
         current["workspace"] = self.workspace
         current["updated_at"] = _now_iso()
         self.graph_governance_path.parent.mkdir(parents=True, exist_ok=True)
+        to_save = {k: v for k, v in current.items() if k != "effective_extraction_prompt"}
         self.graph_governance_path.write_text(
-            json.dumps(current, ensure_ascii=False, indent=2),
+            json.dumps(to_save, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        return current
+        return self.load_graph_governance()
 
     def _load_custom_graph_rule_templates(self) -> list[dict[str, Any]]:
         if not self.graph_rule_templates_path.exists():
@@ -526,6 +540,8 @@ class LightRAGService:
             {
                 "rule_template_id": template["id"],
                 "rule_template_name": template["name"],
+                "extraction_mode": "assist",
+                "allow_other_entity_type": True,
                 "entity_types": list(template.get("entity_types") or []),
                 "relation_types": list(template.get("relation_types") or []),
                 "aliases_text": str(template.get("aliases_text") or ""),
@@ -541,9 +557,12 @@ class LightRAGService:
         return {
             "rule_template_id": cfg.get("rule_template_id", ""),
             "rule_template_name": cfg.get("rule_template_name", ""),
+            "extraction_mode": cfg.get("extraction_mode", "assist"),
+            "allow_other_entity_type": bool(cfg.get("allow_other_entity_type", True)),
             "entity_type_count": len(cfg.get("entity_types") or []),
             "relation_type_count": len(cfg.get("relation_types") or []),
             "extraction_prompt_preview": prompt[:180] + ("..." if len(prompt) > 180 else ""),
+            "effective_extraction_prompt_preview": str(cfg.get("effective_extraction_prompt") or "")[:240],
             "updated_at": cfg.get("updated_at", ""),
         }
 
@@ -581,8 +600,13 @@ class LightRAGService:
         self.save_graph_governance(cfg)
         return {"deleted": ref_id}
 
-    def graph_reference_bundle(self, *, max_chars: int = 12000) -> str:
-        cfg = self.load_graph_governance()
+    def graph_reference_bundle(
+        self,
+        *,
+        max_chars: int = 12000,
+        config: dict[str, Any] | None = None,
+    ) -> str:
+        cfg = config or self.load_graph_governance()
         parts = []
         if cfg.get("aliases_text"):
             parts.append("术语/别名表:\n" + str(cfg.get("aliases_text")))
@@ -597,23 +621,56 @@ class LightRAGService:
         bundle = "\n\n".join(parts)
         return bundle[:max_chars].rstrip()
 
-    def graph_extraction_guidance(self, *, max_reference_chars: int = 8000) -> str:
-        cfg = self.load_graph_governance()
+    def graph_extraction_guidance(
+        self,
+        *,
+        max_reference_chars: int = 8000,
+        config: dict[str, Any] | None = None,
+    ) -> str:
+        cfg = config or self.load_graph_governance()
         entity_types = [str(item).strip() for item in cfg.get("entity_types") or [] if str(item).strip()]
         relation_types = [str(item).strip() for item in cfg.get("relation_types") or [] if str(item).strip()]
-        refs = self.graph_reference_bundle(max_chars=max_reference_chars)
+        refs = self.graph_reference_bundle(max_chars=max_reference_chars, config=cfg)
+        mode = str(cfg.get("extraction_mode") or "assist")
+        allow_other = bool(cfg.get("allow_other_entity_type", True))
         blocks = [
-            "Classify each extracted entity using the following project-specific types when applicable. If no type fits, use `Other`.",
+            (
+                "Core graph extraction policy:\n"
+                "- First build a useful knowledge graph from the current input text itself.\n"
+                "- Extract stable, meaningful entities and real relationships that are explicit or strongly implied by the text.\n"
+                "- Project-specific rules below are guidance for classification, normalization and prioritization; they are not the source of truth.\n"
+                "- Do not skip an important entity or relationship only because it does not match the configured domain vocabulary, unless strict whitelist mode is enabled.\n"
+                "- Do not extract meaningless section numbers, page headers, isolated variables, boilerplate, or generic fragments as entities."
+            )
         ]
+        if mode == "strict":
+            blocks.append(
+                "Extraction mode: strict whitelist. Use configured entity and relation types as hard constraints. "
+                "If an entity cannot be classified into the configured entity types, skip it unless it is essential to connect two valid entities."
+            )
+        elif mode == "enhanced":
+            blocks.append(
+                "Extraction mode: domain enhanced. Prefer configured entity and relation types, but still extract important text-specific entities and relations. "
+                "Configured rules should improve precision, not suppress the graph."
+            )
+        else:
+            blocks.append(
+                "Extraction mode: assist. Treat configured entity and relation types only as hints. "
+                "General LightRAG extraction should remain active for any document domain."
+            )
+        if allow_other:
+            blocks.append("Entity type fallback: if no configured entity type fits, classify the entity as `Other` instead of dropping it.")
+        else:
+            blocks.append("Entity type fallback: do not use `Other`; choose the closest configured type, or skip only genuinely low-value entities.")
         if entity_types:
-            blocks.append("Entity types:\n" + "\n".join(f"- {item}" for item in entity_types))
+            blocks.append("Preferred entity types:\n" + "\n".join(f"- {item}" for item in entity_types))
         if relation_types:
             blocks.append(
-                "Prefer relationships that match these project-specific relation categories:\n"
+                "Preferred relationship categories:\n"
                 + "\n".join(f"- {item}" for item in relation_types)
             )
         if cfg.get("extraction_prompt"):
-            blocks.append("Project extraction rules:\n" + str(cfg.get("extraction_prompt")))
+            blocks.append("Additional project extraction guidance:\n" + str(cfg.get("extraction_prompt")))
         if refs:
             blocks.append(
                 "Project terminology and reference material. Use this only to normalize names, aliases, entity types, and relationship meaning. "

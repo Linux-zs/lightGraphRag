@@ -46,14 +46,27 @@ const emptyConfig: GraphGovernanceConfig = {
   workspace: '',
   rule_template_id: '',
   rule_template_name: '',
+  extraction_mode: 'assist',
+  allow_other_entity_type: true,
   entity_types: [],
   relation_types: [],
   aliases_text: '',
   extraction_prompt: '',
+  effective_extraction_prompt: '',
   reference_files: [],
   updated_at: '',
   audit_log: [],
 }
+
+const EXTRACTION_MODES: {
+  key: GraphGovernanceConfig['extraction_mode']
+  label: string
+  hint: string
+}[] = [
+  { key: 'assist', label: '辅助', hint: '通用抽取优先，规则只做归类和纠偏' },
+  { key: 'enhanced', label: '增强', hint: '优先使用领域规则，但不会压制重要实体' },
+  { key: 'strict', label: '严格', hint: '类型和关系接近白名单，只适合规范业务库' },
+]
 
 function splitLines(text: string) {
   return text.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
@@ -103,6 +116,9 @@ export default function GraphPage({ workspace }: Props) {
   const [relationTypesText, setRelationTypesText] = useState('')
   const [aliasesText, setAliasesText] = useState('')
   const [extractionPrompt, setExtractionPrompt] = useState('')
+  const [extractionMode, setExtractionMode] = useState<GraphGovernanceConfig['extraction_mode']>('assist')
+  const [allowOtherEntityType, setAllowOtherEntityType] = useState(true)
+  const [showEffectivePrompt, setShowEffectivePrompt] = useState(false)
 
   const [entityQuery, setEntityQuery] = useState('')
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null)
@@ -139,6 +155,8 @@ export default function GraphPage({ workspace }: Props) {
     setRelationTypesText(joinLines(cfg.relation_types || []))
     setAliasesText(cfg.aliases_text || '')
     setExtractionPrompt(cfg.extraction_prompt || '')
+    setExtractionMode(cfg.extraction_mode || 'assist')
+    setAllowOtherEntityType(cfg.allow_other_entity_type !== false)
   }
 
   const loadTemplates = async () => {
@@ -245,6 +263,8 @@ export default function GraphPage({ workspace }: Props) {
       workspace,
       rule_template_id: config.rule_template_id || selectedTemplateId,
       rule_template_name: config.rule_template_name || '当前知识库自定义规则',
+      extraction_mode: extractionMode,
+      allow_other_entity_type: allowOtherEntityType,
       entity_types: splitLines(entityTypesText),
       relation_types: splitLines(relationTypesText),
       aliases_text: aliasesText,
@@ -268,6 +288,8 @@ export default function GraphPage({ workspace }: Props) {
       setRelationTypesText(joinLines(cfg.relation_types || []))
       setAliasesText(cfg.aliases_text || '')
       setExtractionPrompt(cfg.extraction_prompt || '')
+      setExtractionMode(cfg.extraction_mode || 'assist')
+      setAllowOtherEntityType(cfg.allow_other_entity_type !== false)
     }, '已套用抽取规则模板；已索引文档需要重新索引才会按新规则重建图谱')
   }
 
@@ -526,7 +548,7 @@ export default function GraphPage({ workspace }: Props) {
               <h3 className="text-sm font-semibold text-gray-800">当前索引抽取规则</h3>
               <p className="mt-1 text-xs text-gray-500">
                 当前知识库使用：{config.rule_template_name || '未命名规则'}。
-                后续上传和重新索引会按这里的规则引导 LightRAG 抽取实体关系。
+                后续上传和重新索引会按这里的偏好引导 LightRAG 抽取实体关系。
               </p>
             </div>
             <div className="shrink-0 rounded-lg bg-gray-50 px-3 py-2 text-right text-xs text-gray-500">
@@ -575,6 +597,52 @@ export default function GraphPage({ workspace }: Props) {
         </div>
 
         <div className="border border-gray-200 rounded-lg bg-white p-4">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h3 className="text-sm font-semibold text-gray-800">抽取模式</h3>
+              <p className="mt-1 text-xs text-gray-500">
+                规则默认只是辅助。只有切到严格模式时，实体类型和关系类型才接近白名单。
+              </p>
+            </div>
+            <label className="shrink-0 flex items-center gap-2 text-xs text-gray-600">
+              <input
+                type="checkbox"
+                checked={allowOtherEntityType}
+                onChange={(e) => setAllowOtherEntityType(e.target.checked)}
+                className="h-4 w-4 rounded accent-gray-900"
+              />
+              允许 Other 类型
+            </label>
+          </div>
+
+          <div className="mt-4 grid grid-cols-1 lg:grid-cols-3 gap-2">
+            {EXTRACTION_MODES.map((mode) => (
+              <button
+                key={mode.key}
+                onClick={() => setExtractionMode(mode.key)}
+                className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                  extractionMode === mode.key
+                    ? 'border-gray-900 bg-gray-900 text-white'
+                    : 'border-gray-200 bg-white text-gray-700 hover:bg-gray-50'
+                }`}
+              >
+                <div className="text-sm font-medium">{mode.label}</div>
+                <div className={`mt-1 text-xs leading-relaxed ${
+                  extractionMode === mode.key ? 'text-gray-200' : 'text-gray-500'
+                }`}>
+                  {mode.hint}
+                </div>
+              </button>
+            ))}
+          </div>
+          {extractionMode === 'strict' && (
+            <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              严格模式可能导致非模板领域文档抽不出实体关系。普通知识库建议使用辅助或增强模式。
+            </div>
+          )}
+        </div>
+
+        <div className="border border-gray-200 rounded-lg bg-white p-4">
           <label className="block text-sm font-semibold text-gray-800 mb-2">抽取提示词</label>
           <textarea
             value={extractionPrompt}
@@ -584,21 +652,21 @@ export default function GraphPage({ workspace }: Props) {
         </div>
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div className="border border-gray-200 rounded-lg bg-white p-4">
-            <label className="block text-sm font-semibold text-gray-800 mb-2">实体类型白名单</label>
+            <label className="block text-sm font-semibold text-gray-800 mb-2">实体类型偏好</label>
             <textarea
               value={entityTypesText}
               onChange={(e) => setEntityTypesText(e.target.value)}
               className="w-full min-h-48 rounded-lg border border-gray-200 px-3 py-2 text-sm outline-none focus:border-gray-400"
-              placeholder="每行一个实体类型"
+              placeholder="每行一个实体类型；辅助模式下不是硬白名单"
             />
           </div>
           <div className="border border-gray-200 rounded-lg bg-white p-4">
-            <label className="block text-sm font-semibold text-gray-800 mb-2">关系类型白名单</label>
+            <label className="block text-sm font-semibold text-gray-800 mb-2">关系类型偏好</label>
             <textarea
               value={relationTypesText}
               onChange={(e) => setRelationTypesText(e.target.value)}
               className="w-full min-h-48 rounded-lg border border-gray-200 px-3 py-2 text-sm outline-none focus:border-gray-400"
-              placeholder="每行一个关系类型"
+              placeholder="每行一个关系类型；辅助模式下不是硬白名单"
             />
           </div>
         </div>
@@ -620,6 +688,28 @@ export default function GraphPage({ workspace }: Props) {
         </button>
       </div>
       <div className="space-y-4">
+        <div className="border border-gray-200 rounded-lg bg-white p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold text-gray-800">最终送入 LightRAG 的抽取提示</h3>
+              <p className="mt-1 text-xs text-gray-500">
+                这是基础通用规则、抽取模式、类型偏好、提示词和参考资料拼接后的结果。
+              </p>
+            </div>
+            <button
+              onClick={() => setShowEffectivePrompt((v) => !v)}
+              className="shrink-0 rounded-lg border border-gray-300 px-2.5 py-1.5 text-xs text-gray-700 hover:bg-gray-50"
+            >
+              {showEffectivePrompt ? '收起' : '查看'}
+            </button>
+          </div>
+          {showEffectivePrompt && (
+            <pre className="mt-3 max-h-80 overflow-auto whitespace-pre-wrap rounded-lg bg-gray-50 p-3 text-xs leading-relaxed text-gray-700">
+              {config.effective_extraction_prompt || '暂无有效抽取提示'}
+            </pre>
+          )}
+        </div>
+
         <div className="border border-gray-200 rounded-lg bg-white p-4">
           <h3 className="text-sm font-semibold text-gray-800">规则模板库</h3>
           <div className="mt-3 max-h-72 overflow-y-auto divide-y divide-gray-100">

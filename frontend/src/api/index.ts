@@ -545,10 +545,13 @@ export interface GraphGovernanceConfig {
   workspace: string
   rule_template_id: string
   rule_template_name: string
+  extraction_mode: 'assist' | 'enhanced' | 'strict'
+  allow_other_entity_type: boolean
   entity_types: string[]
   relation_types: string[]
   aliases_text: string
   extraction_prompt: string
+  effective_extraction_prompt: string
   reference_files: GraphReferenceFile[]
   updated_at: string
   audit_log: GraphAuditEntry[]
@@ -557,9 +560,12 @@ export interface GraphGovernanceConfig {
 export interface GraphRuleSummary {
   rule_template_id: string
   rule_template_name: string
+  extraction_mode: string
+  allow_other_entity_type: boolean
   entity_type_count: number
   relation_type_count: number
   extraction_prompt_preview: string
+  effective_extraction_prompt_preview?: string
   updated_at: string
 }
 
@@ -641,6 +647,8 @@ export function updateGraphGovernanceConfig(config: {
   workspace?: string
   rule_template_id?: string
   rule_template_name?: string
+  extraction_mode?: 'assist' | 'enhanced' | 'strict'
+  allow_other_entity_type?: boolean
   entity_types: string[]
   relation_types: string[]
   aliases_text: string
