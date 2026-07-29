@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import FileUpload from '../components/FileUpload'
 import ChunkPreview from '../components/ChunkPreview'
 import {
@@ -10,6 +10,7 @@ import {
   batchDeleteDocuments,
   batchIndexDocuments,
   getIndexTask,
+  listIndexTasks,
   cancelIndexTask,
   getDocumentRawText,
   updateDocumentRawText,
@@ -76,6 +77,9 @@ export default function KBManagement({ workspace }: Props) {
   const [chunkList, setChunkList] = useState<DocumentChunkItem[]>([])
   const [chunkLoading, setChunkLoading] = useState(false)
   const [graphRule, setGraphRule] = useState<GraphGovernanceConfig | null>(null)
+  const mountedRef = useRef(true)
+  const pollingTaskIdsRef = useRef<Set<string>>(new Set())
+  const taskRunIdRef = useRef(0)
 
   const isTaskTerminal = (task: IndexTask) =>
     ['succeeded', 'failed', 'partial', 'cancelled'].includes(task.status)
@@ -83,17 +87,32 @@ export default function KBManagement({ workspace }: Props) {
   const pollIndexTask = async (
     taskId: string,
     onUpdate: (task: IndexTask) => void,
+    onDone?: (task: IndexTask) => void,
+    runId = taskRunIdRef.current,
   ) => {
-    let finalTask = await getIndexTask(taskId)
-    onUpdate(finalTask)
-    while (!isTaskTerminal(finalTask)) {
-      await new Promise((resolve) => setTimeout(resolve, 1500))
-      finalTask = await getIndexTask(taskId)
-      onUpdate(finalTask)
-      loadDocs()
+    if (pollingTaskIdsRef.current.has(taskId)) {
+      return getIndexTask(taskId)
     }
-    loadDocs()
-    return finalTask
+    pollingTaskIdsRef.current.add(taskId)
+    let finalTask = await getIndexTask(taskId)
+    try {
+      if (!mountedRef.current || taskRunIdRef.current !== runId) return finalTask
+      onUpdate(finalTask)
+      while (!isTaskTerminal(finalTask)) {
+        await new Promise((resolve) => setTimeout(resolve, 1500))
+        finalTask = await getIndexTask(taskId)
+        if (!mountedRef.current || taskRunIdRef.current !== runId) return finalTask
+        onUpdate(finalTask)
+        loadDocs()
+      }
+      if (mountedRef.current && taskRunIdRef.current === runId) {
+        onDone?.(finalTask)
+        loadDocs()
+      }
+      return finalTask
+    } finally {
+      pollingTaskIdsRef.current.delete(taskId)
+    }
   }
 
   const formatTaskMessage = (task: IndexTask) => {
@@ -105,6 +124,68 @@ export default function KBManagement({ workspace }: Props) {
     }
     if (task.status === 'cancelled') return '索引任务已取消'
     return task.message || '索引处理中'
+  }
+
+  const formatBatchTaskMessage = (task: IndexTask) => {
+    const ok = task.results.filter((r) => r.status === 'ok').length
+    const fail = task.errors.length
+    return `${formatTaskMessage(task)}: ${ok} 成功${fail > 0 ? `, ${fail} 失败` : ''}`
+  }
+
+  const isRecentTask = (task: IndexTask) => {
+    const updatedAt = new Date(task.updated_at).getTime()
+    if (!Number.isFinite(updatedAt)) return false
+    return Date.now() - updatedAt <= 60 * 60 * 1000
+  }
+
+  const restoreIndexTasks = async (runId = taskRunIdRef.current) => {
+    try {
+      const tasks = await listIndexTasks()
+      if (!mountedRef.current || taskRunIdRef.current !== runId) return
+      const candidates = tasks.filter(
+        (task) => task.workspace === workspace && (task.kind === 'single' || task.kind === 'batch'),
+      )
+      const pickTask = (kind: 'single' | 'batch') =>
+        candidates.find((task) => task.kind === kind && !isTaskTerminal(task)) ||
+        candidates.find((task) => task.kind === kind && isRecentTask(task))
+
+      const singleTask = pickTask('single')
+      if (singleTask) {
+        setIndexTask(singleTask)
+        setIndexing(!isTaskTerminal(singleTask))
+        setIndexMsg(
+          isTaskTerminal(singleTask)
+            ? formatTaskMessage(singleTask)
+            : `已恢复索引任务: ${singleTask.task_id}`,
+        )
+        if (!isTaskTerminal(singleTask)) {
+          void pollIndexTask(singleTask.task_id, setIndexTask, (finalTask) => {
+            setIndexing(false)
+            setIndexMsg(formatTaskMessage(finalTask))
+          }, runId)
+        }
+      }
+
+      const batchTask = pickTask('batch')
+      if (batchTask) {
+        setBatchIndexTask(batchTask)
+        setBatchIndexing(!isTaskTerminal(batchTask))
+        setBatchMsg(
+          isTaskTerminal(batchTask)
+            ? formatBatchTaskMessage(batchTask)
+            : `已恢复批量索引任务: ${batchTask.task_id}`,
+        )
+        if (!isTaskTerminal(batchTask)) {
+          void pollIndexTask(batchTask.task_id, setBatchIndexTask, (finalTask) => {
+            setBatchIndexing(false)
+            setBatchMsg(formatBatchTaskMessage(finalTask))
+            if (finalTask.status !== 'failed') setCheckedDocs(new Set())
+          }, runId)
+        }
+      }
+    } catch {
+      // Task restore is best-effort; document list and manual refresh still work.
+    }
   }
 
   const formatDuration = (iso?: string) => {
@@ -457,8 +538,24 @@ export default function KBManagement({ workspace }: Props) {
   }
 
   useEffect(() => {
+    mountedRef.current = true
+    const runId = taskRunIdRef.current + 1
+    taskRunIdRef.current = runId
+    pollingTaskIdsRef.current.clear()
+    setIndexTask(null)
+    setBatchIndexTask(null)
+    setIndexing(false)
+    setBatchIndexing(false)
+    setIndexMsg('')
+    setBatchMsg('')
     loadDocs()
     loadGraphRule()
+    restoreIndexTasks(runId)
+    return () => {
+      mountedRef.current = false
+      taskRunIdRef.current += 1
+      pollingTaskIdsRef.current.clear()
+    }
   }, [workspace])
 
   return (
