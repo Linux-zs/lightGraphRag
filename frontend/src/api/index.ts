@@ -89,6 +89,8 @@ export interface ModelConfig {
   chat_temperature: number
   chat_top_p: number
   chat_max_tokens: number
+  frequency_penalty: number
+  presence_penalty: number
   answer_system_prompt: string
 }
 
@@ -135,7 +137,17 @@ export function deleteWorkspace(workspace: string) {
 
 // --- KB ---
 
-export function uploadDocument(file: File, workspace = 'tdx_default') {
+export interface UploadedDocument {
+  file_name: string
+  workspace: string
+  doc_id: string
+  file_type: string
+  char_count: number
+  preview: string
+  index_invalidated: boolean
+}
+
+export function uploadDocument(file: File, workspace = 'tdx_default'): Promise<UploadedDocument> {
   const form = new FormData()
   form.append('file', file)
   return fetch(`${BASE}/kb/upload?workspace=${encodeURIComponent(workspace)}`, {
@@ -146,7 +158,7 @@ export function uploadDocument(file: File, workspace = 'tdx_default') {
       const err = await r.json().catch(() => ({ detail: r.statusText }))
       throw new Error(formatApiError(err, `HTTP ${r.status}`))
     }
-    return r.json()
+    return r.json() as Promise<UploadedDocument>
   })
 }
 
@@ -456,7 +468,11 @@ export function getModelBindings() {
 }
 
 export function updateModelBindings(bindings: ModelBindings) {
-  return request<{ bindings: ModelBindings; embedding_changed: boolean }>('/model-bindings', {
+  return request<{
+    bindings: ModelBindings
+    embedding_changed: boolean
+    affected_workspaces: string[]
+  }>('/model-bindings', {
     method: 'PUT',
     body: JSON.stringify({ bindings }),
   })

@@ -22,14 +22,10 @@ import {
   GraphDeleteResiduals,
   GraphGovernanceConfig,
   IndexTask,
+  UploadedDocument,
 } from '../api'
 
-interface UploadedFile {
-  file_name: string
-  file_type: string
-  char_count: number
-  preview: string
-}
+type UploadedFile = UploadedDocument
 
 interface Props {
   workspace: string
@@ -242,6 +238,9 @@ export default function KBManagement({ workspace }: Props) {
     try {
       const data = await uploadDocument(file, workspace)
       setUploaded(data)
+      if (data.index_invalidated) {
+        setIndexMsg('同名文档内容已更新，旧索引已移除，请重新预览并确认索引。')
+      }
     } finally {
       setUploading(false)
     }
@@ -253,6 +252,7 @@ export default function KBManagement({ workspace }: Props) {
     setBatchMsg('')
     let lastData: UploadedFile | null = null
     const failures: string[] = []
+    let invalidatedCount = 0
     const total = files.length
     for (let i = 0; i < total; i++) {
       const file = files[i]
@@ -264,6 +264,7 @@ export default function KBManagement({ workspace }: Props) {
       try {
         const data = await uploadDocument(file, workspace)
         lastData = data
+        if (data.index_invalidated) invalidatedCount += 1
         setBatchMsg(`已上传 ${i + 1}/${total}: ${data.file_name}`)
       } catch (e: unknown) {
         const message = e instanceof Error ? e.message : String(e)
@@ -275,7 +276,10 @@ export default function KBManagement({ workspace }: Props) {
     if (failures.length > 0) {
       setBatchMsg(`批量上传完成：成功 ${total - failures.length}/${total}，失败 ${failures.length}。${failures.join('；')}`)
     } else {
-      setBatchMsg(`批量上传完成：成功 ${total}/${total}`)
+      setBatchMsg(
+        `批量上传完成：成功 ${total}/${total}` +
+        (invalidatedCount > 0 ? `，其中 ${invalidatedCount} 个同名文档的旧索引已移除，需重新索引` : ''),
+      )
     }
     setUploading(false)
     loadDocs()

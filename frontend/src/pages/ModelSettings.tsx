@@ -38,6 +38,8 @@ const DEFAULT_CONFIG: ModelConfig = {
   chat_temperature: 0.7,
   chat_top_p: 0.9,
   chat_max_tokens: 4096,
+  frequency_penalty: 0.3,
+  presence_penalty: 0.2,
   answer_system_prompt: DEFAULT_ANSWER_SYSTEM_PROMPT,
 }
 
@@ -239,7 +241,15 @@ export default function ModelSettings({ workspace }: Props) {
     try {
       const result = await updateModelBindings(bindings)
       setBindings(result.bindings)
-      setMessage(result.embedding_changed ? '绑定已保存；嵌入模型/维度已变化，请重建知识库索引。' : '模型绑定已保存')
+      setMessage(
+        result.embedding_changed
+          ? (
+              result.affected_workspaces.length > 0
+                ? `绑定已保存；以下知识库必须重建后才能继续检索：${result.affected_workspaces.join('、')}`
+                : '绑定已保存；嵌入模型配置已变化，当前没有需要重建的知识库。'
+            )
+          : '模型绑定已保存',
+      )
     } catch (e) {
       setMessage(`保存绑定失败: ${(e as Error).message}`)
     } finally {
@@ -531,7 +541,7 @@ export default function ModelSettings({ workspace }: Props) {
 
       <section className="bg-white border border-gray-200 rounded-lg p-5">
         <h3 className="text-sm font-semibold text-gray-800">生成参数</h3>
-        <div className="mt-4 grid grid-cols-3 gap-4">
+        <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-5">
           <label className="text-sm text-gray-600">
             Temperature: {config.chat_temperature}
             <input type="range" min={0} max={2} step={0.05} value={config.chat_temperature}
@@ -548,6 +558,18 @@ export default function ModelSettings({ workspace }: Props) {
             Max Tokens: {config.chat_max_tokens}
             <input type="range" min={256} max={8192} step={256} value={config.chat_max_tokens}
               onChange={(e) => setConfig({ ...config, chat_max_tokens: parseInt(e.target.value) })}
+              className="mt-2 w-full accent-primary-500" />
+          </label>
+          <label className="text-sm text-gray-600">
+            Frequency Penalty: {config.frequency_penalty}
+            <input type="range" min={-2} max={2} step={0.1} value={config.frequency_penalty}
+              onChange={(e) => setConfig({ ...config, frequency_penalty: parseFloat(e.target.value) })}
+              className="mt-2 w-full accent-primary-500" />
+          </label>
+          <label className="text-sm text-gray-600">
+            Presence Penalty: {config.presence_penalty}
+            <input type="range" min={-2} max={2} step={0.1} value={config.presence_penalty}
+              onChange={(e) => setConfig({ ...config, presence_penalty: parseFloat(e.target.value) })}
               className="mt-2 w-full accent-primary-500" />
           </label>
         </div>

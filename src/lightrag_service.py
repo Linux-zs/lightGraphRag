@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,27 @@ DEFAULT_WORKSPACE = "tdx_default"
 DEFAULT_MODE = "mix"
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 WORKSPACE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}-",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            Path(temp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 GRAPH_CATEGORY_MAP = {
     "organization": "服务层",
@@ -214,6 +236,88 @@ class LightRAGService:
     def graph_rule_templates_path(self) -> Path:
         return self.data_dir / "graph_rule_templates.json"
 
+    @property
+    def embedding_meta_path(self) -> Path:
+        return self.data_dir / "lightrag_embedding_meta" / f"{self.workspace}.json"
+
+    def current_embedding_signature(
+        self,
+        embedding_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        embedding = embedding_config or self._runtime_models()["embedding"]
+        return {
+            "base_url": str(embedding.get("base_url") or "").rstrip("/"),
+            "model": str(embedding.get("model") or ""),
+            "embed_dim": int(embedding.get("embed_dim") or 0),
+        }
+
+    def record_embedding_signature(
+        self,
+        embedding_config: dict[str, Any] | None = None,
+        *,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        if self.embedding_meta_path.exists() and not overwrite:
+            try:
+                return json.loads(self.embedding_meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                logger.warning("Replacing unreadable embedding metadata: {}", self.embedding_meta_path)
+        payload = {
+            **self.current_embedding_signature(embedding_config),
+            "workspace": self.workspace,
+            "updated_at": _now_iso(),
+        }
+        _atomic_write_json(self.embedding_meta_path, payload)
+        return payload
+
+    def embedding_compatibility(
+        self,
+        embedding_config: dict[str, Any] | None = None,
+        *,
+        initialize_legacy: bool = True,
+    ) -> dict[str, Any]:
+        current = self.current_embedding_signature(embedding_config)
+        manifest = self._load_manifest()
+        indexed = any(bool(item.get("indexed")) for item in manifest.get("documents", {}).values())
+        stored = None
+        if self.embedding_meta_path.exists():
+            try:
+                stored = json.loads(self.embedding_meta_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                return {
+                    "compatible": False,
+                    "reason": f"Embedding metadata is unreadable: {exc}",
+                    "current": current,
+                    "stored": None,
+                }
+        elif indexed and initialize_legacy:
+            stored = self.record_embedding_signature(current)
+
+        compatible = not indexed or stored is None or all(
+            stored.get(key) == current.get(key)
+            for key in ("base_url", "model", "embed_dim")
+        )
+        return {
+            "compatible": compatible,
+            "reason": "" if compatible else "Embedding model configuration differs from the existing index",
+            "current": current,
+            "stored": stored,
+            "indexed_documents": sum(
+                1 for item in manifest.get("documents", {}).values() if item.get("indexed")
+            ),
+        }
+
+    def assert_embedding_compatible(self) -> None:
+        compatibility = self.embedding_compatibility()
+        if not compatibility["compatible"]:
+            stored = compatibility.get("stored") or {}
+            current = compatibility.get("current") or {}
+            raise RuntimeError(
+                "当前嵌入模型与该知识库已有索引不兼容，请先重建索引。"
+                f" 已有: {stored.get('model')} / {stored.get('embed_dim')}，"
+                f"当前: {current.get('model')} / {current.get('embed_dim')}"
+            )
+
     async def get_rag(self) -> LightRAG:
         if self._rag is not None:
             return self._rag
@@ -387,11 +491,7 @@ class LightRAGService:
         return {"documents": {}}
 
     def _save_manifest(self, manifest: dict[str, Any]) -> None:
-        self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        self.manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        _atomic_write_json(self.manifest_path, manifest)
 
     def _manifest_doc_id(self, doc: Document, manifest: dict[str, Any]) -> str:
         explicit = str(doc.metadata.get("lightrag_doc_id") or "").strip()
@@ -468,12 +568,8 @@ class LightRAGService:
                 current[key] = config[key]
         current["workspace"] = self.workspace
         current["updated_at"] = _now_iso()
-        self.graph_governance_path.parent.mkdir(parents=True, exist_ok=True)
         to_save = {k: v for k, v in current.items() if k != "effective_extraction_prompt"}
-        self.graph_governance_path.write_text(
-            json.dumps(to_save, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        _atomic_write_json(self.graph_governance_path, to_save)
         return self.load_graph_governance()
 
     def _load_custom_graph_rule_templates(self) -> list[dict[str, Any]]:
@@ -489,11 +585,7 @@ class LightRAGService:
         return []
 
     def _save_custom_graph_rule_templates(self, templates: list[dict[str, Any]]) -> None:
-        self.graph_rule_templates_path.parent.mkdir(parents=True, exist_ok=True)
-        self.graph_rule_templates_path.write_text(
-            json.dumps({"templates": templates}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        _atomic_write_json(self.graph_rule_templates_path, {"templates": templates})
 
     def list_graph_rule_templates(self) -> list[dict[str, Any]]:
         custom = self._load_custom_graph_rule_templates()
@@ -889,6 +981,7 @@ class LightRAGService:
         chunk_overlap: int | None = None,
         separators: list[str] | None = None,
     ) -> dict[str, Any]:
+        self.assert_embedding_compatible()
         rag = await self.get_rag()
         if chunk_size is not None:
             rag.chunk_token_size = chunk_size
@@ -967,6 +1060,7 @@ class LightRAGService:
             )
             manifest["documents"][doc_id] = item
             self._save_manifest(manifest)
+            self.record_embedding_signature(overwrite=True)
             return item
         except Exception:
             item.update({"indexed": False, "status": "failed", "updated_at": _now_iso()})
@@ -1407,6 +1501,7 @@ class LightRAGService:
         enable_rerank: bool = True,
         history: list[dict[str, str]] | None = None,
     ) -> LightRAGQueryResult:
+        self.assert_embedding_compatible()
         rag = await self.get_rag()
         result = await rag.aquery_llm(
             query,
@@ -1435,6 +1530,7 @@ class LightRAGService:
         enable_rerank: bool = True,
         history: list[dict[str, str]] | None = None,
     ) -> LightRAGStreamResult:
+        self.assert_embedding_compatible()
         rag = await self.get_rag()
         result = await rag.aquery_llm(
             query,
@@ -1471,6 +1567,7 @@ class LightRAGService:
         chunk_top_k: int = 20,
         enable_rerank: bool = True,
     ) -> dict[str, Any]:
+        self.assert_embedding_compatible()
         rag = await self.get_rag()
         result = await rag.aquery_llm(
             query,
@@ -1602,6 +1699,8 @@ class LightRAGService:
             self.manifest_path.unlink()
             removed_manifest = True
         self._save_manifest(preserved_manifest)
+        if self.embedding_meta_path.exists():
+            self.embedding_meta_path.unlink()
 
         return {
             "workspace": self.workspace,

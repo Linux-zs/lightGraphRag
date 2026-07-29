@@ -12,6 +12,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import tempfile
 from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
@@ -200,7 +201,23 @@ def _load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
 
 def _save_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}-",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            Path(temp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _default_store(config: dict[str, Any] | None = None) -> dict[str, Any]:

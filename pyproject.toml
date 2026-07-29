@@ -1,7 +1,7 @@
 [project]
-name = "tdx-knowledge-base"
+name = "lightgraphrag-workbench"
 version = "0.1.0"
-description = "LightRAG knowledge base for TDX financial trading system"
+description = "FastAPI and React knowledge-base workbench powered by LightRAG"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = [
@@ -34,6 +34,7 @@ dev = [
 
 [project.scripts]
 tdx-kb = "src.app.cli:main"
+lightgraphrag = "src.app.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]

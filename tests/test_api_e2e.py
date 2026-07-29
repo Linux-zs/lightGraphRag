@@ -1,4 +1,4 @@
-"""End-to-end API test script for TDX KB Workbench."""
+"""Standalone end-to-end API smoke test for the knowledge-base workbench."""
 import json
 import sys
 import urllib.request
@@ -53,7 +53,7 @@ if "pytest" in sys.modules:
 
 # ============================================================
 print("=" * 60)
-print("TDX KB Workbench 全接口测试")
+print("LightGraphRAG Workbench 全接口测试")
 print("=" * 60)
 
 # 1. Health

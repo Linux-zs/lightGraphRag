@@ -199,7 +199,7 @@ export default function Layout({
             <BrandMark />
             <div className="min-w-0">
               <h1 className="truncate text-sm font-semibold text-gray-900 tracking-tight">
-                TDX KB Workbench
+                LightGraphRAG
               </h1>
               <p className="truncate text-[11px] text-gray-500">LightRAG 知识库工作台</p>
             </div>

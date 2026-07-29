@@ -1,10 +1,10 @@
-"""Custom exceptions for TDX Knowledge Base."""
+"""Custom exceptions for the knowledge-base workbench."""
 
 from __future__ import annotations
 
 
 class TDXKnowledgeBaseError(Exception):
-    """Base exception for all TDX Knowledge Base errors."""
+    """Base exception for all workbench errors."""
 
 
 class ConfigError(TDXKnowledgeBaseError):
