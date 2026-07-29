@@ -223,6 +223,9 @@ export interface IndexTask {
   current: number
   progress: number
   message: string
+  current_doc?: string
+  current_doc_started_at?: string
+  timeout_seconds?: number
   results: IndexTaskResult[]
   errors: IndexTaskResult[]
   created_at: string

@@ -1077,6 +1077,7 @@ _chunk_cache: dict[str, list[dict]] = {}
 _index_tasks: dict[str, dict[str, Any]] = {}
 _index_task_lock = asyncio.Lock()
 _index_write_lock = asyncio.Lock()
+INDEX_DOC_TIMEOUT_SECONDS = int(os.environ.get("TDX_INDEX_DOC_TIMEOUT_SECONDS", "180"))
 
 
 class WorkspaceCreateRequest(BaseModel):
@@ -1143,6 +1144,9 @@ async def _create_index_task(kind: str, doc_names: list[str], workspace: str) ->
         "current": 0,
         "progress": 0,
         "message": "等待索引",
+        "current_doc": "",
+        "current_doc_started_at": "",
+        "timeout_seconds": INDEX_DOC_TIMEOUT_SECONDS,
         "results": [],
         "errors": [],
         "cancel_requested": False,
@@ -1189,77 +1193,124 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
-    await _update_index_task(task_id, message="等待索引写入锁")
-    async with _index_write_lock:
-        await _update_index_task(task_id, status="running", message="开始索引")
-        for idx, doc_name in enumerate(doc_names):
-            current_task = _index_tasks.get(task_id, {})
-            if current_task.get("cancel_requested"):
-                await _update_index_task(task_id, status="cancelled", message="任务已取消")
-                return
+    try:
+        await _update_index_task(task_id, message="等待索引写入锁")
+        async with _index_write_lock:
+            await _update_index_task(task_id, status="running", message="开始索引")
+            for idx, doc_name in enumerate(doc_names):
+                current_task = _index_tasks.get(task_id, {})
+                if current_task.get("cancel_requested"):
+                    await _update_index_task(
+                        task_id,
+                        status="cancelled",
+                        current_doc="",
+                        current_doc_started_at="",
+                        message="任务已取消",
+                    )
+                    return
 
-            try:
-                await _update_index_task(
-                    task_id,
-                    current=idx,
-                    message=f"正在解析: {doc_name}",
-                )
-                doc = _load_doc_for_index(doc_name)
-                service.mark_document_status(doc, status="processing", indexed=False)
-
-                if not doc.raw_text.strip():
-                    raise ValueError("Document text is empty")
-
-                await _update_index_task(
-                    task_id,
-                    current=idx,
-                    message=f"正在写入 LightRAG: {doc_name}",
-                )
-                item = await service.index_document(
-                    doc,
-                    chunk_size=req.chunk_size,
-                    chunk_overlap=req.chunk_overlap,
-                    separators=req.separators,
-                )
-                result = {
-                    "doc_name": doc_name,
-                    "doc_id": item["doc_id"],
-                    "status": "ok",
-                    "chunks": item.get("chunk_count", 0),
-                }
-                results.append(result)
-                logger.info("Indexed '{}' into LightRAG as {}", doc_name, item["doc_id"])
-            except Exception as e:
-                error_msg = str(e)
-                logger.exception("LightRAG index task failed for {}", doc_name)
+                doc: Document | None = None
                 try:
-                    doc = _uploaded_files.get(doc_name)
+                    await _update_index_task(
+                        task_id,
+                        current=idx,
+                        current_doc=doc_name,
+                        current_doc_started_at=_task_now(),
+                        message=f"正在解析: {doc_name}",
+                    )
+                    doc = _load_doc_for_index(doc_name)
+                    service.mark_document_status(doc, status="processing", indexed=False)
+
+                    if not doc.raw_text.strip():
+                        raise ValueError("Document text is empty")
+
+                    await _update_index_task(
+                        task_id,
+                        current=idx,
+                        message=f"正在写入 LightRAG: {doc_name}，单文档超时 {INDEX_DOC_TIMEOUT_SECONDS}s",
+                    )
+                    item = await asyncio.wait_for(
+                        service.index_document(
+                            doc,
+                            chunk_size=req.chunk_size,
+                            chunk_overlap=req.chunk_overlap,
+                            separators=req.separators,
+                        ),
+                        timeout=INDEX_DOC_TIMEOUT_SECONDS,
+                    )
+                    result = {
+                        "doc_name": doc_name,
+                        "doc_id": item["doc_id"],
+                        "status": "ok",
+                        "chunks": item.get("chunk_count", 0),
+                    }
+                    results.append(result)
+                    logger.info("Indexed '{}' into LightRAG as {}", doc_name, item["doc_id"])
+                except asyncio.TimeoutError:
+                    error_msg = f"索引超时：单个文档超过 {INDEX_DOC_TIMEOUT_SECONDS} 秒未完成"
+                    logger.exception("LightRAG index task timed out for {}", doc_name)
                     if doc is not None:
-                        service.mark_document_status(doc, status="failed", indexed=False, error_msg=error_msg)
-                except Exception:
-                    logger.exception("Failed to mark failed index status for {}", doc_name)
-                error = {"doc_name": doc_name, "status": "error", "error": error_msg}
-                errors.append(error)
-                results.append(error)
+                        try:
+                            service.mark_document_status(doc, status="failed", indexed=False, error_msg=error_msg)
+                        except Exception:
+                            logger.exception("Failed to mark timeout index status for {}", doc_name)
+                    error = {"doc_name": doc_name, "status": "error", "error": error_msg}
+                    errors.append(error)
+                    results.append(error)
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.exception("LightRAG index task failed for {}", doc_name)
+                    try:
+                        if doc is None:
+                            doc = _uploaded_files.get(doc_name)
+                        if doc is not None:
+                            service.mark_document_status(doc, status="failed", indexed=False, error_msg=error_msg)
+                    except Exception:
+                        logger.exception("Failed to mark failed index status for {}", doc_name)
+                    error = {"doc_name": doc_name, "status": "error", "error": error_msg}
+                    errors.append(error)
+                    results.append(error)
 
-            await _update_index_task(
-                task_id,
-                current=idx + 1,
-                results=results,
-                errors=errors,
-                message=f"已完成 {idx + 1}/{len(doc_names)}",
-            )
+                await _update_index_task(
+                    task_id,
+                    current=idx + 1,
+                    current_doc="",
+                    current_doc_started_at="",
+                    results=results,
+                    errors=errors,
+                    message=f"已完成 {idx + 1}/{len(doc_names)}",
+                )
 
-    if errors and len(errors) == len(doc_names):
-        status = "failed"
-        message = f"索引失败: {len(errors)} 个文档失败"
-    elif errors:
-        status = "partial"
-        message = f"索引部分完成: {len(results) - len(errors)} 成功, {len(errors)} 失败"
-    else:
-        status = "succeeded"
-        message = f"索引完成: {len(results)} 个文档"
-    await _update_index_task(task_id, status=status, current=len(doc_names), results=results, errors=errors, message=message)
+        if errors and len(errors) == len(doc_names):
+            status = "failed"
+            message = f"索引失败: {len(errors)} 个文档失败"
+        elif errors:
+            status = "partial"
+            message = f"索引部分完成: {len(results) - len(errors)} 成功, {len(errors)} 失败"
+        else:
+            status = "succeeded"
+            message = f"索引完成: {len(results)} 个文档"
+        await _update_index_task(
+            task_id,
+            status=status,
+            current=len(doc_names),
+            current_doc="",
+            current_doc_started_at="",
+            results=results,
+            errors=errors,
+            message=message,
+        )
+    except Exception as exc:
+        logger.exception("Index task crashed: {}", task_id)
+        await _update_index_task(
+            task_id,
+            status="failed",
+            current_doc="",
+            current_doc_started_at="",
+            results=results,
+            errors=errors or [{"doc_name": "", "status": "error", "error": str(exc)}],
+            message=f"索引任务异常退出: {exc}",
+        )
 
 
 # --- KB Management Endpoints ---
@@ -1540,7 +1591,7 @@ async def cancel_index_task(task_id: str):
         if task.get("status") in {"succeeded", "failed", "partial", "cancelled"}:
             return _public_index_task(task)
         task["cancel_requested"] = True
-        task["message"] = "正在取消；当前文档写入完成后停止"
+        task["message"] = f"正在取消；当前文档完成或 {INDEX_DOC_TIMEOUT_SECONDS}s 超时后停止"
         task["updated_at"] = _task_now()
         return _public_index_task(task)
 

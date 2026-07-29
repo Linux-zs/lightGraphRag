@@ -107,6 +107,26 @@ export default function KBManagement({ workspace }: Props) {
     return task.message || '索引处理中'
   }
 
+  const formatDuration = (iso?: string) => {
+    if (!iso) return ''
+    const start = new Date(iso).getTime()
+    if (!Number.isFinite(start)) return ''
+    const seconds = Math.max(0, Math.floor((Date.now() - start) / 1000))
+    if (seconds < 60) return `${seconds}s`
+    const mins = Math.floor(seconds / 60)
+    const rest = seconds % 60
+    return `${mins}m ${rest}s`
+  }
+
+  const formatClock = (iso?: string) => {
+    if (!iso) return ''
+    try {
+      return new Date(iso).toLocaleTimeString('zh-CN', { hour12: false })
+    } catch {
+      return ''
+    }
+  }
+
   const handleUpload = async (file: File) => {
     setUploading(true)
     setChunks([])
@@ -327,6 +347,8 @@ export default function KBManagement({ workspace }: Props) {
     const failed = task.status === 'failed' || task.status === 'partial'
     const ok = task.results.filter((r) => r.status === 'ok').length
     const fail = task.errors.length
+    const currentElapsed = formatDuration(task.current_doc_started_at)
+    const updatedClock = formatClock(task.updated_at)
 
     return (
       <div className={`mt-3 rounded-lg border p-3 text-sm ${
@@ -346,6 +368,14 @@ export default function KBManagement({ workspace }: Props) {
               {task.message}，进度 {task.current}/{task.total}
               {(ok > 0 || fail > 0) && `，成功 ${ok}，失败 ${fail}`}
             </div>
+            {!terminal && (
+              <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-gray-400">
+                {task.current_doc && <span>当前文档：{task.current_doc}</span>}
+                {currentElapsed && <span>本步耗时：{currentElapsed}</span>}
+                {task.timeout_seconds && <span>单文档超时：{task.timeout_seconds}s</span>}
+                {updatedClock && <span>最后更新：{updatedClock}</span>}
+              </div>
+            )}
           </div>
           {!terminal && (
             <button
