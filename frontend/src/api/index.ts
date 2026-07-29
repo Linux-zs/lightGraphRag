@@ -339,6 +339,108 @@ export function testEmbed(text: string) {
   })
 }
 
+export interface ModelProfile {
+  id: string
+  name: string
+  api_base: string
+  api_type: string
+  models_cache: DiscoveredModel[]
+  has_api_key: boolean
+  api_key_preview: string
+  last_used_at?: string
+  last_tested_at?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface DiscoveredModel {
+  id: string
+  type: string
+}
+
+export interface ModelBinding {
+  profile_id: string
+  model: string
+  embed_dim?: number
+  embed_max_chars?: number
+  enabled?: boolean
+}
+
+export interface ModelBindings {
+  chat: ModelBinding
+  embedding: ModelBinding
+  rerank: ModelBinding
+}
+
+export function listModelProfiles() {
+  return request<ModelProfile[]>('/model-profiles')
+}
+
+export function saveModelProfile(profile: {
+  id?: string
+  name: string
+  api_base: string
+  api_key?: string
+  api_type?: string
+}) {
+  const path = profile.id ? `/model-profiles/${encodeURIComponent(profile.id)}` : '/model-profiles'
+  return request<ModelProfile>(path, {
+    method: profile.id ? 'PUT' : 'POST',
+    body: JSON.stringify(profile),
+  })
+}
+
+export function deleteModelProfile(profileId: string) {
+  return request<{ deleted: string }>(`/model-profiles/${encodeURIComponent(profileId)}`, {
+    method: 'DELETE',
+  })
+}
+
+export function discoverModels(api_base: string, api_key = '') {
+  return request<{ models: DiscoveredModel[] }>('/model-profiles/discover', {
+    method: 'POST',
+    body: JSON.stringify({ api_base, api_key }),
+  })
+}
+
+export function discoverProfileModels(profileId: string) {
+  return request<{ models: DiscoveredModel[] }>(`/model-profiles/${encodeURIComponent(profileId)}/discover`, {
+    method: 'POST',
+  })
+}
+
+export function getModelBindings() {
+  return request<ModelBindings>('/model-bindings')
+}
+
+export function updateModelBindings(bindings: ModelBindings) {
+  return request<{ bindings: ModelBindings; embedding_changed: boolean }>('/model-bindings', {
+    method: 'PUT',
+    body: JSON.stringify({ bindings }),
+  })
+}
+
+export function testChatModel(profile_id: string, model: string) {
+  return request<{ ok: boolean; model: string; usage?: Record<string, unknown> }>('/model-profiles/test-chat', {
+    method: 'POST',
+    body: JSON.stringify({ profile_id, model }),
+  })
+}
+
+export function testEmbeddingModel(profile_id: string, model: string) {
+  return request<{ ok: boolean; model: string; dimensions: number; preview: number[] }>('/model-profiles/test-embedding', {
+    method: 'POST',
+    body: JSON.stringify({ profile_id, model }),
+  })
+}
+
+export function testRerankModel(profile_id: string, model: string) {
+  return request<{ ok: boolean; model: string; results: unknown[] }>('/model-profiles/test-rerank', {
+    method: 'POST',
+    body: JSON.stringify({ profile_id, model }),
+  })
+}
+
 export function healthCheck() {
   return request<{ status: string }>('/health')
 }

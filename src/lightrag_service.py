@@ -23,6 +23,7 @@ from loguru import logger
 
 from src.config_loader import get_config
 from src.doc_processor.parsers.base_parser import Document
+from src.model_profiles import get_runtime_model_config
 
 
 DEFAULT_WORKSPACE = "tdx_default"
@@ -159,9 +160,7 @@ class LightRAGService:
                     chunk_overlap_token_size=self.config.get("chunking", {}).get("chunk_overlap", 50),
                     embedding_func=self._make_embedding_func(),
                     llm_model_func=self._make_llm_func(),
-                    llm_model_name=self.config.get("siliconflow", {}).get(
-                        "chat_model", "Qwen/Qwen2.5-7B-Instruct"
-                    ),
+                    llm_model_name=self._runtime_models()["chat"]["model"],
                     llm_model_kwargs=self._llm_kwargs(),
                     entity_extraction_use_json=self.config.get("lightrag", {}).get(
                         "entity_extraction_use_json", True
@@ -192,12 +191,12 @@ class LightRAGService:
         }
 
     def _make_embedding_func(self):
-        sf = self.config.get("siliconflow", {})
-        embed_model = sf.get("embed_model", "BAAI/bge-large-zh-v1.5")
-        embed_dim = int(sf.get("embed_dim", 1024))
-        embed_max_chars = int(sf.get("embed_max_chars", 700))
-        base_url = sf.get("base_url", "https://api.siliconflow.cn/v1")
-        api_key = sf.get("api_key", "")
+        embed = self._runtime_models()["embedding"]
+        embed_model = embed["model"]
+        embed_dim = int(embed["embed_dim"])
+        embed_max_chars = int(embed["embed_max_chars"])
+        base_url = embed["base_url"]
+        api_key = embed["api_key"]
 
         @wrap_embedding_func_with_attrs(
             embedding_dim=embed_dim,
@@ -225,21 +224,21 @@ class LightRAGService:
         return safe
 
     def _llm_kwargs(self) -> dict[str, Any]:
-        sf = self.config.get("siliconflow", {})
+        chat = self._runtime_models()["chat"]
         return {
-            "temperature": sf.get("chat_temperature", self.config.get("llm", {}).get("temperature", 0.7)),
-            "top_p": sf.get("chat_top_p", self.config.get("llm", {}).get("top_p", 0.9)),
-            "max_tokens": sf.get("chat_max_tokens", self.config.get("llm", {}).get("max_tokens", 4096)),
-            "frequency_penalty": sf.get("frequency_penalty", 0.3),
-            "presence_penalty": sf.get("presence_penalty", 0.2),
+            "temperature": chat.get("temperature", self.config.get("llm", {}).get("temperature", 0.7)),
+            "top_p": chat.get("top_p", self.config.get("llm", {}).get("top_p", 0.9)),
+            "max_tokens": chat.get("max_tokens", self.config.get("llm", {}).get("max_tokens", 4096)),
+            "frequency_penalty": chat.get("frequency_penalty", 0.3),
+            "presence_penalty": chat.get("presence_penalty", 0.2),
         }
 
     def _make_llm_func(self):
-        sf = self.config.get("siliconflow", {})
-        model = sf.get("chat_model", "Qwen/Qwen2.5-7B-Instruct")
-        base_url = sf.get("base_url", "https://api.siliconflow.cn/v1")
-        api_key = sf.get("api_key", "")
-        timeout = sf.get("timeout", 30)
+        chat = self._runtime_models()["chat"]
+        model = chat["model"]
+        base_url = chat["base_url"]
+        api_key = chat["api_key"]
+        timeout = chat.get("timeout", 30)
 
         async def siliconflow_complete(
             prompt: str,
@@ -263,14 +262,15 @@ class LightRAGService:
         return siliconflow_complete
 
     def _make_rerank_func(self):
-        sf = self.config.get("siliconflow", {})
-        model = sf.get("rerank_model", "BAAI/bge-reranker-v2-m3")
-        base_url = sf.get("base_url", "https://api.siliconflow.cn/v1").rstrip("/")
-        api_key = sf.get("api_key", "")
-        timeout = sf.get("timeout", 30)
+        rerank = self._runtime_models()["rerank"]
+        model = rerank["model"]
+        base_url = rerank["base_url"].rstrip("/")
+        api_key = rerank["api_key"]
+        timeout = rerank.get("timeout", 30)
+        enabled = bool(rerank.get("enabled", True))
 
         async def siliconflow_rerank(query: str, documents: list[str], top_n: int | None = None, **_: Any):
-            if not api_key or not documents:
+            if not enabled or not api_key or not documents:
                 return []
             payload = {
                 "model": model,
@@ -303,6 +303,9 @@ class LightRAGService:
                 return []
 
         return siliconflow_rerank
+
+    def _runtime_models(self) -> dict[str, Any]:
+        return get_runtime_model_config(self.config)
 
     def _load_manifest(self) -> dict[str, Any]:
         if not self.manifest_path.exists():
@@ -1189,8 +1192,8 @@ class LightRAGService:
             "lightrag_dir": str(self.working_dir),
             "lightrag_dir_size": _dir_size(self.working_dir),
             "workspace": self.workspace,
-            "embed_model": self.config.get("siliconflow", {}).get("embed_model", "unknown"),
-            "embed_dim": self.config.get("siliconflow", {}).get("embed_dim", 1024),
+            "embed_model": self._runtime_models()["embedding"]["model"],
+            "embed_dim": self._runtime_models()["embedding"]["embed_dim"],
         }
 
 

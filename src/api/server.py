@@ -32,6 +32,19 @@ from src.lightrag_service import (
     reset_lightrag_service,
     sanitize_workspace,
 )
+from src.model_profiles import (
+    delete_profile,
+    discover_models,
+    get_bindings,
+    get_profile_with_key,
+    get_runtime_model_config,
+    list_profiles,
+    save_bindings,
+    test_chat,
+    test_embedding,
+    test_rerank,
+    upsert_profile,
+)
 
 # --- App Setup ---
 
@@ -124,6 +137,24 @@ class EmbedTestRequest(BaseModel):
 class EmbedTestResponse(BaseModel):
     dimensions: int
     preview: list[float]
+
+class ModelProfileRequest(BaseModel):
+    id: Optional[str] = None
+    name: str
+    api_base: str
+    api_key: str = ""
+    api_type: str = "openai_compatible"
+
+class ModelDiscoverRequest(BaseModel):
+    api_base: str
+    api_key: str = ""
+
+class ModelCapabilityTestRequest(BaseModel):
+    profile_id: str
+    model: str
+
+class ModelBindingsUpdate(BaseModel):
+    bindings: dict[str, Any]
 
 class SearchRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
@@ -839,14 +870,21 @@ async def _generate_answer_text(
         return "未检索到相关文档，知识库上下文不足，无法基于当前资料回答。"
 
     cfg = get_config()
-    sf_cfg = cfg.get("siliconflow", {})
-    backend = SiliconFlowBackend(sf_cfg)
+    runtime_chat = get_runtime_model_config(cfg)["chat"]
+    backend = SiliconFlowBackend(
+        {
+            "base_url": runtime_chat["base_url"],
+            "api_key": runtime_chat["api_key"],
+            "chat_model": runtime_chat["model"],
+            "timeout": runtime_chat.get("timeout", 90),
+        }
+    )
     try:
         response = await backend.chat(
             messages=_build_answer_messages(question, citations_data, history),
             temperature=0.1,
-            top_p=min(sf_cfg.get("chat_top_p", 0.9), 0.85),
-            max_tokens=min(sf_cfg.get("chat_max_tokens", 4096), 900),
+            top_p=min(runtime_chat.get("top_p", 0.9), 0.85),
+            max_tokens=min(runtime_chat.get("max_tokens", 4096), 900),
             frequency_penalty=0.5,
             presence_penalty=0.0,
         )
@@ -1638,14 +1676,15 @@ async def search(req: SearchRequest):
 
 @app.get("/api/models/config")
 async def get_model_config():
-    """Get current model configuration."""
+    """Get legacy model configuration plus current answer prompt."""
     cfg = get_config()
     sf = cfg.get("siliconflow", {})
+    runtime = get_runtime_model_config(cfg)
     return ModelConfig(
-        embed_model=sf.get("embed_model", "BAAI/bge-large-zh-v1.5"),
-        embed_base_url=sf.get("base_url", "https://api.siliconflow.cn/v1"),
-        rerank_model=sf.get("rerank_model", "BAAI/bge-reranker-v2-m3"),
-        chat_model=sf.get("chat_model", "Qwen/Qwen2.5-7B-Instruct"),
+        embed_model=runtime["embedding"]["model"],
+        embed_base_url=runtime["embedding"]["base_url"],
+        rerank_model=runtime["rerank"]["model"],
+        chat_model=runtime["chat"]["model"],
         chat_temperature=sf.get("chat_temperature", 0.7),
         chat_top_p=sf.get("chat_top_p", 0.9),
         chat_max_tokens=sf.get("chat_max_tokens", 4096),
@@ -1658,7 +1697,11 @@ async def get_model_config():
 
 @app.put("/api/models/config")
 async def update_model_config(config: ModelConfig):
-    """Update model configuration and save to YAML."""
+    """Update legacy generation parameters and answer prompt.
+
+    Model endpoints/keys/models are managed by /api/model-profiles and
+    /api/model-bindings. This endpoint is kept for compatibility.
+    """
     if not CONFIG_PATH.exists():
         raise HTTPException(500, "Config file not found")
 
@@ -1666,10 +1709,6 @@ async def update_model_config(config: ModelConfig):
         yaml_config = yaml.safe_load(f)
 
     sf = yaml_config.setdefault("siliconflow", {})
-    sf["embed_model"] = config.embed_model
-    sf["base_url"] = config.embed_base_url
-    sf["rerank_model"] = config.rerank_model
-    sf["chat_model"] = config.chat_model
     sf["chat_temperature"] = config.chat_temperature
     sf["chat_top_p"] = config.chat_top_p
     sf["chat_max_tokens"] = config.chat_max_tokens
@@ -1686,6 +1725,103 @@ async def update_model_config(config: ModelConfig):
 
     logger.info("Model config updated and saved")
     return {"status": "ok"}
+
+
+@app.get("/api/model-profiles")
+async def api_list_model_profiles():
+    return list_profiles(get_config())
+
+
+@app.post("/api/model-profiles")
+async def api_upsert_model_profile(req: ModelProfileRequest):
+    profile = upsert_profile(req.model_dump(exclude_none=True), get_config())
+    reset_lightrag_service()
+    return profile
+
+
+@app.put("/api/model-profiles/{profile_id}")
+async def api_update_model_profile(profile_id: str, req: ModelProfileRequest):
+    payload = req.model_dump(exclude_none=True)
+    payload["id"] = profile_id
+    profile = upsert_profile(payload, get_config())
+    reset_lightrag_service()
+    return profile
+
+
+@app.delete("/api/model-profiles/{profile_id}")
+async def api_delete_model_profile(profile_id: str):
+    result = delete_profile(profile_id, get_config())
+    reset_lightrag_service()
+    return result
+
+
+@app.post("/api/model-profiles/discover")
+async def api_discover_models(req: ModelDiscoverRequest):
+    try:
+        models = await discover_models(req.api_base, req.api_key)
+    except Exception as exc:
+        logger.exception("Model discovery failed")
+        raise HTTPException(400, f"Model discovery failed: {exc}")
+    return {"models": models}
+
+
+@app.post("/api/model-profiles/{profile_id}/discover")
+async def api_discover_profile_models(profile_id: str):
+    try:
+        profile = get_profile_with_key(profile_id, get_config())
+        models = await discover_models(profile["api_base"], profile.get("api_key", ""))
+        upsert_profile({**profile, "models_cache": models}, get_config())
+    except KeyError:
+        raise HTTPException(404, "Profile not found")
+    except Exception as exc:
+        logger.exception("Profile model discovery failed")
+        raise HTTPException(400, f"Model discovery failed: {exc}")
+    return {"models": models}
+
+
+@app.post("/api/model-profiles/test-chat")
+async def api_test_chat_model(req: ModelCapabilityTestRequest):
+    try:
+        return await test_chat(req.profile_id, req.model, get_config())
+    except Exception as exc:
+        logger.exception("Chat model test failed")
+        raise HTTPException(400, f"Chat model test failed: {exc}")
+
+
+@app.post("/api/model-profiles/test-embedding")
+async def api_test_embedding_model(req: ModelCapabilityTestRequest):
+    try:
+        return await test_embedding(req.profile_id, req.model, get_config())
+    except Exception as exc:
+        logger.exception("Embedding model test failed")
+        raise HTTPException(400, f"Embedding model test failed: {exc}")
+
+
+@app.post("/api/model-profiles/test-rerank")
+async def api_test_rerank_model(req: ModelCapabilityTestRequest):
+    try:
+        return await test_rerank(req.profile_id, req.model, get_config())
+    except Exception as exc:
+        logger.exception("Rerank model test failed")
+        raise HTTPException(400, f"Rerank model test failed: {exc}")
+
+
+@app.get("/api/model-bindings")
+async def api_get_model_bindings():
+    return get_bindings(get_config())
+
+
+@app.put("/api/model-bindings")
+async def api_update_model_bindings(req: ModelBindingsUpdate):
+    old_runtime = get_runtime_model_config(get_config())
+    bindings = save_bindings(req.bindings, get_config())
+    new_runtime = get_runtime_model_config(get_config())
+    reset_lightrag_service()
+    embedding_changed = (
+        old_runtime["embedding"]["model"] != new_runtime["embedding"]["model"]
+        or int(old_runtime["embedding"]["embed_dim"]) != int(new_runtime["embedding"]["embed_dim"])
+    )
+    return {"bindings": bindings, "embedding_changed": embedding_changed}
 
 
 @app.post("/api/models/test-embed", response_model=EmbedTestResponse)
@@ -2043,7 +2179,7 @@ async def system_stats(workspace: str = Query(DEFAULT_WORKSPACE)):
     stats = await service.stats()
     graph = service.read_graph(limit=1, include_isolated=False)
     graph_meta = graph.get("metadata") or {}
-    embed_model = cfg.get("siliconflow", {}).get("embed_model", "unknown")
+    embed_model = get_runtime_model_config(cfg)["embedding"]["model"]
 
     return {
         "doc_count": stats["doc_count"],
@@ -2150,9 +2286,17 @@ async def _generate_graph_suggestions(req: GraphSuggestRequest) -> GraphSuggestR
             "target_entity_data": {"description": "合并后实体描述", "entity_type": "合并后类型"},
         },
     }
-    backend = SiliconFlowBackend(get_config().get("siliconflow", {}))
+    cfg = get_config()
+    runtime_chat = get_runtime_model_config(cfg)["chat"]
+    backend = SiliconFlowBackend(
+        {
+            "base_url": runtime_chat["base_url"],
+            "api_key": runtime_chat["api_key"],
+            "chat_model": runtime_chat["model"],
+            "timeout": runtime_chat.get("timeout", 90),
+        }
+    )
     try:
-        sf = get_config().get("siliconflow", {})
         response = await backend.chat(
             [
                 {"role": "system", "content": system_prompt},
@@ -2160,7 +2304,7 @@ async def _generate_graph_suggestions(req: GraphSuggestRequest) -> GraphSuggestR
             ],
             temperature=0.1,
             top_p=0.8,
-            max_tokens=min(int(sf.get("chat_max_tokens", 4096)), 4096),
+            max_tokens=min(int(runtime_chat.get("max_tokens", 4096)), 4096),
         )
     finally:
         await backend.close()

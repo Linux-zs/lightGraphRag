@@ -33,7 +33,6 @@ def _deep_merge(base: dict, override: dict) -> dict:
 def _apply_env_overrides(config: dict) -> dict:
     """Apply environment variable overrides to config."""
     env_map = {
-        "SILICONFLOW_API_KEY": ("siliconflow", "api_key"),
         "OLLAMA_HOST": ("ollama", "host"),
         "OLLAMA_MODEL": ("ollama", "model"),
         "TDX_DOCS_DIR": ("paths", "docs_dir"),

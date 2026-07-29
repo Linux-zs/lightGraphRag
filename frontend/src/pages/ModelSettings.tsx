@@ -1,9 +1,21 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
+  discoverModels,
+  discoverProfileModels,
+  DiscoveredModel,
+  getModelBindings,
   getModelConfig,
-  updateModelConfig,
-  testEmbed,
+  listModelProfiles,
+  ModelBinding,
+  ModelBindings,
   ModelConfig,
+  ModelProfile,
+  saveModelProfile,
+  testChatModel,
+  testEmbeddingModel,
+  testRerankModel,
+  updateModelBindings,
+  updateModelConfig,
 } from '../api'
 
 const DEFAULT_ANSWER_SYSTEM_PROMPT =
@@ -27,62 +39,281 @@ const DEFAULT_CONFIG: ModelConfig = {
   answer_system_prompt: DEFAULT_ANSWER_SYSTEM_PROMPT,
 }
 
+const DEFAULT_BINDINGS: ModelBindings = {
+  chat: { profile_id: 'siliconflow-default', model: 'Qwen/Qwen2.5-7B-Instruct' },
+  embedding: {
+    profile_id: 'siliconflow-default',
+    model: 'BAAI/bge-large-zh-v1.5',
+    embed_dim: 1024,
+    embed_max_chars: 700,
+  },
+  rerank: { profile_id: 'siliconflow-default', model: 'BAAI/bge-reranker-v2-m3', enabled: true },
+}
+
+function modelOptions(profile: ModelProfile | undefined, manualModel: string): DiscoveredModel[] {
+  const models = profile?.models_cache || []
+  if (manualModel && !models.some((item) => item.id === manualModel)) {
+    return [{ id: manualModel, type: 'manual' }, ...models]
+  }
+  return models
+}
+
 export default function ModelSettings() {
+  const [profiles, setProfiles] = useState<ModelProfile[]>([])
+  const [bindings, setBindings] = useState<ModelBindings>(DEFAULT_BINDINGS)
   const [config, setConfig] = useState<ModelConfig>(DEFAULT_CONFIG)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
-  const [saveMsg, setSaveMsg] = useState('')
+  const [message, setMessage] = useState('')
+  const [testing, setTesting] = useState('')
 
-  // Embed test
-  const [testText, setTestText] = useState('你好，这是一段测试文本')
-  const [embedResult, setEmbedResult] = useState<{
-    dimensions: number
-    preview: number[]
-  } | null>(null)
-  const [embedTesting, setEmbedTesting] = useState(false)
-  const [embedError, setEmbedError] = useState('')
+  const [profileDraft, setProfileDraft] = useState({
+    id: '',
+    name: 'SiliconFlow',
+    api_base: 'https://api.siliconflow.cn/v1',
+    api_key: '',
+  })
+  const [draftModels, setDraftModels] = useState<DiscoveredModel[]>([])
+  const [discovering, setDiscovering] = useState(false)
 
-  useEffect(() => {
-    loadConfig()
-  }, [])
+  const profileById = useMemo(() => {
+    const map = new Map<string, ModelProfile>()
+    profiles.forEach((profile) => map.set(profile.id, profile))
+    return map
+  }, [profiles])
 
-  const loadConfig = async () => {
+  const loadAll = async () => {
+    setLoading(true)
+    setMessage('')
     try {
-      const data = await getModelConfig()
-      setConfig(data)
-    } catch {
-      // use defaults
+      const [profileData, bindingData, modelConfig] = await Promise.all([
+        listModelProfiles(),
+        getModelBindings(),
+        getModelConfig(),
+      ])
+      setProfiles(profileData)
+      setBindings(bindingData)
+      setConfig(modelConfig)
+    } catch (e) {
+      setMessage(`加载失败: ${(e as Error).message}`)
     } finally {
       setLoading(false)
     }
   }
 
-  const handleSave = async () => {
-    setSaving(true)
-    setSaveMsg('')
+  useEffect(() => {
+    loadAll()
+  }, [])
+
+  const updateBinding = (purpose: keyof ModelBindings, patch: Partial<ModelBinding>) => {
+    setBindings((prev) => ({
+      ...prev,
+      [purpose]: { ...prev[purpose], ...patch },
+    }))
+  }
+
+  const handleDiscoverDraft = async () => {
+    if (!profileDraft.api_base.trim()) return
+    setDiscovering(true)
+    setMessage('')
     try {
-      await updateModelConfig(config)
-      setSaveMsg('配置已保存到 config/default.yaml')
-    } catch (e: unknown) {
-      setSaveMsg(`保存失败: ${(e as Error).message}`)
+      const result = await discoverModels(profileDraft.api_base.trim(), profileDraft.api_key.trim())
+      setDraftModels(result.models)
+      setMessage(`发现 ${result.models.length} 个模型`)
+    } catch (e) {
+      setMessage(`发现模型失败: ${(e as Error).message}`)
+    } finally {
+      setDiscovering(false)
+    }
+  }
+
+  const handleSaveProfile = async () => {
+    if (!profileDraft.name.trim() || !profileDraft.api_base.trim()) return
+    setSaving(true)
+    setMessage('')
+    try {
+      const saved = await saveModelProfile({
+        id: profileDraft.id || undefined,
+        name: profileDraft.name.trim(),
+        api_base: profileDraft.api_base.trim(),
+        api_key: profileDraft.api_key.trim() || undefined,
+        api_type: 'openai_compatible',
+      })
+      setProfiles((prev) => [saved, ...prev.filter((item) => item.id !== saved.id)])
+      setProfileDraft({ id: '', name: 'SiliconFlow', api_base: 'https://api.siliconflow.cn/v1', api_key: '' })
+      setDraftModels([])
+      setMessage('连接档案已保存，API Key 不会回显')
+    } catch (e) {
+      setMessage(`保存连接失败: ${(e as Error).message}`)
     } finally {
       setSaving(false)
     }
   }
 
-  const handleTestEmbed = async () => {
-    if (!testText.trim()) return
-    setEmbedTesting(true)
-    setEmbedError('')
-    setEmbedResult(null)
+  const refreshProfileModels = async (profileId: string) => {
+    setTesting(`discover-${profileId}`)
+    setMessage('')
     try {
-      const data = await testEmbed(testText.trim())
-      setEmbedResult(data)
-    } catch (e: unknown) {
-      setEmbedError((e as Error).message || 'Embed test failed')
+      const result = await discoverProfileModels(profileId)
+      setProfiles((prev) =>
+        prev.map((profile) =>
+          profile.id === profileId ? { ...profile, models_cache: result.models } : profile,
+        ),
+      )
+      setMessage(`已刷新模型列表: ${result.models.length} 个`)
+    } catch (e) {
+      setMessage(`刷新模型失败: ${(e as Error).message}`)
     } finally {
-      setEmbedTesting(false)
+      setTesting('')
     }
+  }
+
+  const saveBindings = async () => {
+    const ok =
+      !bindings.embedding.embed_dim ||
+      window.confirm('如果嵌入模型或维度发生变化，已有 LightRAG 索引可能不可复用，需要清空并重建知识库。确认保存？')
+    if (!ok) return
+    setSaving(true)
+    setMessage('')
+    try {
+      const result = await updateModelBindings(bindings)
+      setBindings(result.bindings)
+      setMessage(result.embedding_changed ? '绑定已保存；嵌入模型/维度已变化，请重建知识库索引。' : '模型绑定已保存')
+    } catch (e) {
+      setMessage(`保存绑定失败: ${(e as Error).message}`)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const saveGenerationConfig = async () => {
+    setSaving(true)
+    setMessage('')
+    try {
+      await updateModelConfig(config)
+      setMessage('生成参数和问答提示词已保存')
+    } catch (e) {
+      setMessage(`保存失败: ${(e as Error).message}`)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const testPurpose = async (purpose: keyof ModelBindings) => {
+    const binding = bindings[purpose]
+    if (!binding.profile_id || !binding.model) return
+    setTesting(purpose)
+    setMessage('')
+    try {
+      if (purpose === 'chat') {
+        await testChatModel(binding.profile_id, binding.model)
+        setMessage('大语言模型测试通过')
+      } else if (purpose === 'embedding') {
+        const result = await testEmbeddingModel(binding.profile_id, binding.model)
+        updateBinding('embedding', { embed_dim: result.dimensions })
+        setMessage(`嵌入模型测试通过，维度 ${result.dimensions}`)
+      } else {
+        await testRerankModel(binding.profile_id, binding.model)
+        setMessage('Rerank 模型测试通过')
+      }
+    } catch (e) {
+      setMessage(`模型测试失败: ${(e as Error).message}`)
+    } finally {
+      setTesting('')
+    }
+  }
+
+  const renderBinding = (purpose: keyof ModelBindings, title: string, hint: string) => {
+    const binding = bindings[purpose]
+    const profile = profileById.get(binding.profile_id)
+    const options = modelOptions(profile, binding.model)
+
+    return (
+      <div className="rounded-lg border border-gray-200 bg-white p-4">
+        <div className="mb-3 flex items-start justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold text-gray-800">{title}</h3>
+            <p className="mt-1 text-xs text-gray-500">{hint}</p>
+          </div>
+          {purpose === 'rerank' && (
+            <label className="flex items-center gap-2 text-xs text-gray-600">
+              <input
+                type="checkbox"
+                checked={binding.enabled !== false}
+                onChange={(e) => updateBinding('rerank', { enabled: e.target.checked })}
+              />
+              启用
+            </label>
+          )}
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-[220px_minmax(0,1fr)_auto] gap-3">
+          <select
+            value={binding.profile_id}
+            onChange={(e) => updateBinding(purpose, { profile_id: e.target.value })}
+            className="rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
+          >
+            {profiles.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name}
+              </option>
+            ))}
+          </select>
+
+          <div className="flex gap-2">
+            <select
+              value={binding.model}
+              onChange={(e) => updateBinding(purpose, { model: e.target.value })}
+              className="min-w-0 flex-1 rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white"
+            >
+              {options.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.id}
+                </option>
+              ))}
+              {options.length === 0 && <option value={binding.model}>{binding.model || '请手动输入模型名'}</option>}
+            </select>
+            <input
+              value={binding.model}
+              onChange={(e) => updateBinding(purpose, { model: e.target.value })}
+              className="min-w-0 flex-1 rounded-lg border border-gray-300 px-3 py-2 text-sm"
+              placeholder="也可手动输入模型名"
+            />
+          </div>
+
+          <button
+            onClick={() => testPurpose(purpose)}
+            disabled={testing === purpose || !binding.profile_id || !binding.model}
+            className="rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:text-gray-300"
+          >
+            {testing === purpose ? '测试中...' : '测试'}
+          </button>
+        </div>
+
+        {purpose === 'embedding' && (
+          <div className="mt-3 grid grid-cols-2 gap-3">
+            <label className="text-xs text-gray-500">
+              向量维度
+              <input
+                type="number"
+                value={binding.embed_dim || 1024}
+                onChange={(e) => updateBinding('embedding', { embed_dim: Number(e.target.value) })}
+                className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+              />
+            </label>
+            <label className="text-xs text-gray-500">
+              单条嵌入最大字符
+              <input
+                type="number"
+                value={binding.embed_max_chars || 700}
+                onChange={(e) => updateBinding('embedding', { embed_max_chars: Number(e.target.value) })}
+                className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+              />
+            </label>
+          </div>
+        )}
+      </div>
+    )
   }
 
   if (loading) {
@@ -95,240 +326,172 @@ export default function ModelSettings() {
   }
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
       <div>
         <h2 className="text-xl font-bold text-gray-800">模型设置</h2>
         <p className="text-sm text-gray-500 mt-1">
-          配置嵌入模型、重排序模型和大语言模型参数，修改后保存到 YAML 配置文件。
+          管理 OpenAI-compatible 连接档案，并分别绑定大语言、嵌入和 Rerank 模型。
         </p>
       </div>
 
-      {/* Model config form */}
-      <section className="bg-white border border-gray-200 rounded-xl p-6">
-        <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide mb-5">
-          模型配置
-        </h3>
-
-        <div className="space-y-5">
-          {/* Embed model */}
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Embed Model
-              </label>
-              <input
-                type="text"
-                value={config.embed_model}
-                onChange={(e) => setConfig({ ...config, embed_model: e.target.value })}
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-primary-200 focus:border-primary-400 outline-none"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Embed API Base URL
-              </label>
-              <input
-                type="text"
-                value={config.embed_base_url}
-                onChange={(e) =>
-                  setConfig({ ...config, embed_base_url: e.target.value })
-                }
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-primary-200 focus:border-primary-400 outline-none"
-              />
-            </div>
-          </div>
-
-          {/* Rerank model */}
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Rerank Model
-            </label>
-            <input
-              type="text"
-              value={config.rerank_model}
-              onChange={(e) => setConfig({ ...config, rerank_model: e.target.value })}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-primary-200 focus:border-primary-400 outline-none"
-            />
-          </div>
-
-          {/* Chat model */}
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Chat Model
-            </label>
-            <input
-              type="text"
-              value={config.chat_model}
-              onChange={(e) => setConfig({ ...config, chat_model: e.target.value })}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-primary-200 focus:border-primary-400 outline-none"
-            />
-          </div>
-
-          {/* Chat params */}
-          <div className="grid grid-cols-3 gap-4 pt-2 border-t border-gray-100">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Temperature: {config.chat_temperature}
-              </label>
-              <input
-                type="range"
-                min={0}
-                max={2}
-                step={0.05}
-                value={config.chat_temperature}
-                onChange={(e) =>
-                  setConfig({ ...config, chat_temperature: parseFloat(e.target.value) })
-                }
-                className="w-full accent-primary-500"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Top-P: {config.chat_top_p}
-              </label>
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.05}
-                value={config.chat_top_p}
-                onChange={(e) =>
-                  setConfig({ ...config, chat_top_p: parseFloat(e.target.value) })
-                }
-                className="w-full accent-primary-500"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Max Tokens: {config.chat_max_tokens}
-              </label>
-              <input
-                type="range"
-                min={256}
-                max={8192}
-                step={256}
-                value={config.chat_max_tokens}
-                onChange={(e) =>
-                  setConfig({ ...config, chat_max_tokens: parseInt(e.target.value) })
-                }
-                className="w-full accent-primary-500"
-              />
-            </div>
-          </div>
+      {message && (
+        <div className={`rounded-lg border px-4 py-3 text-sm ${
+          message.includes('失败')
+            ? 'border-red-200 bg-red-50 text-red-700'
+            : 'border-emerald-200 bg-emerald-50 text-emerald-700'
+        }`}>
+          {message}
         </div>
+      )}
 
-        <div className="mt-6">
-          <button
-            onClick={handleSave}
-            disabled={saving}
-            className="px-5 py-2 text-sm font-medium rounded-lg bg-primary-600 text-white hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-          >
-            {saving ? '保存中...' : '保存配置'}
-          </button>
-          {saveMsg && (
-            <span
-              className={`ml-3 text-sm ${
-                saveMsg.includes('失败') ? 'text-red-500' : 'text-green-600'
-              }`}
+      <div className="grid grid-cols-1 xl:grid-cols-[380px_minmax(0,1fr)] gap-5">
+        <section className="space-y-4">
+          <div className="rounded-lg border border-gray-200 bg-white p-4">
+            <h3 className="text-sm font-semibold text-gray-800">连接档案</h3>
+            <div className="mt-3 space-y-3">
+              {profiles.map((profile) => (
+                <div key={profile.id} className="rounded-lg border border-gray-200 p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium text-gray-800">{profile.name}</div>
+                      <div className="mt-1 truncate text-xs text-gray-500">{profile.api_base}</div>
+                      <div className="mt-1 text-xs text-gray-400">
+                        Key: {profile.has_api_key ? profile.api_key_preview : '未保存'} · 模型 {profile.models_cache?.length || 0}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => refreshProfileModels(profile.id)}
+                      className="shrink-0 rounded border border-gray-300 px-2 py-1 text-xs text-gray-600 hover:bg-gray-50"
+                    >
+                      刷新
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-gray-200 bg-white p-4">
+            <h3 className="text-sm font-semibold text-gray-800">新增或更新连接</h3>
+            <div className="mt-3 space-y-3">
+              <input
+                value={profileDraft.name}
+                onChange={(e) => setProfileDraft({ ...profileDraft, name: e.target.value })}
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                placeholder="连接名称"
+              />
+              <input
+                value={profileDraft.api_base}
+                onChange={(e) => setProfileDraft({ ...profileDraft, api_base: e.target.value })}
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm font-mono"
+                placeholder="https://api.example.com/v1"
+              />
+              <input
+                type="password"
+                value={profileDraft.api_key}
+                onChange={(e) => setProfileDraft({ ...profileDraft, api_key: e.target.value })}
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm font-mono"
+                placeholder="API Key，保存后不回显"
+              />
+              <div className="flex gap-2">
+                <button
+                  onClick={handleDiscoverDraft}
+                  disabled={discovering}
+                  className="rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                >
+                  {discovering ? '发现中...' : '发现模型'}
+                </button>
+                <button
+                  onClick={handleSaveProfile}
+                  disabled={saving}
+                  className="rounded-lg bg-gray-900 px-3 py-2 text-sm text-white hover:bg-gray-700 disabled:bg-gray-300"
+                >
+                  保存连接
+                </button>
+              </div>
+              {draftModels.length > 0 && (
+                <div className="max-h-40 overflow-y-auto rounded-lg bg-gray-50 p-2 text-xs text-gray-600">
+                  {draftModels.map((model) => (
+                    <div key={model.id} className="truncate py-1">{model.id}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+
+        <section className="space-y-4">
+          {renderBinding('chat', '大语言模型', '用于问答生成、图谱修正建议和 LightRAG 查询。')}
+          {renderBinding('embedding', '嵌入模型', '用于索引和检索向量。模型或维度变化后需要重建索引。')}
+          {renderBinding('rerank', 'Rerank 模型', '用于召回结果重排序；如果供应商不支持，可以关闭。')}
+
+          <div className="flex justify-end">
+            <button
+              onClick={saveBindings}
+              disabled={saving}
+              className="rounded-lg bg-primary-600 px-5 py-2 text-sm font-medium text-white hover:bg-primary-700 disabled:bg-gray-300"
             >
-              {saveMsg}
-            </span>
-          )}
+              保存模型绑定
+            </button>
+          </div>
+        </section>
+      </div>
+
+      <section className="bg-white border border-gray-200 rounded-lg p-5">
+        <h3 className="text-sm font-semibold text-gray-800">生成参数</h3>
+        <div className="mt-4 grid grid-cols-3 gap-4">
+          <label className="text-sm text-gray-600">
+            Temperature: {config.chat_temperature}
+            <input type="range" min={0} max={2} step={0.05} value={config.chat_temperature}
+              onChange={(e) => setConfig({ ...config, chat_temperature: parseFloat(e.target.value) })}
+              className="mt-2 w-full accent-primary-500" />
+          </label>
+          <label className="text-sm text-gray-600">
+            Top-P: {config.chat_top_p}
+            <input type="range" min={0} max={1} step={0.05} value={config.chat_top_p}
+              onChange={(e) => setConfig({ ...config, chat_top_p: parseFloat(e.target.value) })}
+              className="mt-2 w-full accent-primary-500" />
+          </label>
+          <label className="text-sm text-gray-600">
+            Max Tokens: {config.chat_max_tokens}
+            <input type="range" min={256} max={8192} step={256} value={config.chat_max_tokens}
+              onChange={(e) => setConfig({ ...config, chat_max_tokens: parseInt(e.target.value) })}
+              className="mt-2 w-full accent-primary-500" />
+          </label>
         </div>
       </section>
 
-      <section className="bg-white border border-gray-200 rounded-xl p-6">
+      <section className="bg-white border border-gray-200 rounded-lg p-5">
         <div className="flex items-start justify-between gap-4 mb-4">
           <div>
-            <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide">
-              问答提示词
-            </h3>
+            <h3 className="text-sm font-semibold text-gray-800">问答提示词</h3>
             <p className="text-sm text-gray-500 mt-1">
-              这里控制智能问答的系统提示词；参考资料会另行拼接到用户消息中。
+              控制最终回答风格；参考资料会另行拼接到用户消息中。
             </p>
           </div>
           <button
-            onClick={() =>
-              setConfig({ ...config, answer_system_prompt: DEFAULT_ANSWER_SYSTEM_PROMPT })
-            }
+            onClick={() => setConfig({ ...config, answer_system_prompt: DEFAULT_ANSWER_SYSTEM_PROMPT })}
             className="shrink-0 px-3 py-1.5 text-xs rounded-lg border border-gray-300 bg-white text-gray-600 hover:bg-gray-50"
           >
             恢复推荐模板
           </button>
         </div>
-
         <textarea
           value={config.answer_system_prompt}
-          onChange={(e) =>
-            setConfig({ ...config, answer_system_prompt: e.target.value })
-          }
+          onChange={(e) => setConfig({ ...config, answer_system_prompt: e.target.value })}
           rows={10}
-          className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm leading-relaxed focus:ring-2 focus:ring-primary-200 focus:border-primary-400 outline-none font-mono"
+          className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm leading-relaxed outline-none font-mono"
         />
-        <div className="mt-3 flex items-center justify-between text-xs text-gray-400">
-          <span>保存后新问题立即使用；已生成的历史回答不会自动重写。</span>
-          <span>{config.answer_system_prompt.length} 字符</span>
-        </div>
-      </section>
-
-      {/* Embed test */}
-      <section className="bg-white border border-gray-200 rounded-xl p-6">
-        <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide mb-4">
-          嵌入测试
-        </h3>
-        <p className="text-sm text-gray-500 mb-4">
-          输入一段文本，查看当前嵌入模型的输出向量维度和前 10 个值。
-        </p>
-
-        <div className="flex gap-3">
-          <input
-            type="text"
-            value={testText}
-            onChange={(e) => setTestText(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleTestEmbed()}
-            placeholder="输入测试文本..."
-            className="flex-1 border border-gray-300 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-primary-200 focus:border-primary-400 outline-none"
-          />
+        <div className="mt-3 flex items-center justify-between">
+          <span className="text-xs text-gray-400">{config.answer_system_prompt.length} 字符</span>
           <button
-            onClick={handleTestEmbed}
-            disabled={embedTesting || !testText.trim()}
-            className="px-5 py-2.5 text-sm font-medium rounded-lg bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            onClick={saveGenerationConfig}
+            disabled={saving}
+            className="rounded-lg bg-gray-900 px-4 py-2 text-sm text-white hover:bg-gray-700 disabled:bg-gray-300"
           >
-            {embedTesting ? '计算中...' : '测试'}
+            保存生成参数和提示词
           </button>
         </div>
-
-        {embedError && (
-          <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">
-            {embedError}
-          </div>
-        )}
-
-        {embedResult && (
-          <div className="mt-4 p-4 bg-gray-50 rounded-lg border border-gray-200">
-            <div className="flex items-center gap-4 mb-3">
-              <span className="text-sm text-gray-500">
-                维度: <span className="font-bold text-gray-800">{embedResult.dimensions}</span>
-              </span>
-              <span className="text-sm text-gray-500">
-                模型: <span className="font-mono">{config.embed_model}</span>
-              </span>
-            </div>
-            <div>
-              <p className="text-xs text-gray-400 mb-1">前 10 个值:</p>
-              <div className="flex flex-wrap gap-1.5">
-                {embedResult.preview.map((v, i) => (
-                  <span
-                    key={i}
-                    className="text-[11px] font-mono bg-white border border-gray-200 rounded px-1.5 py-0.5"
-                  >
-                    {v.toFixed(6)}
-                  </span>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
       </section>
     </div>
   )
