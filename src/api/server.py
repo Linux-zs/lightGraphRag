@@ -1463,15 +1463,20 @@ async def list_documents(workspace: str = Query(DEFAULT_WORKSPACE)):
 @app.delete("/api/kb/documents/{doc_name}")
 async def delete_document(doc_name: str, workspace: str = Query(DEFAULT_WORKSPACE)):
     """Delete a document from LightRAG by doc_id or uploaded file name."""
+    service = get_lightrag_service(workspace)
     try:
-        result = await get_lightrag_service(workspace).delete_document(doc_name)
+        result = await service.delete_document(doc_name)
     except KeyError:
         raise HTTPException(404, f"Document '{doc_name}' not found")
     except Exception as e:
         logger.exception("LightRAG delete failed for {}", doc_name)
         raise HTTPException(500, f"LightRAG delete failed: {e}")
     _uploaded_files.pop(result["doc_name"], None)
-    return {"deleted": 1, **result}
+    graph_residuals = service.find_graph_references(
+        doc_id=result["doc_id"],
+        doc_name=result["doc_name"],
+    )
+    return {"deleted": 1, **result, "graph_residuals": graph_residuals}
 
 
 class BatchDeleteRequest(BaseModel):
@@ -1504,16 +1509,35 @@ async def batch_delete(req: BatchDeleteRequest):
     """Delete multiple documents at once."""
     deleted = 0
     errors = []
+    residual_items = []
     service = get_lightrag_service(req.workspace)
     for doc_name in req.doc_names:
         try:
             result = await service.delete_document(doc_name)
             _uploaded_files.pop(result["doc_name"], None)
+            residual_items.append(
+                {
+                    "doc_name": result["doc_name"],
+                    "doc_id": result["doc_id"],
+                    **service.find_graph_references(
+                        doc_id=result["doc_id"],
+                        doc_name=result["doc_name"],
+                    ),
+                }
+            )
             deleted += 1
             logger.info("Batch-delete: removed LightRAG doc '{}'", doc_name)
         except Exception as e:
             errors.append({"doc_name": doc_name, "error": str(e)})
-    return {"deleted_chunks": deleted, "doc_count": len(req.doc_names), "errors": errors}
+    return {
+        "deleted_chunks": deleted,
+        "doc_count": len(req.doc_names),
+        "errors": errors,
+        "graph_residuals": {
+            "has_residuals": any(item.get("has_residuals") for item in residual_items),
+            "items": residual_items,
+        },
+    }
 
 
 @app.post("/api/kb/batch-index")

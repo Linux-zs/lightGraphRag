@@ -179,15 +179,41 @@ export function listDocuments(workspace = 'tdx_default') {
   return request<DocInfo[]>(`/kb/documents?workspace=${encodeURIComponent(workspace)}`)
 }
 
+export interface GraphDeleteResiduals {
+  checked: boolean
+  has_residuals: boolean
+  node_count: number
+  edge_count: number
+  nodes: Array<{ id: string; label: string; source_id?: string; file_path?: string }>
+  edges: Array<{ source: string; target: string; source_id?: string; file_path?: string }>
+  graph_exists?: boolean
+  error?: string
+}
+
+export interface BatchGraphDeleteResiduals {
+  has_residuals: boolean
+  items: Array<GraphDeleteResiduals & { doc_name: string; doc_id: string }>
+}
+
 export function deleteDocument(docName: string, workspace = 'tdx_default') {
-  return request<{ deleted: number; doc_id: string; doc_name: string }>(
+  return request<{
+    deleted: number
+    doc_id: string
+    doc_name: string
+    graph_residuals: GraphDeleteResiduals
+  }>(
     `/kb/documents/${encodeURIComponent(docName)}?workspace=${encodeURIComponent(workspace)}`,
     { method: 'DELETE' },
   )
 }
 
 export function batchDeleteDocuments(docNames: string[], workspace = 'tdx_default') {
-  return request<{ deleted_chunks: number; doc_count: number }>(
+  return request<{
+    deleted_chunks: number
+    doc_count: number
+    errors?: Array<{ doc_name: string; error: string }>
+    graph_residuals?: BatchGraphDeleteResiduals
+  }>(
     '/kb/batch-delete',
     { method: 'POST', body: JSON.stringify({ workspace, doc_names: docNames }) },
   )

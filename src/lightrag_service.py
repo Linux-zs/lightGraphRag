@@ -1130,6 +1130,102 @@ class LightRAGService:
             },
         }
 
+    def find_graph_references(
+        self,
+        *,
+        doc_id: str,
+        doc_name: str,
+        sample_limit: int = 8,
+    ) -> dict[str, Any]:
+        """Check whether graph nodes/edges still reference a deleted document."""
+        path = self.graphml_path
+        if not path.exists():
+            return {
+                "checked": True,
+                "has_residuals": False,
+                "node_count": 0,
+                "edge_count": 0,
+                "nodes": [],
+                "edges": [],
+                "graph_exists": False,
+            }
+
+        try:
+            graph = nx.read_graphml(path)
+        except Exception as exc:
+            logger.warning("Failed to inspect LightRAG graphml {} after delete: {}", path, exc)
+            return {
+                "checked": False,
+                "has_residuals": False,
+                "node_count": 0,
+                "edge_count": 0,
+                "nodes": [],
+                "edges": [],
+                "graph_exists": True,
+                "error": str(exc),
+            }
+
+        def clean(value: Any, max_len: int = 240) -> str:
+            text = str(value or "").replace("<SEP>", "；")
+            text = CONTROL_CHARS_RE.sub("", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            return text[:max_len].rstrip()
+
+        doc_stem = Path(doc_name).stem if doc_name else ""
+        needles = [value for value in {doc_id, doc_name} if value]
+        if len(doc_stem) >= 4:
+            needles.append(doc_stem)
+
+        def has_reference(data: dict[str, Any]) -> bool:
+            values = [
+                clean(data.get("source_id"), 2000),
+                clean(data.get("file_path"), 2000),
+            ]
+            return any(needle in value for needle in needles for value in values)
+
+        node_count = 0
+        edge_count = 0
+        nodes: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+
+        for node_id, data in graph.nodes(data=True):
+            if not has_reference(data):
+                continue
+            node_count += 1
+            if len(nodes) < sample_limit:
+                nodes.append(
+                    {
+                        "id": str(node_id),
+                        "label": clean(data.get("entity_id") or node_id, 80),
+                        "source_id": clean(data.get("source_id")),
+                        "file_path": clean(data.get("file_path")),
+                    }
+                )
+
+        for source, target, data in graph.edges(data=True):
+            if not has_reference(data):
+                continue
+            edge_count += 1
+            if len(edges) < sample_limit:
+                edges.append(
+                    {
+                        "source": str(source),
+                        "target": str(target),
+                        "source_id": clean(data.get("source_id")),
+                        "file_path": clean(data.get("file_path")),
+                    }
+                )
+
+        return {
+            "checked": True,
+            "has_residuals": node_count > 0 or edge_count > 0,
+            "node_count": node_count,
+            "edge_count": edge_count,
+            "nodes": nodes,
+            "edges": edges,
+            "graph_exists": True,
+        }
+
     async def delete_document(self, doc_name_or_id: str) -> dict[str, Any]:
         await self.get_rag()
         manifest = self._load_manifest()

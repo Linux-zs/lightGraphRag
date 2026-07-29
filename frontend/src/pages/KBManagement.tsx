@@ -19,6 +19,7 @@ import {
   ChunkPreviewItem,
   DocInfo,
   DocumentChunkItem,
+  GraphDeleteResiduals,
   GraphGovernanceConfig,
   IndexTask,
 } from '../api'
@@ -131,6 +132,21 @@ export default function KBManagement({ workspace }: Props) {
     const fail = task.errors.length
     return `${formatTaskMessage(task)}: ${ok} 成功${fail > 0 ? `, ${fail} 失败` : ''}`
   }
+
+  const formatGraphResidualWarning = (docName: string, residuals?: GraphDeleteResiduals) => {
+    if (!residuals) return ''
+    if (!residuals.checked) {
+      return `已删除 ${docName}，但图谱残留检查失败：${residuals.error || '未知错误'}。建议重建当前知识库索引。`
+    }
+    if (!residuals.has_residuals) return ''
+    return `已删除 ${docName} 的文档索引，但知识图谱仍检测到 ${residuals.node_count} 个实体 / ${residuals.edge_count} 条关系引用该文档。建议重建当前知识库索引以清理残留。`
+  }
+
+  const batchMessageTone = batchMsg.includes('失败') || batchMsg.includes('取消')
+    ? 'error'
+    : batchMsg.includes('残留') || batchMsg.includes('重建当前知识库')
+      ? 'warning'
+      : 'success'
 
   const isRecentTask = (task: IndexTask) => {
     const updatedAt = new Date(task.updated_at).getTime()
@@ -329,14 +345,19 @@ export default function KBManagement({ workspace }: Props) {
 
   const handleDelete = async (docName: string) => {
     setDeleting(docName)
+    setBatchMsg('')
     try {
-      await deleteDocument(docName, workspace)
+      const result = await deleteDocument(docName, workspace)
+      const residualWarning = formatGraphResidualWarning(result.doc_name, result.graph_residuals)
+      setBatchMsg(residualWarning || `已删除文档: ${result.doc_name}`)
       setCheckedDocs((prev) => {
         const next = new Set(prev)
         next.delete(docName)
         return next
       })
       loadDocs()
+    } catch (e: unknown) {
+      setBatchMsg(`删除失败: ${(e as Error).message || '未知错误'}`)
     } finally {
       setDeleting(null)
     }
@@ -364,7 +385,17 @@ export default function KBManagement({ workspace }: Props) {
     setBatchMsg('')
     try {
       const result = await batchDeleteDocuments([...checkedDocs], workspace)
-      setBatchMsg(`批量删除完成: ${result.deleted_chunks} 个文档，提交 ${result.doc_count} 个`)
+      const residualItems = result.graph_residuals?.items.filter((item) => item.has_residuals || !item.checked) || []
+      const errorSuffix = result.errors?.length ? `，${result.errors.length} 个失败` : ''
+      if (residualItems.length > 0) {
+        const nodes = residualItems.reduce((sum, item) => sum + (item.node_count || 0), 0)
+        const edges = residualItems.reduce((sum, item) => sum + (item.edge_count || 0), 0)
+        setBatchMsg(
+          `批量删除完成: ${result.deleted_chunks} 个文档，提交 ${result.doc_count} 个${errorSuffix}。其中 ${residualItems.length} 个文档存在图谱残留，共 ${nodes} 个实体 / ${edges} 条关系。建议重建当前知识库索引。`,
+        )
+      } else {
+        setBatchMsg(`批量删除完成: ${result.deleted_chunks} 个文档，提交 ${result.doc_count} 个${errorSuffix}`)
+      }
       setCheckedDocs(new Set())
       loadDocs()
     } catch (e: unknown) {
@@ -765,8 +796,10 @@ export default function KBManagement({ workspace }: Props) {
 
         {batchMsg && (
           <div className={`mb-4 p-3 rounded-lg text-sm ${
-            batchMsg.includes('失败') || batchMsg.includes('取消')
+            batchMessageTone === 'error'
               ? 'bg-red-50 border border-red-200 text-red-700'
+              : batchMessageTone === 'warning'
+                ? 'bg-amber-50 border border-amber-200 text-amber-800'
               : 'bg-green-50 border border-green-200 text-green-700'
           }`}>
             {batchMsg}
