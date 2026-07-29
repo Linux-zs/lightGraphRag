@@ -59,6 +59,25 @@ function modelOptions(profile: ModelProfile | undefined, manualModel: string): D
   return models
 }
 
+function isLocalApiBase(apiBase: string): boolean {
+  return /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(apiBase)
+}
+
+function needsSavedApiKey(profile: ModelProfile | undefined): boolean {
+  return Boolean(profile && !profile.has_api_key && !isLocalApiBase(profile.api_base))
+}
+
+function friendlyError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  if (message.includes('Illegal header value')) {
+    return '当前连接没有有效 API Key，请编辑连接档案并保存 API Key 后再测试。'
+  }
+  if (message.includes('401') || message.includes('Unauthorized')) {
+    return '接口返回 401，请确认 API Key 已保存且有权限访问该 API 地址。'
+  }
+  return message
+}
+
 export default function ModelSettings() {
   const [profiles, setProfiles] = useState<ModelProfile[]>([])
   const [bindings, setBindings] = useState<ModelBindings>(DEFAULT_BINDINGS)
@@ -115,6 +134,10 @@ export default function ModelSettings() {
 
   const handleDiscoverDraft = async () => {
     if (!profileDraft.api_base.trim()) return
+    if (!profileDraft.api_key.trim() && !isLocalApiBase(profileDraft.api_base)) {
+      setMessage('远端模型服务通常需要 API Key；请先输入 API Key，再发现模型。')
+      return
+    }
     setDiscovering(true)
     setMessage('')
     try {
@@ -122,7 +145,7 @@ export default function ModelSettings() {
       setDraftModels(result.models)
       setMessage(`发现 ${result.models.length} 个模型`)
     } catch (e) {
-      setMessage(`发现模型失败: ${(e as Error).message}`)
+      setMessage(`发现模型失败: ${friendlyError(e)}`)
     } finally {
       setDiscovering(false)
     }
@@ -152,6 +175,11 @@ export default function ModelSettings() {
   }
 
   const refreshProfileModels = async (profileId: string) => {
+    const profile = profileById.get(profileId)
+    if (needsSavedApiKey(profile)) {
+      setMessage('该连接还没有保存 API Key，请先编辑连接档案并保存 API Key，再刷新模型列表。')
+      return
+    }
     setTesting(`discover-${profileId}`)
     setMessage('')
     try {
@@ -163,7 +191,7 @@ export default function ModelSettings() {
       )
       setMessage(`已刷新模型列表: ${result.models.length} 个`)
     } catch (e) {
-      setMessage(`刷新模型失败: ${(e as Error).message}`)
+      setMessage(`刷新模型失败: ${friendlyError(e)}`)
     } finally {
       setTesting('')
     }
@@ -229,6 +257,11 @@ export default function ModelSettings() {
   const testPurpose = async (purpose: keyof ModelBindings) => {
     const binding = bindings[purpose]
     if (!binding.profile_id || !binding.model) return
+    const profile = profileById.get(binding.profile_id)
+    if (needsSavedApiKey(profile)) {
+      setMessage('当前连接没有保存 API Key，请先编辑连接档案并保存 API Key 后再测试。')
+      return
+    }
     setTesting(purpose)
     setMessage('')
     try {
@@ -244,7 +277,7 @@ export default function ModelSettings() {
         setMessage('Rerank 模型测试通过')
       }
     } catch (e) {
-      setMessage(`模型测试失败: ${(e as Error).message}`)
+      setMessage(`模型测试失败: ${friendlyError(e)}`)
     } finally {
       setTesting('')
     }

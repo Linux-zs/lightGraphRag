@@ -44,11 +44,27 @@ def _new_id(name: str, api_base: str) -> str:
 
 
 def _key_preview(api_key: str) -> str:
+    api_key = api_key.strip()
     if not api_key:
         return ""
     if len(api_key) <= 8:
         return "*" * len(api_key)
     return f"{api_key[:3]}****{api_key[-4:]}"
+
+
+def _auth_headers(api_key: str, *, json_content: bool = False) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"} if json_content else {}
+    key = (api_key or "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
+def _require_api_key(profile: dict[str, Any]) -> str:
+    key = str(profile.get("api_key") or "").strip()
+    if not key:
+        raise ValueError("当前连接档案尚未保存 API Key，请在模型设置中编辑该连接并保存 API Key")
+    return key
 
 
 def _load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -181,8 +197,8 @@ def upsert_profile(payload: dict[str, Any], config: dict[str, Any] | None = None
     else:
         store["profiles"] = [profile if item.get("id") == profile_id else item for item in store["profiles"]]
     api_key = payload.get("api_key")
-    if isinstance(api_key, str) and api_key:
-        keys[profile_id] = api_key
+    if isinstance(api_key, str) and api_key.strip():
+        keys[profile_id] = api_key.strip()
         _save_keys(keys, config)
     _save_store(store, config)
     return _public_profile(profile, keys)
@@ -260,11 +276,22 @@ def get_runtime_model_config(config: dict[str, Any] | None = None) -> dict[str, 
 
 
 async def discover_models(api_base: str, api_key: str, timeout: int = 30) -> list[dict[str, Any]]:
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.get(f"{api_base.rstrip('/')}/models", headers=headers)
-        response.raise_for_status()
-        payload = response.json()
+    normalized_base = api_base.strip().rstrip("/")
+    if not normalized_base:
+        raise ValueError("API 地址不能为空")
+    headers = _auth_headers(api_key)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(f"{normalized_base}/models", headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status == 401:
+            if not (api_key or "").strip():
+                raise ValueError("模型发现失败：该接口需要 API Key，请先填写并保存有效 API Key") from exc
+            raise ValueError("模型发现失败：接口返回 401 Unauthorized，请确认 API Key 有效且有权限访问该 API 地址") from exc
+        raise
     models = payload.get("data") if isinstance(payload, dict) else payload
     if not isinstance(models, list):
         return []
@@ -279,7 +306,7 @@ async def discover_models(api_base: str, api_key: str, timeout: int = 30) -> lis
 
 async def test_chat(profile_id: str, model: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
     profile = get_profile_with_key(profile_id, config)
-    headers = {"Authorization": f"Bearer {profile.get('api_key', '')}", "Content-Type": "application/json"}
+    headers = _auth_headers(_require_api_key(profile), json_content=True)
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": "ping"}],
@@ -295,7 +322,7 @@ async def test_chat(profile_id: str, model: str, config: dict[str, Any] | None =
 
 async def test_embedding(profile_id: str, model: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
     profile = get_profile_with_key(profile_id, config)
-    headers = {"Authorization": f"Bearer {profile.get('api_key', '')}", "Content-Type": "application/json"}
+    headers = _auth_headers(_require_api_key(profile), json_content=True)
     payload = {"model": model, "input": ["你好"], "encoding_format": "float"}
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(f"{profile['api_base'].rstrip('/')}/embeddings", headers=headers, json=payload)
@@ -307,7 +334,7 @@ async def test_embedding(profile_id: str, model: str, config: dict[str, Any] | N
 
 async def test_rerank(profile_id: str, model: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
     profile = get_profile_with_key(profile_id, config)
-    headers = {"Authorization": f"Bearer {profile.get('api_key', '')}", "Content-Type": "application/json"}
+    headers = _auth_headers(_require_api_key(profile), json_content=True)
     payload = {"model": model, "query": "新闻资讯", "documents": ["客户端读取新闻资讯", "无关内容"], "top_n": 1}
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(f"{profile['api_base'].rstrip('/')}/rerank", headers=headers, json=payload)
