@@ -65,6 +65,39 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 SESSIONS_DIR = Path("data/sessions")
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
+_SESSION_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def _safe_leaf_name(value: str, *, label: str = "File name") -> str:
+    """Validate a user-controlled name used directly below an application directory."""
+    name = str(value or "").strip()
+    if not name:
+        raise ValueError(f"{label} cannot be empty")
+    if name in {".", ".."} or "/" in name or "\\" in name or "\x00" in name:
+        raise ValueError(f"Invalid {label.lower()}")
+    if Path(name).name != name:
+        raise ValueError(f"Invalid {label.lower()}")
+    return name
+
+
+def _resolve_upload_path(file_name: str) -> Path:
+    """Resolve a direct child of UPLOAD_DIR and reject path traversal."""
+    safe_name = _safe_leaf_name(file_name)
+    upload_root = UPLOAD_DIR.resolve()
+    candidate = (upload_root / safe_name).resolve()
+    if candidate.parent != upload_root:
+        raise ValueError("Invalid file name")
+    return candidate
+
+
+def _session_path(session_id: str) -> Path:
+    """Return the JSON path for a server-generated session id."""
+    value = str(session_id or "").strip().lower()
+    if not _SESSION_ID_RE.fullmatch(value):
+        raise ValueError("Invalid session id")
+    return SESSIONS_DIR / f"{value}.json"
+
+
 DEFAULT_ANSWER_SYSTEM_PROMPT = (
     "你是通达信系统技术支持知识库助手。必须使用简体中文回答。"
     "只依据给定参考资料回答；资料不足时明确说“知识库上下文不足”。"
@@ -174,7 +207,7 @@ class ChatMessage(BaseModel):
     evidence: Optional["EvidenceChain"] = None
 
 class ChatSendRequest(BaseModel):
-    session_id: Optional[str] = None
+    session_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{12}$")
     workspace: str = DEFAULT_WORKSPACE
     message: str
     mode: str = "mix"
@@ -347,7 +380,10 @@ class ChatSessionListItem(BaseModel):
 
 def _load_session(session_id: str) -> dict | None:
     """Load a session from disk, returns None if not found."""
-    path = SESSIONS_DIR / f"{session_id}.json"
+    try:
+        path = _session_path(session_id)
+    except ValueError:
+        return None
     if not path.exists():
         return None
     try:
@@ -357,7 +393,7 @@ def _load_session(session_id: str) -> dict | None:
 
 def _save_session(session_id: str, data: dict) -> None:
     """Save a session dict to disk."""
-    path = SESSIONS_DIR / f"{session_id}.json"
+    path = _session_path(session_id)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -1179,11 +1215,20 @@ def _public_index_task(task: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in task.items() if k != "cancel_requested"}
 
 
-def _load_doc_for_index(doc_name: str) -> Document:
+def _load_doc_for_index(doc_name: str, workspace: str) -> Document:
+    doc_name = _safe_leaf_name(doc_name)
+    manifest = get_lightrag_service(workspace)._load_manifest()
+    registered = any(
+        item.get("doc_name") == doc_name
+        for item in manifest.get("documents", {}).values()
+        if isinstance(item, dict)
+    )
+    if not registered:
+        raise FileNotFoundError(f"文件未登记在当前知识库: {doc_name}")
     doc = _uploaded_files.get(doc_name)
     if doc is not None:
         return doc
-    file_path = UPLOAD_DIR / doc_name
+    file_path = _resolve_upload_path(doc_name)
     if not file_path.exists():
         raise FileNotFoundError(f"文件不存在: {doc_name}")
     doc = DocumentLoader().load_document(file_path)
@@ -1209,7 +1254,12 @@ def _workspace_doc_names_for_rebuild(workspace: str) -> list[str]:
             continue
         if Path(doc_name).suffix.lower() not in supported_exts:
             continue
-        if not (UPLOAD_DIR / doc_name).exists():
+        try:
+            source_path = _resolve_upload_path(doc_name)
+        except ValueError:
+            logger.warning("Skipping rebuild source with invalid file name: {}", doc_name)
+            continue
+        if not source_path.exists():
             logger.warning("Skipping rebuild source missing from upload dir: {}", doc_name)
             continue
         seen.add(doc_name)
@@ -1249,7 +1299,7 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                         current_doc_started_at=_task_now(),
                         message=f"正在解析: {doc_name}",
                     )
-                    doc = _load_doc_for_index(doc_name)
+                    doc = _load_doc_for_index(doc_name, workspace)
                     service.mark_document_status(doc, status="processing", indexed=False)
 
                     if not doc.raw_text.strip():
@@ -1389,14 +1439,18 @@ async def upload_document(file: UploadFile = File(...), workspace: str = Query(D
     if not file.filename:
         raise HTTPException(400, "No filename provided")
 
-    ext = Path(file.filename).suffix.lower()
+    upload_name = str(file.filename).replace("\\", "/").rsplit("/", 1)[-1]
+    try:
+        safe_name = _safe_leaf_name(upload_name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    ext = Path(safe_name).suffix.lower()
     loader = DocumentLoader()
     if ext not in loader._ext_to_parser:
         raise HTTPException(400, f"Unsupported file type: {ext}")
 
     # Save to upload dir
-    safe_name = Path(file.filename).name
-    dest = UPLOAD_DIR / safe_name
+    dest = _resolve_upload_path(safe_name)
     content = await file.read()
     dest.write_bytes(content)
 
@@ -1420,6 +1474,10 @@ async def upload_document(file: UploadFile = File(...), workspace: str = Query(D
 @app.post("/api/kb/preview-chunks", response_model=list[ChunkPreviewItem])
 async def preview_chunks(req: ChunkPreviewRequest):
     """Preview chunking results without indexing."""
+    try:
+        req.file_name = _safe_leaf_name(req.file_name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     doc = _uploaded_files.get(req.file_name)
     if doc is None:
         raise HTTPException(404, f"File '{req.file_name}' not uploaded yet")
@@ -1445,10 +1503,21 @@ async def preview_chunks(req: ChunkPreviewRequest):
 @app.post("/api/kb/index")
 async def index_document(req: IndexRequest):
     """Create a background task to index a document into LightRAG."""
-    if req.file_name not in _uploaded_files and not (UPLOAD_DIR / req.file_name).exists():
+    try:
+        req.file_name = _safe_leaf_name(req.file_name)
+        file_path = _resolve_upload_path(req.file_name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    req.workspace = sanitize_workspace(req.workspace)
+    manifest = get_lightrag_service(req.workspace)._load_manifest()
+    registered = any(
+        item.get("doc_name") == req.file_name
+        for item in manifest.get("documents", {}).values()
+        if isinstance(item, dict)
+    )
+    if not registered or (req.file_name not in _uploaded_files and not file_path.exists()):
         raise HTTPException(404, f"File '{req.file_name}' not uploaded yet")
 
-    req.workspace = sanitize_workspace(req.workspace)
     task = await _create_index_task("single", [req.file_name], req.workspace)
     asyncio.create_task(_run_index_task(task["task_id"], req))
     return _public_index_task(task)
@@ -1545,6 +1614,10 @@ async def batch_index(req: BatchIndexRequest):
     """Create a background task to index multiple uploaded documents."""
     if not req.doc_names:
         raise HTTPException(400, "No documents selected")
+    try:
+        req.doc_names = [_safe_leaf_name(name) for name in req.doc_names]
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     req.workspace = sanitize_workspace(req.workspace)
     task = await _create_index_task("batch", list(req.doc_names), req.workspace)
     asyncio.create_task(_run_index_task(task["task_id"], req))
@@ -1648,6 +1721,10 @@ async def cancel_index_task(task_id: str):
 @app.get("/api/kb/documents/{doc_name}/raw-text")
 async def get_document_raw_text(doc_name: str):
     """Get the raw parsed text of a document (for preview/editing before chunking)."""
+    try:
+        doc_name = _safe_leaf_name(doc_name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     # 1) Check in-memory cache (freshly uploaded)
     doc = _uploaded_files.get(doc_name)
     if doc is not None:
@@ -1660,7 +1737,7 @@ async def get_document_raw_text(doc_name: str):
         }
 
     # 2) Check if indexed — re-parse from disk
-    file_path = UPLOAD_DIR / doc_name
+    file_path = _resolve_upload_path(doc_name)
     if file_path.exists():
         try:
             loader = DocumentLoader()
@@ -1682,6 +1759,10 @@ async def get_document_raw_text(doc_name: str):
 @app.put("/api/kb/documents/{doc_name}/raw-text")
 async def update_document_raw_text(doc_name: str, req: RawTextUpdateRequest):
     """Update the raw text of a cached document (user-edited before chunking)."""
+    try:
+        doc_name = _safe_leaf_name(doc_name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     doc = _uploaded_files.get(doc_name)
     if doc is None:
         raise HTTPException(404, f"Document '{doc_name}' not in cache — upload it first")
@@ -1698,6 +1779,10 @@ async def update_document_raw_text(doc_name: str, req: RawTextUpdateRequest):
 @app.get("/api/kb/documents/{doc_name}/chunks")
 async def get_document_chunks(doc_name: str, workspace: str = Query(DEFAULT_WORKSPACE)):
     """Return indexed LightRAG chunks, falling back to local raw-text chunks on failure."""
+    try:
+        doc_name = _safe_leaf_name(doc_name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     service = get_lightrag_service(workspace)
     chunks = await service.get_document_chunks(doc_name)
     if chunks:
@@ -1710,7 +1795,10 @@ async def get_document_chunks(doc_name: str, workspace: str = Query(DEFAULT_WORK
 
     file_path = Path(item.get("file_path") or "")
     if not file_path.exists():
-        file_path = UPLOAD_DIR / item.get("doc_name", doc_name)
+        try:
+            file_path = _resolve_upload_path(item.get("doc_name", doc_name))
+        except ValueError:
+            return {"doc_name": item.get("doc_name", doc_name), "total": 0, "chunks": []}
     if not file_path.exists():
         return {"doc_name": item.get("doc_name", doc_name), "total": 0, "chunks": []}
 
@@ -2225,6 +2313,8 @@ async def list_chat_sessions():
 @app.get("/api/chat/sessions/{session_id}", response_model=ChatSession)
 async def get_chat_session(session_id: str):
     """Get a single chat session with full messages."""
+    if not _SESSION_ID_RE.fullmatch(session_id.lower()):
+        raise HTTPException(400, "Invalid session id")
     s = _load_session(session_id)
     if not s:
         raise HTTPException(404, "Session not found")
@@ -2240,7 +2330,10 @@ async def get_chat_session(session_id: str):
 @app.delete("/api/chat/sessions/{session_id}")
 async def delete_chat_session(session_id: str):
     """Delete a chat session."""
-    path = SESSIONS_DIR / f"{session_id}.json"
+    try:
+        path = _session_path(session_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     if path.exists():
         path.unlink()
         logger.info(f"Deleted chat session: {session_id}")
