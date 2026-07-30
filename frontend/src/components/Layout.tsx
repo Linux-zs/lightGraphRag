@@ -23,6 +23,7 @@ interface Props {
   workspaces: WorkspaceInfo[]
   onWorkspaceChange: (workspace: string) => void
   onCreateWorkspace: (name: string) => Promise<void>
+  onDeleteWorkspace: (workspace: string) => void
   chatSessions: ChatSessionListItem[]
   activeChatId: string | null
   onNewChat: () => void
@@ -65,6 +66,7 @@ export default function Layout({
   workspaces,
   onWorkspaceChange,
   onCreateWorkspace,
+  onDeleteWorkspace,
   chatSessions,
   activeChatId,
   onNewChat,
@@ -156,6 +158,7 @@ export default function Layout({
             onChange={onWorkspaceChange}
             onManage={() => onNavigate('kb')}
             onCreate={openCreateDialog}
+            onDelete={onDeleteWorkspace}
           />
         </div>
 

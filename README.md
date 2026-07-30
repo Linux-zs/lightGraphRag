@@ -111,9 +111,32 @@ uv run lightgraphrag rebuild --workspace my_kb --docs-dir D:\docs
 config/default.yaml
 ```
 
+机器本地覆盖配置：
+
+```text
+config/local.yaml
+```
+
+加载顺序为：
+
+```text
+config/default.yaml -> config/local.yaml -> 环境变量
+```
+
+`config/local.yaml` 不进入版本控制，适合保存本机文档目录和本地模型地址。例如：
+
+```yaml
+paths:
+  docs_dir: D:/local/docs
+ollama:
+  host: http://127.0.0.1:11434
+```
+
 常用环境变量：
 
 ```powershell
+$env:TDX_CONFIG_PATH="D:\path\custom.yaml"
+$env:TDX_CONFIG_LOCAL_PATH="D:\path\local.yaml"
 $env:TDX_DOCS_DIR="D:\docs"
 $env:TDX_DATA_DIR="./data"
 $env:TDX_UPLOAD_DIR="data/uploads"
@@ -177,6 +200,7 @@ data/
 /api/models/config         当前知识库问答提示词
 /api/prompt-templates      提示词模板
 /api/system/stats          系统状态
+/api/system/logs           运行日志
 /api/health                健康检查
 ```
 
@@ -209,6 +233,8 @@ npm audit --omit=dev --audit-level=high
 ### 1. 上传成功但问答没有内容
 
 先确认文档状态是否已经完成索引。`uploaded` 只表示文件已保存和解析，不能直接用于 LightRAG 问答；成功索引后才会进入召回和问答。
+
+如果不确定索引是否卡住，进入“系统状态”查看最近索引任务和运行日志。
 
 ### 2. 更换嵌入模型后检索失败
 

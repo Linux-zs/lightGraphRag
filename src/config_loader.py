@@ -15,6 +15,7 @@ from src.exceptions import ConfigError
 load_dotenv()
 
 _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "default.yaml"
+_LOCAL_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "local.yaml"
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -60,10 +61,14 @@ def load_yaml(path: Path) -> dict:
 
 
 def load_config(config_path: Path | None = None) -> dict:
-    """Load and merge configuration: YAML → defaults → env overrides.
+    """Load and merge configuration: YAML → local override → env overrides.
 
     Args:
         config_path: Optional custom config path. Defaults to config/default.yaml.
+            When using the default config, config/local.yaml is loaded as a
+            machine-local override if it exists. TDX_CONFIG_PATH can replace
+            the main config path, and TDX_CONFIG_LOCAL_PATH can replace the
+            local override path.
 
     Returns:
         Merged configuration dictionary.
@@ -71,8 +76,14 @@ def load_config(config_path: Path | None = None) -> dict:
     Raises:
         ConfigError: If config file cannot be loaded.
     """
-    path = config_path or _DEFAULT_CONFIG_PATH
+    env_config_path = os.environ.get("TDX_CONFIG_PATH")
+    path = Path(env_config_path) if env_config_path else (config_path or _DEFAULT_CONFIG_PATH)
     config = load_yaml(path)
+    default_path = _DEFAULT_CONFIG_PATH.resolve()
+    if path.resolve() == default_path:
+        local_path = Path(os.environ.get("TDX_CONFIG_LOCAL_PATH", _LOCAL_CONFIG_PATH))
+        if local_path.exists():
+            config = _deep_merge(config, load_yaml(local_path))
     config = _apply_env_overrides(config)
     # Ensure data_dir derived paths
     data_dir = config.get("paths", {}).get("data_dir", "./data")

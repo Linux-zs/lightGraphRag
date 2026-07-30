@@ -594,6 +594,32 @@ export function getSystemStats(workspace = 'tdx_default') {
   return request<SystemStats>(`/system/stats?workspace=${encodeURIComponent(workspace)}`)
 }
 
+export interface SystemLogItem {
+  line_no: number
+  level: string
+  text: string
+}
+
+export interface SystemLogsResponse {
+  path: string
+  exists: boolean
+  total_matched: number
+  items: SystemLogItem[]
+}
+
+export function getSystemLogs(params: {
+  limit?: number
+  level?: string
+  contains?: string
+} = {}) {
+  const query = new URLSearchParams()
+  if (params.limit) query.set('limit', String(params.limit))
+  if (params.level) query.set('level', params.level)
+  if (params.contains) query.set('contains', params.contains)
+  const suffix = query.toString() ? `?${query}` : ''
+  return request<SystemLogsResponse>(`/system/logs${suffix}`)
+}
+
 export interface ClearKnowledgeBaseResult {
   workspace: string
   workspace_path: string

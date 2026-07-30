@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { FileText, GitBranch, Layers3, Network } from 'lucide-react'
+import { FileText, GitBranch, Layers3, ListChecks, Network, RefreshCw, ScrollText } from 'lucide-react'
 import { useConfirm } from '../components/ConfirmDialog'
 import {
   clearKnowledgeBase,
   getIndexTask,
+  getSystemLogs,
   getSystemStats,
   listIndexTasks,
   rebuildIndex,
   IndexTask,
+  SystemLogItem,
   SystemStats,
 } from '../api'
 
@@ -24,6 +26,12 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
   const [opMsg, setOpMsg] = useState('')
   const [operating, setOperating] = useState(false)
   const [rebuildTask, setRebuildTask] = useState<IndexTask | null>(null)
+  const [recentTasks, setRecentTasks] = useState<IndexTask[]>([])
+  const [logs, setLogs] = useState<SystemLogItem[]>([])
+  const [logLevel, setLogLevel] = useState('')
+  const [logContains, setLogContains] = useState('')
+  const [logMsg, setLogMsg] = useState('')
+  const [logsLoading, setLogsLoading] = useState(false)
   const pollingTaskIdRef = useRef<string | null>(null)
   const mountedRef = useRef(true)
 
@@ -31,6 +39,7 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
     mountedRef.current = true
     loadStats()
     restoreRebuildTask()
+    loadObservability()
     return () => {
       mountedRef.current = false
       pollingTaskIdRef.current = null
@@ -72,6 +81,40 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
     }
   }
 
+  const formatTaskKind = (kind: IndexTask['kind']) => {
+    if (kind === 'single') return '单文档索引'
+    if (kind === 'batch') return '批量索引'
+    return '重建索引'
+  }
+
+  const loadObservability = useCallback(async () => {
+    setLogsLoading(true)
+    setLogMsg('')
+    try {
+      const [tasks, logData] = await Promise.all([
+        listIndexTasks(),
+        getSystemLogs({
+          limit: 200,
+          level: logLevel,
+          contains: logContains.trim(),
+        }),
+      ])
+      if (!mountedRef.current) return
+      setRecentTasks(tasks.filter((task) => task.workspace === workspace).slice(0, 8))
+      setLogs(logData.items)
+      setLogMsg(
+        logData.exists
+          ? `匹配 ${logData.total_matched} 行，显示最近 ${logData.items.length} 行`
+          : '日志文件尚未生成',
+      )
+    } catch (e: unknown) {
+      if (!mountedRef.current) return
+      setLogMsg(`加载日志失败: ${(e as Error).message}`)
+    } finally {
+      if (mountedRef.current) setLogsLoading(false)
+    }
+  }, [logContains, logLevel, workspace])
+
   const pollTask = useCallback(async (taskId: string) => {
     if (pollingTaskIdRef.current === taskId) return
     pollingTaskIdRef.current = taskId
@@ -89,12 +132,14 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
     setOperating(false)
     setOpMsg(task.message)
     await loadStats()
-  }, [loadStats])
+    await loadObservability()
+  }, [loadObservability, loadStats])
 
   const restoreRebuildTask = useCallback(async () => {
     try {
       const tasks = await listIndexTasks()
       if (!mountedRef.current) return
+      setRecentTasks(tasks.filter((item) => item.workspace === workspace).slice(0, 8))
       const task = tasks.find((item) => item.workspace === workspace && item.kind === 'rebuild')
       if (!task) {
         setRebuildTask(null)
@@ -131,6 +176,7 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
       setOpMsg(`已清空索引: ${result.workspace}`)
       await onWorkspaceChanged?.()
       await loadStats()
+      await loadObservability()
     } catch (e: unknown) {
       setOpMsg(`清空失败: ${(e as Error).message}`)
     } finally {
@@ -325,8 +371,153 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
         )}
       </div>
 
+      <div className="rounded-lg border border-gray-200 bg-white p-6">
+        <div className="mb-4 flex items-start justify-between gap-4">
+          <div>
+            <h3 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-gray-600">
+              <ListChecks size={16} />
+              最近索引任务
+            </h3>
+            <p className="mt-1 text-sm text-gray-500">显示当前知识库最近 8 条索引、批量索引和重建任务。</p>
+          </div>
+          <button
+            onClick={loadObservability}
+            className="ui-button-secondary inline-flex items-center gap-2"
+          >
+            <RefreshCw size={14} />
+            刷新
+          </button>
+        </div>
+        {recentTasks.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-gray-200 p-8 text-center text-sm text-gray-400">
+            当前知识库暂无索引任务记录
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {recentTasks.map((task) => (
+              <div key={task.task_id} className="rounded-lg border border-gray-200 p-3">
+                <div className="flex flex-wrap items-center gap-2 text-sm">
+                  <span className="font-medium text-gray-900">{formatTaskKind(task.kind)}</span>
+                  <span className="font-mono text-xs text-gray-400">{task.task_id}</span>
+                  <span className={`rounded px-2 py-0.5 text-xs ${
+                    taskTone(task) === 'red'
+                      ? 'bg-red-50 text-red-700'
+                      : taskTone(task) === 'green'
+                        ? 'bg-green-50 text-green-700'
+                        : taskTone(task) === 'gray'
+                          ? 'bg-gray-100 text-gray-600'
+                          : 'bg-primary-50 text-primary-700'
+                  }`}>
+                    {task.status}
+                  </span>
+                  <span className="ml-auto text-xs text-gray-400">{formatTaskTime(task.updated_at)}</span>
+                </div>
+                <div className="mt-2 text-xs text-gray-500">
+                  {task.message}，进度 {task.current}/{task.total}
+                  {task.current_doc && `，当前文档 ${task.current_doc}`}
+                </div>
+                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-gray-100">
+                  <div
+                    className={`h-full ${
+                      taskTone(task) === 'red'
+                        ? 'bg-red-500'
+                        : taskTone(task) === 'green'
+                          ? 'bg-green-500'
+                          : 'bg-primary-500'
+                    }`}
+                    style={{ width: `${Math.max(2, task.progress)}%` }}
+                  />
+                </div>
+                {task.errors.length > 0 && (
+                  <div className="mt-2 space-y-1 rounded-md bg-red-50 p-2">
+                    {task.errors.slice(0, 4).map((err) => (
+                      <div key={`${task.task_id}-${err.doc_name}-${err.error}`} className="text-xs text-red-700">
+                        {err.doc_name || '任务'}: {err.error}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="rounded-lg border border-gray-200 bg-white p-6">
+        <div className="mb-4 flex items-start justify-between gap-4">
+          <div>
+            <h3 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-gray-600">
+              <ScrollText size={16} />
+              运行日志
+            </h3>
+            <p className="mt-1 text-sm text-gray-500">查看索引、模型测试、答案质量检查和异常日志。</p>
+          </div>
+          <button
+            onClick={loadObservability}
+            disabled={logsLoading}
+            className="ui-button-secondary inline-flex items-center gap-2 disabled:opacity-50"
+          >
+            <RefreshCw size={14} className={logsLoading ? 'animate-spin' : ''} />
+            刷新日志
+          </button>
+        </div>
+        <div className="grid gap-3 border-b border-gray-100 pb-4 md:grid-cols-[160px_minmax(0,1fr)]">
+          <label className="block">
+            <span className="ui-label">级别</span>
+            <select value={logLevel} onChange={(event) => setLogLevel(event.target.value)} className="ui-control w-full">
+              <option value="">全部</option>
+              <option value="INFO">INFO</option>
+              <option value="WARNING">WARNING</option>
+              <option value="ERROR">ERROR</option>
+              <option value="CRITICAL">CRITICAL</option>
+            </select>
+          </label>
+          <label className="block">
+            <span className="ui-label">关键词</span>
+            <input
+              value={logContains}
+              onChange={(event) => setLogContains(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') void loadObservability()
+              }}
+              className="ui-control w-full"
+              placeholder="例如 answer_quality_check、model、索引失败"
+            />
+          </label>
+        </div>
+        {logMsg && (
+          <div className={`mt-3 text-xs ${logMsg.includes('失败') ? 'text-red-600' : 'text-gray-400'}`}>
+            {logMsg}
+          </div>
+        )}
+        <div className="mt-3 max-h-[420px] overflow-auto rounded-lg bg-gray-950 p-3 font-mono text-xs leading-relaxed text-gray-200">
+          {logs.length === 0 ? (
+            <div className="py-8 text-center text-gray-500">暂无可显示日志</div>
+          ) : (
+            logs.map((item) => (
+              <div key={`${item.line_no}-${item.text}`} className="flex gap-3 border-b border-white/5 py-1 last:border-0">
+                <span className="w-12 shrink-0 text-right text-gray-600">{item.line_no}</span>
+                <span className={`w-16 shrink-0 ${
+                  item.level === 'ERROR' || item.level === 'CRITICAL'
+                    ? 'text-red-300'
+                    : item.level === 'WARNING'
+                      ? 'text-amber-300'
+                      : 'text-emerald-300'
+                }`}>
+                  {item.level || 'LOG'}
+                </span>
+                <span className="min-w-0 whitespace-pre-wrap break-words">{item.text}</span>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
       <button
-        onClick={loadStats}
+        onClick={() => {
+          void loadStats()
+          void loadObservability()
+        }}
         className="text-xs text-primary-500 hover:text-primary-700 transition-colors"
       >
         刷新数据

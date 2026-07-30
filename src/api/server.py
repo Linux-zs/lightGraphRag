@@ -12,6 +12,7 @@ import re
 import shutil
 import tempfile
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -253,6 +254,75 @@ def _remove_workspace_sources(workspace: str) -> int:
             shutil.rmtree(resolved)
     _clear_workspace_cache(workspace)
     return removed_files
+
+
+def _unlink_owned_file(path: Path, root: Path) -> int:
+    root = root.resolve()
+    resolved = path.resolve()
+    if resolved.parent != root:
+        raise RuntimeError(f"Refusing to remove unsafe file path: {resolved}")
+    if resolved.exists():
+        resolved.unlink()
+        return 1
+    return 0
+
+
+def _remove_owned_dir(path: Path, root: Path) -> int:
+    root = root.resolve()
+    resolved = path.resolve()
+    if resolved.parent != root:
+        raise RuntimeError(f"Refusing to remove unsafe directory path: {resolved}")
+    if not resolved.exists():
+        return 0
+    count = sum(1 for child in resolved.rglob("*") if child.is_file())
+    shutil.rmtree(resolved)
+    return count
+
+
+async def _remove_workspace_metadata(workspace: str, service) -> dict[str, int]:
+    """Remove UI/runtime metadata owned by a deleted non-default workspace."""
+    workspace = sanitize_workspace(workspace)
+    removed_settings = _unlink_owned_file(
+        _workspace_settings_path(workspace),
+        WORKSPACE_SETTINGS_DIR,
+    )
+    removed_graph_config = _unlink_owned_file(
+        service.graph_governance_path,
+        service.data_dir / "graph_governance",
+    )
+    removed_graph_refs = _remove_owned_dir(
+        service.graph_reference_dir,
+        service.data_dir / "graph_governance_refs",
+    )
+
+    removed_sessions = 0
+    for path in SESSIONS_DIR.glob("*.json"):
+        if not _SESSION_ID_RE.fullmatch(path.stem.lower()):
+            continue
+        session = _load_session(path.stem)
+        if session and session.get("workspace") == workspace:
+            path.unlink(missing_ok=True)
+            removed_sessions += 1
+
+    removed_tasks = 0
+    async with _index_task_lock:
+        for task_id, task in list(_index_tasks.items()):
+            if task.get("workspace") != workspace:
+                continue
+            _index_tasks.pop(task_id, None)
+            try:
+                _index_task_path(task_id).unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Failed to delete workspace index task {}: {}", task_id, exc)
+            removed_tasks += 1
+
+    return {
+        "removed_settings": removed_settings,
+        "removed_graph_config": removed_graph_config,
+        "removed_graph_reference_files": removed_graph_refs,
+        "removed_sessions": removed_sessions,
+        "removed_index_tasks": removed_tasks,
+    }
 
 
 def _move_legacy_unassigned(source: Path, root: Path) -> Path:
@@ -827,6 +897,19 @@ class ChatSessionListItem(BaseModel):
     created_at: str
     updated_at: str
 
+
+class SystemLogItem(BaseModel):
+    line_no: int
+    level: str
+    text: str
+
+
+class SystemLogsResponse(BaseModel):
+    path: str
+    exists: bool
+    total_matched: int
+    items: list[SystemLogItem]
+
 # --- Session Persistence ---
 
 def _load_session(session_id: str) -> dict | None:
@@ -1337,6 +1420,8 @@ def _generated_answer_quality_issues(text: str) -> list[str]:
         issues.append("numeric_noise_line")
     elif len(numeric_noise_lines) >= 3:
         issues.append("multiple_numeric_noise_lines")
+    elif any(re.fullmatch(r"\d{1,3}", line) for line in numeric_noise_lines):
+        issues.append("bare_numeric_line")
 
     tokens = re.findall(r"\S+", text)
     isolated_noise = re.findall(r"(?<![\w])(?:D|z|Z|1)(?![\w])", text)
@@ -1371,7 +1456,10 @@ def _salvage_generated_answer(text: str) -> tuple[str, list[str]]:
     if not issues:
         return text, []
 
-    has_numeric_noise = any("numeric_noise" in issue for issue in issues)
+    has_numeric_noise = any(
+        "numeric_noise" in issue or issue == "bare_numeric_line"
+        for issue in issues
+    )
     cleaned_lines: list[str] = []
     for line in text.splitlines():
         stripped = line.strip()
@@ -2441,7 +2529,7 @@ async def create_workspace(req: WorkspaceCreateRequest):
 
 @app.delete("/api/kb/workspaces/{workspace}")
 async def delete_workspace(workspace: str):
-    """Delete a non-default workspace, including its index, manifest and uploaded sources."""
+    """Delete a non-default workspace and its local workspace-owned data."""
     workspace = sanitize_workspace(workspace)
     default = get_config().get("lightrag", {}).get("workspace", DEFAULT_WORKSPACE)
     if workspace == default:
@@ -2457,8 +2545,9 @@ async def delete_workspace(workspace: str):
     if service.manifest_path.exists():
         service.manifest_path.unlink()
     removed_uploads = _remove_workspace_sources(workspace)
+    metadata = await _remove_workspace_metadata(workspace, service)
     reset_lightrag_service(workspace)
-    return {"deleted": workspace, "removed_uploads": removed_uploads, **result}
+    return {"deleted": workspace, "removed_uploads": removed_uploads, **metadata, **result}
 
 
 @app.post("/api/kb/upload")
@@ -3955,7 +4044,60 @@ async def system_stats(workspace: str = Query(DEFAULT_WORKSPACE)):
     }
 
 
-# --- Health ---
+_LOG_LEVEL_RE = re.compile(r"\|\s*(TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL)\s*\|")
+
+
+def _log_level_from_line(line: str) -> str:
+    match = _LOG_LEVEL_RE.search(line)
+    return match.group(1) if match else ""
+
+
+def _read_system_log_tail(
+    *,
+    limit: int = 200,
+    level: str = "",
+    contains: str = "",
+) -> SystemLogsResponse:
+    level = level.strip().upper()
+    contains = contains.strip().lower()
+    items: deque[SystemLogItem] = deque(maxlen=limit)
+    matched = 0
+    if not APP_LOG_PATH.exists():
+        return SystemLogsResponse(
+            path=str(APP_LOG_PATH),
+            exists=False,
+            total_matched=0,
+            items=[],
+        )
+    with APP_LOG_PATH.open("r", encoding="utf-8", errors="replace") as stream:
+        for line_no, line in enumerate(stream, 1):
+            text = line.rstrip("\n")
+            line_level = _log_level_from_line(text)
+            if level and line_level != level:
+                continue
+            if contains and contains not in text.lower():
+                continue
+            matched += 1
+            items.append(SystemLogItem(line_no=line_no, level=line_level, text=text))
+    return SystemLogsResponse(
+        path=str(APP_LOG_PATH),
+        exists=True,
+        total_matched=matched,
+        items=list(items),
+    )
+
+
+@app.get("/api/system/logs", response_model=SystemLogsResponse)
+async def system_logs(
+    limit: int = Query(default=200, ge=1, le=1000),
+    level: str = Query(default="", pattern=r"^(|TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL)$"),
+    contains: str = Query(default="", max_length=200),
+):
+    """Return recent application log lines for local observability."""
+    return _read_system_log_tail(limit=limit, level=level, contains=contains)
+
+
+# --- Graph ---
 
 @app.get("/api/graph")
 async def get_graph(limit: int = Query(200, ge=1, le=1000), workspace: str = Query(DEFAULT_WORKSPACE)):

@@ -11,28 +11,34 @@ import {
   createChatSession,
   createWorkspace,
   deleteChatSession,
+  deleteWorkspace,
   listChatSessions,
   listWorkspaces,
   WorkspaceInfo,
 } from './api'
+import { useConfirm } from './components/ConfirmDialog'
 
 type Page = 'chat' | 'kb' | 'recall' | 'graph' | 'models' | 'dashboard'
 
 export default function App() {
+  const confirm = useConfirm()
   const [page, setPage] = useState<Page>('chat')
   const [workspace, setWorkspace] = useState(() => localStorage.getItem('tdx_workspace') || 'tdx_default')
   const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([])
   const [chatSessions, setChatSessions] = useState<ChatSessionListItem[]>([])
   const [activeChatId, setActiveChatId] = useState<string | null>(null)
 
-  const loadWorkspaces = async () => {
+  const loadWorkspaces = async (current = workspace) => {
     try {
       const data = await listWorkspaces()
       setWorkspaces(data)
-      if (!data.some((item) => item.workspace === workspace) && data[0]) {
+      if (!data.some((item) => item.workspace === current) && data[0]) {
         setWorkspace(data[0].workspace)
+        localStorage.setItem('tdx_workspace', data[0].workspace)
       }
+      return data
     } catch {/* ignore */}
+    return []
   }
 
   const loadChatSessions = async (targetWorkspace = workspace) => {
@@ -67,6 +73,33 @@ export default function App() {
     handleWorkspaceChange(created.workspace)
   }
 
+  const handleDeleteWorkspace = async (target: string) => {
+    const info = workspaces.find((item) => item.workspace === target)
+    if (info?.is_default) return
+    const ok = await confirm({
+      title: '删除知识库',
+      message: `将删除知识库“${target}”的上传文档、LightRAG 索引、manifest、图谱和会话入口。该操作不可撤销。`,
+      confirmLabel: '删除知识库',
+      tone: 'danger',
+    })
+    if (!ok) return
+    try {
+      await deleteWorkspace(target)
+      const nextWorkspaces = await loadWorkspaces(target)
+      if (target === workspace) {
+        const next = nextWorkspaces[0]?.workspace || 'tdx_default'
+        setWorkspace(next)
+        localStorage.setItem('tdx_workspace', next)
+        setActiveChatId(null)
+        setChatSessions([])
+        void loadChatSessions(next)
+        setPage('chat')
+      }
+    } catch (error) {
+      throw new Error((error as Error).message || '删除知识库失败')
+    }
+  }
+
   const handleNewChat = async () => {
     try {
       const created = await createChatSession(workspace)
@@ -99,6 +132,7 @@ export default function App() {
       workspaces={workspaces}
       onWorkspaceChange={handleWorkspaceChange}
       onCreateWorkspace={handleCreateWorkspace}
+      onDeleteWorkspace={handleDeleteWorkspace}
       chatSessions={chatSessions}
       activeChatId={activeChatId}
       onNewChat={handleNewChat}

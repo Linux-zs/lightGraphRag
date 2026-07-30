@@ -38,7 +38,7 @@ ollama:
   timeout: 60
 paths:
   data_dir: ./data
-  docs_dir: D:/codes/workbuddy/6月培训/
+  docs_dir: ./docs
   lightrag_dir: ./data/lightrag
   lightrag_manifest: ./data/lightrag_manifest.json
   log_dir: ./data/logs

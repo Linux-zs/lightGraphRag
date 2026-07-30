@@ -6,6 +6,7 @@ import {
   Plus,
   Search,
   Settings2,
+  Trash2,
 } from 'lucide-react'
 import type { WorkspaceInfo } from '../api'
 
@@ -15,6 +16,7 @@ interface Props {
   onChange: (workspace: string) => void
   onManage?: () => void
   onCreate?: () => void
+  onDelete?: (workspace: string) => Promise<void> | void
   placement?: 'bottom' | 'top'
   compact?: boolean
   className?: string
@@ -26,12 +28,14 @@ export default function WorkspaceSwitcher({
   onChange,
   onManage,
   onCreate,
+  onDelete,
   placement = 'bottom',
   compact = false,
   className = '',
 }: Props) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
+  const [actionError, setActionError] = useState('')
   const rootRef = useRef<HTMLDivElement>(null)
   const menuId = useId()
 
@@ -55,11 +59,14 @@ export default function WorkspaceSwitcher({
     if (!keyword) return workspaces
     return workspaces.filter((item) => item.workspace.toLowerCase().includes(keyword))
   }, [query, workspaces])
+  const currentWorkspace = workspaces.find((item) => item.workspace === workspace)
+  const canDeleteCurrent = Boolean(onDelete && currentWorkspace && !currentWorkspace.is_default)
 
   const selectWorkspace = (next: string) => {
     onChange(next)
     setOpen(false)
     setQuery('')
+    setActionError('')
   }
 
   return (
@@ -136,8 +143,8 @@ export default function WorkspaceSwitcher({
             )}
           </div>
 
-          {(onManage || onCreate) && (
-            <div className="grid grid-cols-2 gap-1 border-t border-gray-100 p-1.5">
+          {(onManage || onCreate || onDelete) && (
+            <div className="flex flex-wrap gap-1 border-t border-gray-100 p-1.5">
               {onManage && (
                 <button
                   type="button"
@@ -145,7 +152,7 @@ export default function WorkspaceSwitcher({
                     setOpen(false)
                     onManage()
                   }}
-                  className="flex h-8 items-center justify-center gap-1.5 rounded-md text-xs text-gray-600 hover:bg-gray-100 hover:text-gray-900"
+                  className="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-xs text-gray-600 hover:bg-gray-100 hover:text-gray-900"
                 >
                   <Settings2 size={14} />
                   管理知识库
@@ -158,11 +165,37 @@ export default function WorkspaceSwitcher({
                     setOpen(false)
                     onCreate()
                   }}
-                  className="flex h-8 items-center justify-center gap-1.5 rounded-md text-xs text-gray-600 hover:bg-gray-100 hover:text-gray-900"
+                  className="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-xs text-gray-600 hover:bg-gray-100 hover:text-gray-900"
                 >
                   <Plus size={14} />
                   新建知识库
                 </button>
+              )}
+              {onDelete && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!canDeleteCurrent) return
+                    setActionError('')
+                    try {
+                      await onDelete(workspace)
+                      setOpen(false)
+                    } catch (error) {
+                      setActionError((error as Error).message || '删除知识库失败')
+                    }
+                  }}
+                  disabled={!canDeleteCurrent}
+                  title={currentWorkspace?.is_default ? '默认知识库不能删除' : '删除当前知识库'}
+                  className="flex h-8 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-xs text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:text-gray-300 disabled:hover:bg-transparent"
+                >
+                  <Trash2 size={14} />
+                  删除
+                </button>
+              )}
+              {actionError && (
+                <div className="basis-full rounded-md bg-red-50 px-2 py-1.5 text-xs text-red-600">
+                  {actionError}
+                </div>
               )}
             </div>
           )}

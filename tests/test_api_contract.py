@@ -78,3 +78,33 @@ def test_recall_returns_conflict_for_incompatible_embedding(monkeypatch):
 
     assert response.status_code == 409
     assert "重建索引" in response.json()["detail"]
+
+
+def test_system_logs_returns_filtered_tail(tmp_path, monkeypatch):
+    log_path = tmp_path / "app.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "2026-01-01 00:00:00 | INFO | startup ok",
+                "2026-01-01 00:00:01 | WARNING | answer_quality_check action=retry",
+                "2026-01-01 00:00:02 | ERROR | model failed",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server, "APP_LOG_PATH", log_path)
+
+    response = asyncio.run(
+        _request(
+            "GET",
+            "/api/system/logs",
+            params={"level": "WARNING", "contains": "answer_quality", "limit": 10},
+        )
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["exists"] is True
+    assert body["total_matched"] == 1
+    assert body["items"][0]["level"] == "WARNING"
+    assert "answer_quality_check" in body["items"][0]["text"]

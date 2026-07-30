@@ -111,3 +111,62 @@ def test_chat_sessions_are_filtered_and_rejected_across_workspaces(tmp_path, mon
 
     with pytest.raises(ValueError, match="different workspace"):
         server._ensure_session(created_a["id"], "question", "workspace_b")
+
+
+def test_workspace_metadata_cleanup_removes_only_target_workspace(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    sessions_dir = data_dir / "sessions"
+    settings_dir = data_dir / "workspace_settings"
+    index_tasks_dir = data_dir / "index_tasks"
+    sessions_dir.mkdir(parents=True)
+    settings_dir.mkdir(parents=True)
+    index_tasks_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(server, "SESSIONS_DIR", sessions_dir)
+    monkeypatch.setattr(server, "WORKSPACE_SETTINGS_DIR", settings_dir)
+    monkeypatch.setattr(server, "INDEX_TASKS_DIR", index_tasks_dir)
+    monkeypatch.setattr(server, "_session_locks", {})
+
+    service = LightRAGService(
+        config={
+            "paths": {
+                "data_dir": str(data_dir),
+                "lightrag_dir": str(data_dir / "lightrag"),
+            },
+            "lightrag": {"workspace": "tdx_default"},
+        },
+        workspace="workspace_a",
+    )
+
+    server._save_workspace_settings("workspace_a", {"answer_system_prompt": "A"})
+    server._save_workspace_settings("workspace_b", {"answer_system_prompt": "B"})
+    created_a = asyncio.run(server.create_chat_session(server.ChatSessionCreateRequest(workspace="workspace_a")))
+    created_b = asyncio.run(server.create_chat_session(server.ChatSessionCreateRequest(workspace="workspace_b")))
+    service.graph_governance_path.parent.mkdir(parents=True, exist_ok=True)
+    service.graph_governance_path.write_text("{}", encoding="utf-8")
+    service.graph_reference_dir.mkdir(parents=True, exist_ok=True)
+    (service.graph_reference_dir / "ref.txt").write_text("ref", encoding="utf-8")
+    task_path = index_tasks_dir / "abc123abc123.json"
+    task_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        server,
+        "_index_tasks",
+        {
+            "abc123abc123": {"task_id": "abc123abc123", "workspace": "workspace_a"},
+            "def456def456": {"task_id": "def456def456", "workspace": "workspace_b"},
+        },
+    )
+
+    result = asyncio.run(server._remove_workspace_metadata("workspace_a", service))
+
+    assert result["removed_settings"] == 1
+    assert result["removed_graph_config"] == 1
+    assert result["removed_graph_reference_files"] == 1
+    assert result["removed_sessions"] == 1
+    assert result["removed_index_tasks"] == 1
+    assert not server._workspace_settings_path("workspace_a").exists()
+    assert server._workspace_settings_path("workspace_b").exists()
+    assert not server._session_path(created_a["id"]).exists()
+    assert server._session_path(created_b["id"]).exists()
+    assert "abc123abc123" not in server._index_tasks
+    assert "def456def456" in server._index_tasks
