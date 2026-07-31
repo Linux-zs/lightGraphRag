@@ -508,6 +508,13 @@ export default function KBManagement({ workspace }: Props) {
     const fail = task.errors.length
     const currentElapsed = formatDuration(task.current_doc_started_at)
     const updatedClock = formatClock(task.updated_at)
+    const stageTimings = task.stage_timings
+    const STAGE_CARDS: { key: keyof NonNullable<IndexTask['stage_timings']>; label: string }[] = [
+      { key: 'parse', label: '解析' },
+      { key: 'chunk_vector', label: 'Chunk向量' },
+      { key: 'kg', label: 'KG抽取' },
+      { key: 'merge', label: '图谱merge' },
+    ]
 
     return (
       <div className={`mt-3 rounded-lg border p-3 text-sm ${
@@ -553,6 +560,24 @@ export default function KBManagement({ workspace }: Props) {
             style={{ width: `${Math.max(2, task.progress)}%` }}
           />
         </div>
+        {stageTimings && (
+          <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {STAGE_CARDS.map(({ key, label }) => {
+              const v = stageTimings[key]
+              return (
+                <div
+                  key={key}
+                  className="rounded-md border border-gray-200 bg-white px-2.5 py-2"
+                >
+                  <div className="text-[11px] text-gray-400">{label}</div>
+                  <div className="text-sm font-semibold text-gray-800">
+                    {typeof v === 'number' ? `${v.toFixed(1)}s` : '—'}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
         {task.errors.length > 0 && (
           <div className="mt-2 space-y-1">
             {task.errors.slice(0, 3).map((err) => (

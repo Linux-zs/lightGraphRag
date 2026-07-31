@@ -24,6 +24,7 @@ from loguru import logger
 
 from src.config_loader import get_config
 from src.doc_processor.parsers.base_parser import Document
+from src.lightrag_stage_timing import install_stage_timing
 from src.model_profiles import get_runtime_model_config
 
 
@@ -67,6 +68,25 @@ GRAPH_CATEGORY_MAP = {
     "component": "核心系统",
     "process": "传输",
 }
+
+_EMBED_TOKENIZER = None
+
+
+def _get_embed_tokenizer():
+    """Lazily load a tiktoken encoding for embedding token truncation.
+
+    Returns ``None`` if tiktoken is unavailable or the encoding cannot be loaded,
+    in which case the caller falls back to the character cap.
+    """
+    global _EMBED_TOKENIZER
+    if _EMBED_TOKENIZER is None:
+        try:
+            import tiktoken
+
+            _EMBED_TOKENIZER = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            _EMBED_TOKENIZER = False
+    return _EMBED_TOKENIZER or None
 
 TDX_GRAPH_RULE_TEMPLATE = {
     "id": "tdx_ops",
@@ -209,6 +229,7 @@ class LightRAGService:
             self.manifest_path = data_dir / "lightrag_manifests" / f"{self.workspace}.json"
         self._rag: LightRAG | None = None
         self._init_lock = asyncio.Lock()
+        self._last_stage_timings: dict[str, float] = {}
 
     @property
     def rag(self) -> LightRAG:
@@ -325,6 +346,7 @@ class LightRAGService:
             if self._rag is None:
                 self.working_dir.mkdir(parents=True, exist_ok=True)
                 self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                lightrag_cfg = self.config.get("lightrag", {})
                 self._rag = LightRAG(
                     working_dir=str(self.working_dir),
                     workspace=self.workspace,
@@ -334,9 +356,9 @@ class LightRAGService:
                     llm_model_func=self._make_llm_func(),
                     llm_model_name=self._runtime_models()["chat"]["model"],
                     llm_model_kwargs=self._llm_kwargs(),
-                    entity_extraction_use_json=self.config.get("lightrag", {}).get(
-                        "entity_extraction_use_json", True
-                    ),
+                    entity_extraction_use_json=lightrag_cfg.get("entity_extraction_use_json", True),
+                    entity_extract_max_gleaning=lightrag_cfg.get("entity_extract_max_gleaning", 1),
+                    llm_model_max_async=lightrag_cfg.get("llm_model_max_async", 4),
                     rerank_model_func=self._make_rerank_func(),
                     addon_params={
                         "language": "Chinese",
@@ -367,16 +389,20 @@ class LightRAGService:
         embed_model = embed["model"]
         embed_dim = int(embed["embed_dim"])
         embed_max_chars = int(embed["embed_max_chars"])
+        embed_max_tokens = int(embed.get("embed_max_tokens") or 0)
         base_url = embed["base_url"]
         api_key = embed["api_key"]
 
         @wrap_embedding_func_with_attrs(
             embedding_dim=embed_dim,
-            max_token_size=512,
+            max_token_size=480,
             model_name=embed_model,
         )
         async def siliconflow_embed(texts: list[str]):
-            safe_texts = [self._prepare_embedding_text(text, embed_max_chars) for text in texts]
+            safe_texts = [
+                self._prepare_embedding_text(text, embed_max_chars, embed_max_tokens)
+                for text in texts
+            ]
             return await openai_embed.func(
                 safe_texts,
                 model=embed_model,
@@ -386,24 +412,72 @@ class LightRAGService:
 
         return siliconflow_embed
 
-    def _prepare_embedding_text(self, text: str, max_chars: int) -> str:
+    def _prepare_embedding_text(
+        self,
+        text: str,
+        max_chars: int,
+        max_tokens: int | None = None,
+    ) -> str:
+        """Normalize and truncate text before embedding.
+
+        Truncates by tokens first (when a tokenizer is available) because the
+        embedding model has a hard *token* limit, not a character limit. A
+        character-based cap alone is unsafe for Chinese text, where each character
+        can map to ~1 token: e.g. SiliconFlow's ``BAAI/bge-large-zh-v1.5`` rejects
+        inputs above 512 tokens, so a 700-character Chinese chunk is refused with
+        HTTP 400 / error code 20015 ("The parameter is invalid"), which aborts the
+        whole indexing flush. The character cap stays as a cheap fallback when no
+        tokenizer can be loaded.
+        """
         safe = CONTROL_CHARS_RE.sub(" ", text or "")
         safe = safe.strip()
         if not safe:
             safe = " "
+        if max_tokens and max_tokens > 0:
+            try:
+                enc = _get_embed_tokenizer()
+                if enc is not None:
+                    ids = enc.encode(safe)
+                    if len(ids) > max_tokens:
+                        safe = enc.decode(ids[:max_tokens]).strip()
+            except Exception:
+                logger.debug("Token-based embedding truncation unavailable; using char cap")
         if len(safe) > max_chars:
             safe = safe[:max_chars]
         return safe
 
+    @staticmethod
+    def _thinking_extra_body(model: str) -> dict[str, Any]:
+        """Disable hidden chain-of-thought for hybrid thinking models.
+
+        Models like Qwen3-8B / GLM-4.5 / DeepSeek-V3.1 default to thinking mode
+        on SiliconFlow, which makes each entity-extraction call take 60-300s and
+        often yields empty JSON. `enable_thinking: false` turns it off.
+        Pure instruct/coder variants do not accept this parameter, so skip them.
+        """
+        m = (model or "").lower()
+        if "instruct" in m or "coder" in m:
+            return {}
+        hybrid_markers = ("qwen3", "glm-4.5", "glm-4.6", "glm-5", "deepseek-v3.1", "deepseek-v3.2", "hunyuan-a13b")
+        if any(marker in m for marker in hybrid_markers):
+            return {"enable_thinking": False}
+        return {}
+
     def _llm_kwargs(self) -> dict[str, Any]:
         chat = self._runtime_models()["chat"]
-        return {
+        kwargs: dict[str, Any] = {
             "temperature": chat.get("temperature", self.config.get("llm", {}).get("temperature", 0.7)),
             "top_p": chat.get("top_p", self.config.get("llm", {}).get("top_p", 0.9)),
             "max_tokens": chat.get("max_tokens", self.config.get("llm", {}).get("max_tokens", 4096)),
             "frequency_penalty": chat.get("frequency_penalty", 0.3),
             "presence_penalty": chat.get("presence_penalty", 0.2),
         }
+        disable_thinking = bool(self.config.get("lightrag", {}).get("disable_thinking", True))
+        if disable_thinking:
+            extra_body = self._thinking_extra_body(chat.get("model", ""))
+            if extra_body:
+                kwargs["extra_body"] = extra_body
+        return kwargs
 
     def _make_llm_func(self):
         chat = self._runtime_models()["chat"]
@@ -1012,7 +1086,12 @@ class LightRAGService:
                         f"Existing LightRAG document could not be removed before re-index: {message}"
                     )
                 logger.info("Removed existing LightRAG doc before re-index: {}", doc_id)
-            result = await rag.ainsert(doc.raw_text, ids=[doc_id], file_paths=[doc.file_path])
+            collector = install_stage_timing(rag)
+            with collector.scope():
+                result = await rag.ainsert(
+                    doc.raw_text, ids=[doc_id], file_paths=[doc.file_path]
+                )
+            self._last_stage_timings = collector.to_stages()
             status = await self.get_doc_status(doc_id)
             if status and status.status == "failed":
                 item.update(

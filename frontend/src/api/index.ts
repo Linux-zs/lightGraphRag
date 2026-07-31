@@ -291,6 +291,12 @@ export interface IndexTaskResult {
   status: 'ok' | 'error'
   chunks?: number
   error?: string
+  stage_timings?: {
+    parse: number
+    chunk_vector: number
+    kg: number
+    merge: number
+  } | null
 }
 
 export interface IndexTask {
@@ -306,6 +312,12 @@ export interface IndexTask {
   current_doc?: string
   current_doc_started_at?: string
   timeout_seconds?: number
+  stage_timings?: {
+    parse: number
+    chunk_vector: number
+    kg: number
+    merge: number
+  } | null
   results: IndexTaskResult[]
   errors: IndexTaskResult[]
   created_at: string

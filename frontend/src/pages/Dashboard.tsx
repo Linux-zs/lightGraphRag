@@ -350,6 +350,32 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
                 style={{ width: `${Math.max(2, rebuildTask.progress)}%` }}
               />
             </div>
+            {rebuildTask.stage_timings && (
+              <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                {(['parse', 'chunk_vector', 'kg', 'merge'] as const).map((key) => {
+                  const label =
+                    key === 'parse'
+                      ? '解析'
+                      : key === 'chunk_vector'
+                        ? 'Chunk向量'
+                        : key === 'kg'
+                          ? 'KG抽取'
+                          : '图谱merge'
+                  const v = rebuildTask.stage_timings?.[key]
+                  return (
+                    <div
+                      key={key}
+                      className="rounded-md border border-gray-200 bg-white px-2.5 py-2"
+                    >
+                      <div className="text-[11px] text-gray-400">{label}</div>
+                      <div className="text-sm font-semibold text-gray-800">
+                        {typeof v === 'number' ? `${v.toFixed(1)}s` : '—'}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
             {rebuildTask.errors.length > 0 && (
               <div className="mt-2 space-y-1">
                 {rebuildTask.errors.slice(0, 3).map((err) => (

@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
@@ -1994,7 +1995,7 @@ def _list_sessions(workspace: str | None = None) -> list[dict]:
 _uploaded_files: dict[tuple[str, str], Document] = {}
 _chunk_cache: dict[tuple[str, str], list[dict]] = {}
 _index_task_lock = asyncio.Lock()
-INDEX_DOC_TIMEOUT_SECONDS = int(os.environ.get("TDX_INDEX_DOC_TIMEOUT_SECONDS", "180"))
+INDEX_DOC_TIMEOUT_SECONDS = int(os.environ.get("TDX_INDEX_DOC_TIMEOUT_SECONDS", "1800"))
 _INDEX_TASK_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
 
@@ -2386,6 +2387,8 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                     return
 
                 doc: Document | None = None
+                stage_timings: dict[str, float] | None = None
+                service._last_stage_timings = {}
                 try:
                     await _update_index_task(
                         task_id,
@@ -2394,7 +2397,9 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                         current_doc_started_at=_task_now(),
                         message=f"正在解析: {doc_name}",
                     )
+                    parse_start = time.perf_counter()
                     doc = _load_doc_for_index(doc_name, workspace)
+                    parse_seconds = time.perf_counter() - parse_start
                     service.mark_document_status(doc, status="processing", indexed=False)
 
                     if not doc.raw_text.strip():
@@ -2414,11 +2419,19 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                         ),
                         timeout=INDEX_DOC_TIMEOUT_SECONDS,
                     )
+                    rag_stages = service._last_stage_timings or {}
+                    stage_timings = {
+                        "parse": round(parse_seconds, 3),
+                        "chunk_vector": rag_stages.get("chunk_vector", 0.0),
+                        "kg": rag_stages.get("kg", 0.0),
+                        "merge": rag_stages.get("merge", 0.0),
+                    }
                     result = {
                         "doc_name": doc_name,
                         "doc_id": item["doc_id"],
                         "status": "ok",
                         "chunks": item.get("chunk_count", 0),
+                        "stage_timings": stage_timings,
                     }
                     results.append(result)
                     logger.info("Indexed '{}' into LightRAG as {}", doc_name, item["doc_id"])
@@ -2454,6 +2467,7 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                     current_doc_started_at="",
                     results=results,
                     errors=errors,
+                    stage_timings=stage_timings,
                     message=f"已完成 {idx + 1}/{len(doc_names)}",
                 )
 
