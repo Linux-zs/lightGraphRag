@@ -135,20 +135,20 @@ ollama:
 常用环境变量：
 
 ```powershell
-$env:TDX_CONFIG_PATH="D:\path\custom.yaml"
-$env:TDX_CONFIG_LOCAL_PATH="D:\path\local.yaml"
-$env:TDX_DOCS_DIR="D:\docs"
-$env:TDX_DATA_DIR="./data"
-$env:TDX_UPLOAD_DIR="data/uploads"
-$env:TDX_RAW_TEXT_DIR="data/upload_text"
-$env:TDX_LOG_DIR="data/logs"
-$env:TDX_INDEX_DOC_TIMEOUT_SECONDS="180"
+$env:LIGHTGRAPHRAG_CONFIG_PATH="D:\path\custom.yaml"
+$env:LIGHTGRAPHRAG_CONFIG_LOCAL_PATH="D:\path\local.yaml"
+$env:LIGHTGRAPHRAG_DOCS_DIR="D:\docs"
+$env:LIGHTGRAPHRAG_DATA_DIR="./data"
+$env:LIGHTGRAPHRAG_UPLOAD_DIR="data/uploads"
+$env:LIGHTGRAPHRAG_RAW_TEXT_DIR="data/upload_text"
+$env:LIGHTGRAPHRAG_LOG_DIR="data/logs"
+$env:LIGHTGRAPHRAG_INDEX_DOC_TIMEOUT_SECONDS="180"
 ```
 
 远程访问 API 时必须设置访问令牌：
 
 ```powershell
-$env:TDX_APP_API_TOKEN="replace-with-a-random-token"
+$env:LIGHTGRAPHRAG_APP_API_TOKEN="replace-with-a-random-token"
 uv run python -m src.app.cli server --host 0.0.0.0 --no-reload
 ```
 

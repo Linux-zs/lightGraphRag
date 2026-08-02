@@ -133,7 +133,7 @@ def test_workspace_metadata_cleanup_removes_only_target_workspace(tmp_path, monk
                 "data_dir": str(data_dir),
                 "lightrag_dir": str(data_dir / "lightrag"),
             },
-            "lightrag": {"workspace": "tdx_default"},
+            "lightrag": {"workspace": "default"},
         },
         workspace="workspace_a",
     )

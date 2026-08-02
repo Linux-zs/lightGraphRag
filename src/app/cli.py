@@ -11,7 +11,7 @@ from loguru import logger
 
 from src.config_loader import get_config
 from src.doc_processor.loader import DocumentLoader
-from src.lightrag_service import LightRAGService, sanitize_workspace
+from src.lightrag_service import DEFAULT_WORKSPACE, LightRAGService, sanitize_workspace
 
 
 async def _ingest_docs(
@@ -139,18 +139,18 @@ def main() -> None:
     # ingest
     ingest_parser = subparsers.add_parser("ingest", help="Ingest documents and build index")
     ingest_parser.add_argument("--docs-dir", help="Override docs directory path")
-    ingest_parser.add_argument("--workspace", default="tdx_default", help="Target knowledge base")
+    ingest_parser.add_argument("--workspace", default=DEFAULT_WORKSPACE, help="Target knowledge base")
 
     # rebuild
     rebuild_parser = subparsers.add_parser("rebuild", help="Clear and rebuild index")
     rebuild_parser.add_argument("--docs-dir", help="Override docs directory path")
-    rebuild_parser.add_argument("--workspace", default="tdx_default", help="Target knowledge base")
+    rebuild_parser.add_argument("--workspace", default=DEFAULT_WORKSPACE, help="Target knowledge base")
 
     # search
     search_parser = subparsers.add_parser("search", help="Search the knowledge base")
     search_parser.add_argument("query", help="Search query string")
     search_parser.add_argument("--top-k", type=int, help="Number of results")
-    search_parser.add_argument("--workspace", default="tdx_default", help="Target knowledge base")
+    search_parser.add_argument("--workspace", default=DEFAULT_WORKSPACE, help="Target knowledge base")
 
     # server
     server_parser = subparsers.add_parser("server", help="Start FastAPI workbench server")

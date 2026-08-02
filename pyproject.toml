@@ -33,7 +33,6 @@ dev = [
 ]
 
 [project.scripts]
-tdx-kb = "src.app.cli:main"
 lightgraphrag = "src.app.cli:main"
 
 [build-system]

@@ -19,6 +19,7 @@ def test_config_loading_for_lightrag_stack():
     assert config["siliconflow"]["embed_dim"] == 1024
     assert config["chunking"]["chunk_size"] == 1024
     assert config["paths"]["lightrag_dir"]
+    assert config["lightrag"]["workspace"] == "default"
     assert "不要把原文逐条搬运成答案" in config["answer_generation"]["system_prompt"]
     assert config["lightrag"]["kg_skip_low_value_chunks"] is True
     assert config["lightrag"]["kg_skip_timed_out_chunks"] is True
@@ -197,7 +198,7 @@ def test_chunker_preserves_document_metadata():
         file_name="sample.txt",
         file_path="/tmp/sample.txt",
         file_type="txt",
-        raw_text="这是通达信行情系统的测试文档。\n\n" * 80,
+        raw_text="这是示例行情系统的测试文档。\n\n" * 80,
         metadata={"title": "测试文档"},
     )
 

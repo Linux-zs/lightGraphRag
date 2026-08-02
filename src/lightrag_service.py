@@ -22,7 +22,8 @@ import re
 from lightrag import LightRAG, QueryParam
 from lightrag.base import DocStatus
 from lightrag.llm.openai import openai_complete_if_cache, openai_embed
-from lightrag.utils import wrap_embedding_func_with_attrs
+from lightrag.operate import merge_nodes_and_edges
+from lightrag.utils import compute_mdhash_id, sanitize_text_for_encoding, wrap_embedding_func_with_attrs
 from loguru import logger
 
 from src.config_loader import get_config
@@ -31,7 +32,7 @@ from src.lightrag_stage_timing import install_stage_timing
 from src.model_profiles import get_runtime_model_config
 
 
-DEFAULT_WORKSPACE = "tdx_default"
+DEFAULT_WORKSPACE = "default"
 DEFAULT_MODE = "mix"
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 NON_BMP_CHARS_RE = re.compile(r"[\U00010000-\U0010ffff]")
@@ -95,15 +96,15 @@ def _get_embed_tokenizer():
             _EMBED_TOKENIZER = False
     return _EMBED_TOKENIZER or None
 
-TDX_GRAPH_RULE_TEMPLATE = {
-    "id": "tdx_ops",
-    "name": "通达信运维知识库",
-    "description": "适合通达信部署、运维、同步链路、服务排查类文档。",
+OPERATIONS_GRAPH_RULE_TEMPLATE = {
+    "id": "technical_operations",
+    "name": "技术运维知识库",
+    "description": "适合软件部署、运维、同步链路、服务排查类文档。",
     "entity_types": ["产品", "模块", "服务", "配置项", "故障现象", "排查步骤", "文件", "数据库"],
     "relation_types": ["依赖于", "部署在", "读取", "写入", "同步到", "导致", "排查", "包含"],
     "aliases_text": "",
     "extraction_prompt": (
-        "请从通达信运维/部署文档中抽取稳定、可复用的业务实体和技术实体。"
+        "请从技术运维和部署文档中抽取稳定、可复用的业务实体和技术实体。"
         "优先抽取系统、模块、服务、配置项、文件、数据库、故障现象和排查动作；"
         "关系应表达真实依赖、数据流向、部署位置、读写关系、故障原因和排查路径。"
         "不要把普通段落标题、孤立编号、无意义变量值抽成实体。"
@@ -149,7 +150,7 @@ SUPPLY_CHAIN_GRAPH_RULE_TEMPLATE = {
 }
 
 BUILTIN_GRAPH_RULE_TEMPLATES = [
-    TDX_GRAPH_RULE_TEMPLATE,
+    OPERATIONS_GRAPH_RULE_TEMPLATE,
     GENERAL_GRAPH_RULE_TEMPLATE,
     SUPPLY_CHAIN_GRAPH_RULE_TEMPLATE,
 ]
@@ -264,6 +265,10 @@ class LightRAGService:
     @property
     def graph_rule_templates_path(self) -> Path:
         return self.data_dir / "graph_rule_templates.json"
+
+    @property
+    def graph_import_dir(self) -> Path:
+        return self.data_dir / "graph_imports" / self.workspace
 
     @property
     def embedding_meta_path(self) -> Path:
@@ -864,10 +869,19 @@ class LightRAGService:
         return []
 
     @contextmanager
-    def _temporary_index_llm_and_kg_filter(self, rag: LightRAG, *, skip_kg: bool):
+    def _temporary_index_llm_and_kg_filter(
+        self,
+        rag: LightRAG,
+        *,
+        skip_kg: bool,
+        max_entities: int | None = None,
+        max_records: int | None = None,
+    ):
         original_llm_func = getattr(rag, "llm_model_func", None)
         original_llm_name = getattr(rag, "llm_model_name", None)
         original_llm_kwargs = getattr(rag, "llm_model_kwargs", None)
+        original_max_entities = getattr(rag, "entity_extract_max_entities", None)
+        original_max_records = getattr(rag, "entity_extract_max_records", None)
         original_extract = getattr(rag, "_process_extract_entities", None)
         role_states = getattr(rag, "_role_llm_states", {}) or {}
         original_extract_role = None
@@ -883,6 +897,10 @@ class LightRAGService:
         self._last_kg_filter_stats = {}
 
         if not skip_kg:
+            if max_entities is not None:
+                rag.entity_extract_max_entities = max(1, int(max_entities))
+            if max_records is not None:
+                rag.entity_extract_max_records = max(1, int(max_records))
             kg_runtime = self._runtime_models().get("kg", {})
             kg_llm_func = self._make_kg_llm_func()
             kg_llm_kwargs = self._llm_kwargs("kg")
@@ -932,6 +950,10 @@ class LightRAGService:
             rag.llm_model_func = original_llm_func
             rag.llm_model_name = original_llm_name
             rag.llm_model_kwargs = original_llm_kwargs
+            if original_max_entities is not None:
+                rag.entity_extract_max_entities = original_max_entities
+            if original_max_records is not None:
+                rag.entity_extract_max_records = original_max_records
             if original_extract_role is not None and hasattr(rag, "update_llm_role_config"):
                 rag.update_llm_role_config(
                     "extract",
@@ -1005,7 +1027,7 @@ class LightRAGService:
         return stable_doc_id(doc)
 
     def _default_graph_governance(self) -> dict[str, Any]:
-        template = TDX_GRAPH_RULE_TEMPLATE if self.workspace == DEFAULT_WORKSPACE else GENERAL_GRAPH_RULE_TEMPLATE
+        template = GENERAL_GRAPH_RULE_TEMPLATE
         cfg = {
             "workspace": self.workspace,
             "rule_template_id": template["id"],
@@ -1431,6 +1453,160 @@ class LightRAGService:
         )
         return self._jsonable(result)
 
+    def _graph_import_path(self, import_id: str) -> Path:
+        safe_id = re.sub(r"[^0-9a-f]", "", str(import_id).lower())[:24]
+        if len(safe_id) < 8:
+            raise ValueError("Invalid graph import id")
+        return self.graph_import_dir / f"{safe_id}.json"
+
+    def list_graph_imports(self) -> list[dict[str, Any]]:
+        if not self.graph_import_dir.exists():
+            return []
+        items = []
+        for path in self.graph_import_dir.glob("*.json"):
+            try:
+                package = json.loads(path.read_text(encoding="utf-8"))
+                items.append(
+                    {
+                        "import_id": package.get("import_id", path.stem),
+                        "file_name": package.get("file_name", ""),
+                        "entity_count": len(package.get("entities") or []),
+                        "relationship_count": len(package.get("relationships") or []),
+                        "created_at": package.get("created_at", ""),
+                    }
+                )
+            except Exception:
+                logger.warning("Ignoring unreadable graph import package: {}", path)
+        return sorted(items, key=lambda item: item.get("created_at", ""), reverse=True)
+
+    async def import_custom_graph(
+        self,
+        *,
+        file_name: str,
+        source_text: str,
+        entities: list[dict[str, Any]],
+        relationships: list[dict[str, Any]],
+        import_id: str | None = None,
+        persist: bool = True,
+        audit: bool = True,
+    ) -> dict[str, Any]:
+        """Insert reviewed graph candidates without adding them to chunk vector recall."""
+        clean_text = source_text.strip()
+        if not clean_text:
+            raise ValueError("Graph import source text is empty")
+        import_id = import_id or hashlib.sha256(
+            f"{self.workspace}\0{file_name}\0{clean_text}".encode("utf-8")
+        ).hexdigest()[:16]
+        source_key = f"graph-import-{import_id}"
+        safe_name = Path(file_name).name or "graph-import.txt"
+        file_path = f"graph-import/{safe_name}"
+
+        normalized_entities = []
+        known_entities: set[str] = set()
+        for entity in entities:
+            name = str(entity.get("entity_name") or "").strip()
+            if not name:
+                continue
+            known_entities.add(name)
+            normalized_entities.append(
+                {
+                    "entity_name": name,
+                    "entity_type": str(entity.get("entity_type") or "UNKNOWN").strip() or "UNKNOWN",
+                    "description": str(entity.get("description") or "").strip() or name,
+                    "source_id": source_key,
+                    "file_path": file_path,
+                }
+            )
+
+        normalized_relationships = []
+        for relation in relationships:
+            src_id = str(relation.get("src_id") or "").strip()
+            tgt_id = str(relation.get("tgt_id") or "").strip()
+            if not src_id or not tgt_id or src_id == tgt_id:
+                continue
+            normalized_relationships.append(
+                {
+                    "src_id": src_id,
+                    "tgt_id": tgt_id,
+                    "description": str(relation.get("description") or "").strip()
+                    or f"{src_id} 与 {tgt_id} 相关",
+                    "keywords": str(
+                        relation.get("keywords")
+                        or relation.get("relation_type")
+                        or "关联"
+                    ).strip(),
+                    "weight": max(0.0, min(float(relation.get("weight", 1.0)), 10.0)),
+                    "source_id": source_key,
+                    "file_path": file_path,
+                }
+            )
+            known_entities.update((src_id, tgt_id))
+
+        if not normalized_entities and not normalized_relationships:
+            raise ValueError("No valid entities or relationships selected")
+
+        # Ensure relation endpoints have explicit nodes instead of LightRAG UNKNOWN placeholders.
+        declared = {item["entity_name"] for item in normalized_entities}
+        for entity_name in sorted(known_entities - declared):
+            normalized_entities.append(
+                {
+                    "entity_name": entity_name,
+                    "entity_type": "UNKNOWN",
+                    "description": entity_name,
+                    "source_id": source_key,
+                    "file_path": file_path,
+                }
+            )
+
+        package = {
+            "import_id": import_id,
+            "workspace": self.workspace,
+            "file_name": safe_name,
+            "source_text": clean_text,
+            "entities": normalized_entities,
+            "relationships": normalized_relationships,
+            "created_at": _now_iso(),
+        }
+        rag = await self.get_rag()
+        custom_kg = {
+            "chunks": [
+                {
+                    "content": clean_text,
+                    "source_id": source_key,
+                    "file_path": file_path,
+                    "chunk_order_index": 0,
+                }
+            ],
+            "entities": normalized_entities,
+            "relationships": normalized_relationships,
+        }
+        await rag.ainsert_custom_kg(custom_kg, full_doc_id=source_key)
+
+        # Keep the source chunk for graph provenance, but exclude it from naive/vector recall.
+        chunk_id = compute_mdhash_id(
+            sanitize_text_for_encoding(clean_text),
+            prefix="chunk-",
+        )
+        await rag.chunks_vdb.delete([chunk_id])
+        await rag._insert_done()
+        if persist:
+            _atomic_write_json(self._graph_import_path(import_id), package)
+
+        result = {
+            "import_id": import_id,
+            "file_name": safe_name,
+            "entity_count": len(normalized_entities),
+            "relationship_count": len(normalized_relationships),
+            "source_chunk_id": chunk_id,
+        }
+        if audit:
+            self.append_graph_audit(
+                "import_custom_kg",
+                {"import_id": import_id, "file_name": safe_name},
+                result,
+            )
+        return result
+
     def register_upload(self, doc: Document) -> dict[str, Any]:
         manifest = self._load_manifest()
         doc_id = self._manifest_doc_id(doc, manifest)
@@ -1499,6 +1675,8 @@ class LightRAGService:
         chunk_overlap: int | None = None,
         separators: list[str] | None = None,
         index_mode: str = "complete",
+        kg_max_entities: int | None = None,
+        kg_max_records: int | None = None,
         stage_update_callback: Callable[[dict[str, float], str, str], Awaitable[None] | None] | None = None,
     ) -> dict[str, Any]:
         self.assert_embedding_compatible()
@@ -1538,7 +1716,12 @@ class LightRAGService:
             collector = install_stage_timing(rag)
             collector.on_update = stage_update_callback
             try:
-                with self._temporary_index_llm_and_kg_filter(rag, skip_kg=skip_kg):
+                with self._temporary_index_llm_and_kg_filter(
+                    rag,
+                    skip_kg=skip_kg,
+                    max_entities=kg_max_entities,
+                    max_records=kg_max_records,
+                ):
                     with collector.scope():
                         result = await self._insert_document_text(
                             rag,
@@ -1567,6 +1750,10 @@ class LightRAGService:
                     "kg_status": "skipped" if skip_kg else "failed",
                     "kg_filter": self._last_kg_filter_stats,
                     "kg_model": self._runtime_models().get("kg", {}).get("model", ""),
+                    "kg_extraction_limits": {
+                        "max_entities_per_chunk": kg_max_entities,
+                        "max_records_per_chunk": kg_max_records,
+                    },
                     "graph_rule": self.graph_governance_summary(),
                     "updated_at": _now_iso(),
                 }
@@ -1597,6 +1784,10 @@ class LightRAGService:
                     "kg_status": self._kg_status_for_success(skip_kg=skip_kg),
                     "kg_filter": self._last_kg_filter_stats,
                     "kg_model": "" if skip_kg else self._runtime_models().get("kg", {}).get("model", ""),
+                    "kg_extraction_limits": {
+                        "max_entities_per_chunk": kg_max_entities,
+                        "max_records_per_chunk": kg_max_records,
+                    },
                     "graph_rule": self.graph_governance_summary(),
                     "last_insert_result": result,
                     "updated_at": _now_iso(),
@@ -1672,6 +1863,170 @@ class LightRAGService:
             )
         chunks.sort(key=lambda c: c["chunk_index"])
         return chunks
+
+    async def backfill_document_graph(
+        self,
+        doc_name_or_id: str,
+        *,
+        kg_max_entities: int | None = None,
+        kg_max_records: int | None = None,
+        stage_update_callback: Callable[
+            [dict[str, float], str, str], Awaitable[None] | None
+        ]
+        | None = None,
+    ) -> dict[str, Any]:
+        """Extract and merge KG data from already indexed chunks only."""
+        self.assert_embedding_compatible()
+        manifest = self._load_manifest()
+        match = next(
+            (
+                (doc_id, item)
+                for doc_id, item in manifest.get("documents", {}).items()
+                if isinstance(item, dict)
+                and (
+                    item.get("doc_name") == doc_name_or_id
+                    or doc_id == doc_name_or_id
+                )
+            ),
+            None,
+        )
+        if match is None:
+            raise KeyError(f"Document not found in workspace: {doc_name_or_id}")
+
+        doc_id, item = match
+        if not item.get("indexed"):
+            raise ValueError("Document must be indexed before graph backfill")
+        chunk_ids = list(item.get("chunks_list") or [])
+        if not chunk_ids:
+            raise ValueError("Document has no indexed chunks to extract")
+
+        rag = await self.get_rag()
+        records = await rag.text_chunks.get_by_ids(chunk_ids)
+        chunks: dict[str, dict[str, Any]] = {}
+        for index, chunk_id in enumerate(chunk_ids):
+            record = records[index] if records and index < len(records) else None
+            if not isinstance(record, dict):
+                continue
+            chunks[chunk_id] = {
+                **record,
+                "full_doc_id": record.get("full_doc_id") or doc_id,
+                "file_path": record.get("file_path") or item.get("file_path") or item.get("doc_name"),
+            }
+        if not chunks:
+            raise ValueError("Indexed chunk records are missing from LightRAG storage")
+
+        guidance = self.graph_extraction_guidance()
+        rag.addon_params = rag.addon_params or {}
+        if guidance:
+            rag.addon_params["entity_types_guidance"] = guidance
+
+        timings = {"parse": 0.0, "chunk_vector": 0.0, "kg": 0.0, "merge": 0.0}
+        pipeline_status = {
+            "latest_message": "",
+            "history_messages": [],
+            "cancellation_requested": False,
+        }
+        pipeline_status_lock = asyncio.Lock()
+        loop = asyncio.get_running_loop()
+
+        async def emit(stage: str, event: str) -> None:
+            if stage_update_callback is None:
+                return
+            result = stage_update_callback(dict(timings), stage, event)
+            if hasattr(result, "__await__"):
+                await result
+
+        try:
+            with self._temporary_index_llm_and_kg_filter(
+                rag,
+                skip_kg=False,
+                max_entities=kg_max_entities,
+                max_records=kg_max_records,
+            ):
+                await emit("kg", "start")
+                started = loop.time()
+                chunk_results = await rag._process_extract_entities(
+                    chunks,
+                    pipeline_status,
+                    pipeline_status_lock,
+                )
+                timings["kg"] = round(loop.time() - started, 3)
+                await emit("kg", "end")
+
+                await emit("merge", "start")
+                started = loop.time()
+                await merge_nodes_and_edges(
+                    chunk_results=chunk_results,
+                    knowledge_graph_inst=rag.chunk_entity_relation_graph,
+                    entity_vdb=rag.entities_vdb,
+                    relationships_vdb=rag.relationships_vdb,
+                    global_config=rag._build_global_config(),
+                    full_entities_storage=rag.full_entities,
+                    full_relations_storage=rag.full_relations,
+                    doc_id=doc_id,
+                    pipeline_status=pipeline_status,
+                    pipeline_status_lock=pipeline_status_lock,
+                    llm_response_cache=rag.llm_response_cache,
+                    entity_chunks_storage=rag.entity_chunks,
+                    relation_chunks_storage=rag.relation_chunks,
+                    current_file_number=1,
+                    total_files=1,
+                    file_path=str(item.get("file_path") or item.get("doc_name") or "unknown_source"),
+                )
+                await rag._insert_done_with_cleanup()
+                timings["merge"] = round(loop.time() - started, 3)
+                await emit("merge", "end")
+
+            entity_names: set[str] = set()
+            relation_pairs: set[tuple[str, str]] = set()
+            for maybe_nodes, maybe_edges in chunk_results:
+                entity_names.update(str(name) for name in maybe_nodes)
+                relation_pairs.update(
+                    tuple(sorted((str(pair[0]), str(pair[1]))))
+                    for pair in maybe_edges
+                    if len(pair) >= 2
+                )
+
+            item.update(
+                {
+                    "kg_status": self._kg_status_for_success(skip_kg=False),
+                    "kg_filter": self._last_kg_filter_stats,
+                    "kg_model": self._runtime_models().get("kg", {}).get("model", ""),
+                    "kg_extraction_limits": {
+                        "max_entities_per_chunk": kg_max_entities,
+                        "max_records_per_chunk": kg_max_records,
+                    },
+                    "graph_rule": self.graph_governance_summary(),
+                    "kg_backfilled_at": _now_iso(),
+                    "updated_at": _now_iso(),
+                }
+            )
+            manifest["documents"][doc_id] = item
+            self._save_manifest(manifest)
+            self._last_stage_timings = timings
+            return {
+                **item,
+                "kg_entity_count": len(entity_names),
+                "kg_relation_count": len(relation_pairs),
+                "stage_timings": timings,
+            }
+        except (Exception, asyncio.CancelledError) as exc:
+            try:
+                await rag._discard_pending_index_ops(skip_enqueue_owned=False)
+            except Exception:
+                logger.exception("Failed to discard pending graph backfill writes")
+            item.update(
+                {
+                    "kg_status": "failed",
+                    "kg_error": str(exc),
+                    "kg_model": self._runtime_models().get("kg", {}).get("model", ""),
+                    "updated_at": _now_iso(),
+                }
+            )
+            manifest["documents"][doc_id] = item
+            self._save_manifest(manifest)
+            self._last_stage_timings = timings
+            raise
 
     def read_graph(self, *, limit: int = 200, include_isolated: bool = True) -> dict[str, Any]:
         """Read LightRAG's GraphML as frontend-friendly nodes and edges."""
@@ -2226,6 +2581,7 @@ class LightRAGService:
         skipped = 0
         errors: list[dict[str, str]] = []
         replayable = {
+            "import_custom_kg",
             "create_entity",
             "edit_entity",
             "delete_entity",
@@ -2240,7 +2596,19 @@ class LightRAGService:
                 continue
             payload = entry.get("payload") or {}
             try:
-                if action == "create_entity":
+                if action == "import_custom_kg":
+                    import_path = self._graph_import_path(payload["import_id"])
+                    package = json.loads(import_path.read_text(encoding="utf-8"))
+                    await self.import_custom_graph(
+                        file_name=package["file_name"],
+                        source_text=package["source_text"],
+                        entities=package.get("entities") or [],
+                        relationships=package.get("relationships") or [],
+                        import_id=package["import_id"],
+                        persist=False,
+                        audit=False,
+                    )
+                elif action == "create_entity":
                     await rag.acreate_entity(
                         entity_name=payload["entity_name"],
                         entity_data=payload.get("entity_data") or {},

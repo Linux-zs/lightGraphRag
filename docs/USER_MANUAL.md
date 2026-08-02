@@ -95,7 +95,7 @@ http://127.0.0.1:5173
 本地回环访问不需要令牌。绑定到非本机地址时必须设置：
 
 ```powershell
-$env:TDX_APP_API_TOKEN="replace-with-a-random-token"
+$env:LIGHTGRAPHRAG_APP_API_TOKEN="replace-with-a-random-token"
 uv run python -m src.app.cli server --host 0.0.0.0 --no-reload
 ```
 
@@ -174,7 +174,7 @@ API Key 保存后不会回显，只显示脱敏预览。
 示例：
 
 ```text
-tdx_default
+default
 butterfly_test
 supply_chain_2026
 ```
@@ -421,7 +421,7 @@ naive    基础文本检索
 
 系统内置模板包括：
 
-- 通达信运维知识库。
+- 技术运维知识库。
 - 通用知识库。
 - 供应链/风险分析。
 
@@ -580,13 +580,13 @@ Invoke-RestMethod http://127.0.0.1:8101/api/kb/workspaces
 查看文档：
 
 ```powershell
-Invoke-RestMethod "http://127.0.0.1:8101/api/kb/documents?workspace=tdx_default"
+Invoke-RestMethod "http://127.0.0.1:8101/api/kb/documents?workspace=default"
 ```
 
 查看系统状态：
 
 ```powershell
-Invoke-RestMethod "http://127.0.0.1:8101/api/system/stats?workspace=tdx_default"
+Invoke-RestMethod "http://127.0.0.1:8101/api/system/stats?workspace=default"
 ```
 
 OpenAPI 页面：
@@ -637,7 +637,7 @@ http://127.0.0.1:8101/docs
 单文档索引默认超时：
 
 ```text
-TDX_INDEX_DOC_TIMEOUT_SECONDS=180
+LIGHTGRAPHRAG_INDEX_DOC_TIMEOUT_SECONDS=180
 ```
 
 ### 5. 上下文预览有数据，问答却说找不到文档

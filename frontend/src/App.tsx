@@ -21,6 +21,9 @@ import { useConfirm } from './components/ConfirmDialog'
 type Page = 'chat' | 'kb' | 'recall' | 'graph' | 'models' | 'dashboard'
 const PAGES: Page[] = ['chat', 'kb', 'recall', 'graph', 'models', 'dashboard']
 const DEFAULT_PAGE: Page = 'chat'
+const DEFAULT_WORKSPACE = 'default'
+const PAGE_STORAGE_KEY = 'lightgraphrag_page'
+const WORKSPACE_STORAGE_KEY = 'lightgraphrag_workspace'
 
 function isPage(value: string | null): value is Page {
   return !!value && PAGES.includes(value as Page)
@@ -32,7 +35,8 @@ function pageFromHash(): Page | null {
 }
 
 function initialPage(): Page {
-  return pageFromHash() || (isPage(localStorage.getItem('tdx_page')) ? localStorage.getItem('tdx_page') as Page : DEFAULT_PAGE)
+  const storedPage = localStorage.getItem(PAGE_STORAGE_KEY)
+  return pageFromHash() || (isPage(storedPage) ? storedPage : DEFAULT_PAGE)
 }
 
 function pageHash(page: Page) {
@@ -40,17 +44,21 @@ function pageHash(page: Page) {
 }
 
 function chatStorageKey(workspace: string) {
-  return `tdx_active_chat_${workspace}`
+  return `lightgraphrag_active_chat_${workspace}`
 }
 
 export default function App() {
   const confirm = useConfirm()
   const [page, setPage] = useState<Page>(() => initialPage())
-  const [workspace, setWorkspace] = useState(() => localStorage.getItem('tdx_workspace') || 'tdx_default')
+  const [workspace, setWorkspace] = useState(
+    () => localStorage.getItem(WORKSPACE_STORAGE_KEY) || DEFAULT_WORKSPACE,
+  )
   const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([])
   const [chatSessions, setChatSessions] = useState<ChatSessionListItem[]>([])
   const [activeChatId, setActiveChatId] = useState<string | null>(
-    () => localStorage.getItem(chatStorageKey(localStorage.getItem('tdx_workspace') || 'tdx_default')),
+    () => localStorage.getItem(
+      chatStorageKey(localStorage.getItem(WORKSPACE_STORAGE_KEY) || DEFAULT_WORKSPACE),
+    ),
   )
 
   const loadWorkspaces = async (current = workspace) => {
@@ -59,7 +67,7 @@ export default function App() {
       setWorkspaces(data)
       if (!data.some((item) => item.workspace === current) && data[0]) {
         setWorkspace(data[0].workspace)
-        localStorage.setItem('tdx_workspace', data[0].workspace)
+        localStorage.setItem(WORKSPACE_STORAGE_KEY, data[0].workspace)
       }
       return data
     } catch {/* ignore */}
@@ -88,7 +96,7 @@ export default function App() {
       const next = pageFromHash()
       if (!next) return
       setPage(next)
-      localStorage.setItem('tdx_page', next)
+      localStorage.setItem(PAGE_STORAGE_KEY, next)
     }
     window.addEventListener('hashchange', handleHashChange)
     return () => window.removeEventListener('hashchange', handleHashChange)
@@ -110,7 +118,7 @@ export default function App() {
 
   const handleNavigate = (next: Page) => {
     setPage(next)
-    localStorage.setItem('tdx_page', next)
+    localStorage.setItem(PAGE_STORAGE_KEY, next)
     const nextHash = pageHash(next)
     if (window.location.hash !== nextHash) {
       window.location.hash = nextHash
@@ -130,7 +138,7 @@ export default function App() {
     if (next === workspace) return
     setActiveChatId(localStorage.getItem(chatStorageKey(next)))
     setWorkspace(next)
-    localStorage.setItem('tdx_workspace', next)
+    localStorage.setItem(WORKSPACE_STORAGE_KEY, next)
   }
 
   const handleCreateWorkspace = async (name: string, ruleTemplateId: string) => {
@@ -153,9 +161,9 @@ export default function App() {
       await deleteWorkspace(target)
       const nextWorkspaces = await loadWorkspaces(target)
       if (target === workspace) {
-        const next = nextWorkspaces[0]?.workspace || 'tdx_default'
+        const next = nextWorkspaces[0]?.workspace || DEFAULT_WORKSPACE
         setWorkspace(next)
-        localStorage.setItem('tdx_workspace', next)
+        localStorage.setItem(WORKSPACE_STORAGE_KEY, next)
         handleSetActiveChatId(null)
         setChatSessions([])
         void loadChatSessions(next)

@@ -41,13 +41,13 @@ class TestStripCitationSection:
 
     def test_normal_answer_unchanged(self):
         """A normal answer without any citation section should be unchanged."""
-        text = "TDX是通达信金融交易系统[1]。它包含行情系统和交易系统[2]。"
+        text = "ABC是示例金融交易系统[1]。它包含行情系统和交易系统[2]。"
         assert _strip_citation_section(text) == text
 
     def test_strips_header_citation_section(self):
         """Should remove everything from '引用文档：' header to end."""
         text = (
-            "TDX是通达信金融交易系统[1]。\n\n"
+            "ABC是示例金融交易系统[1]。\n\n"
             "引用文档：\n"
             "[1] 培训文档.md\n"
             "[2] 系统说明.docx\n"
@@ -56,7 +56,7 @@ class TestStripCitationSection:
         assert "引用文档" not in result
         assert "培训文档.md" not in result
         assert "系统说明.docx" not in result
-        assert "TDX是通达信金融交易系统[1]。" in result
+        assert "ABC是示例金融交易系统[1]。" in result
 
     def test_strips_markdown_header_citation_section(self):
         """Should remove '## 引用文档' markdown header section."""
@@ -130,7 +130,7 @@ class TestDetectRepetitionDegenerate:
 
     def test_normal_text_not_degenerate(self):
         """Normal varied text should not be flagged."""
-        text = "这是通达信行情系统的说明文档。" * 5  # >60 chars, varied
+        text = "这是示例行情系统的说明文档。" * 5  # >60 chars, varied
         is_degen, _ = _detect_repetition_degenerate(text)
         assert is_degen is False
 
@@ -168,7 +168,7 @@ class TestDetectRepetitionDegenerate:
 
     def test_normal_long_text_safe_idx_equals_length(self):
         """For non-degenerate text, safe_idx should equal full length."""
-        text = "通达信行情系统包含多个组件，每个组件有不同功能。" * 3
+        text = "示例行情系统包含多个组件，每个组件有不同功能。" * 3
         is_degen, safe_idx = _detect_repetition_degenerate(text)
         assert is_degen is False
         assert safe_idx == len(text)
@@ -190,7 +190,7 @@ class TestIsContaminatedText:
 
     def test_normal_chinese_text_not_contaminated(self):
         """Normal Chinese text should not be flagged."""
-        text = "通达信行情系统是金融交易系统的核心组件，负责接收和处理实时行情数据。" * 3
+        text = "示例行情系统是金融交易系统的核心组件，负责接收和处理实时行情数据。" * 3
         assert _is_contaminated_text(text) is False
 
     def test_noise_lines_detected(self):
@@ -216,7 +216,7 @@ class TestIsContaminatedText:
     def test_normal_english_text_not_contaminated(self):
         """English text WITH some CJK should not be flagged (mixed content)."""
         text = (
-            "TDX trading system 是通达信金融交易系统的核心组件。 "
+            "ABC trading system 是示例金融交易系统的核心组件。 "
             "It provides real-time market data and trading functionality. "
             "系统包含多个组件协同工作，确保行情数据的实时传输和处理。 "
         )
@@ -233,7 +233,7 @@ class TestIsContaminatedText:
         (no word structure) are still caught — see test_pure_binary_stream_detected.
         """
         text = (
-            "The TDX trading system is a financial trading platform. "
+            "The ABC trading system is a financial trading platform. "
             "It provides real-time market data and trading functionality. "
             "The system consists of multiple components working together. "
         )

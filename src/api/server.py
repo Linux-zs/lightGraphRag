@@ -58,6 +58,12 @@ from src.model_profiles import (
 
 @asynccontextmanager
 async def _app_lifespan(_: FastAPI):
+    workspace_migration = _migrate_legacy_default_workspace()
+    if workspace_migration.get("migrated"):
+        logger.info(
+            "Moved the former branded default workspace manifest to '{}'",
+            workspace_migration["workspace"],
+        )
     migration = _migrate_legacy_source_layout()
     if migration["migrated"] or migration["unassigned"]:
         logger.info(
@@ -85,7 +91,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-APP_API_TOKEN = os.environ.get("TDX_APP_API_TOKEN", "").strip()
+APP_API_TOKEN = os.environ.get("LIGHTGRAPHRAG_APP_API_TOKEN", "").strip()
 
 
 def _is_loopback_client(host: str | None) -> bool:
@@ -113,19 +119,19 @@ async def require_remote_api_token(request: Request, call_next):
     return await call_next(request)
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "default.yaml"
-UPLOAD_DIR = Path(os.environ.get("TDX_UPLOAD_DIR", "data/uploads"))
+UPLOAD_DIR = Path(os.environ.get("LIGHTGRAPHRAG_UPLOAD_DIR", "data/uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-RAW_TEXT_DIR = Path(os.environ.get("TDX_RAW_TEXT_DIR", "data/upload_text"))
+RAW_TEXT_DIR = Path(os.environ.get("LIGHTGRAPHRAG_RAW_TEXT_DIR", "data/upload_text"))
 RAW_TEXT_DIR.mkdir(parents=True, exist_ok=True)
 WORKSPACE_SETTINGS_DIR = Path(
-    os.environ.get("TDX_WORKSPACE_SETTINGS_DIR", "data/workspace_settings")
+    os.environ.get("LIGHTGRAPHRAG_WORKSPACE_SETTINGS_DIR", "data/workspace_settings")
 )
 WORKSPACE_SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
 PROMPT_TEMPLATES_PATH = Path(
-    os.environ.get("TDX_PROMPT_TEMPLATES_PATH", "data/prompt_templates.json")
+    os.environ.get("LIGHTGRAPHRAG_PROMPT_TEMPLATES_PATH", "data/prompt_templates.json")
 )
-INDEX_TASKS_DIR = Path(os.environ.get("TDX_INDEX_TASKS_DIR", "data/index_tasks"))
-LOG_DIR = Path(os.environ.get("TDX_LOG_DIR", "data/logs"))
+INDEX_TASKS_DIR = Path(os.environ.get("LIGHTGRAPHRAG_INDEX_TASKS_DIR", "data/index_tasks"))
+LOG_DIR = Path(os.environ.get("LIGHTGRAPHRAG_LOG_DIR", "data/logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 APP_LOG_PATH = LOG_DIR / "app.log"
 logger.add(
@@ -176,6 +182,65 @@ def _atomic_write_text(path: Path, content: str) -> None:
         except OSError:
             pass
         raise
+
+
+def _migrate_legacy_default_workspace() -> dict[str, Any]:
+    """Detach data created under the former branded default from the new generic default."""
+    config = get_config()
+    configured_default = sanitize_workspace(
+        config.get("lightrag", {}).get("workspace", DEFAULT_WORKSPACE)
+    )
+    if configured_default != DEFAULT_WORKSPACE:
+        return {"migrated": False, "reason": "custom_default_workspace"}
+
+    paths = config.get("paths", {})
+    data_dir = Path(paths.get("data_dir", "./data"))
+    marker = data_dir / ".workspace-default-migration-v1"
+    if marker.exists():
+        return {"migrated": False, "reason": "already_migrated"}
+
+    old_workspace = "tdx_default"
+    source = Path(paths.get("lightrag_manifest", data_dir / "lightrag_manifest.json"))
+    target = data_dir / "lightrag_manifests" / f"{old_workspace}.json"
+    migrated = False
+    if source.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            try:
+                source_data = json.loads(source.read_text(encoding="utf-8"))
+                target_data = json.loads(target.read_text(encoding="utf-8"))
+                source_docs = source_data.get("documents", {}) if isinstance(source_data, dict) else {}
+                target_docs = target_data.get("documents", {}) if isinstance(target_data, dict) else {}
+                merged = {
+                    **(source_data if isinstance(source_data, dict) else {}),
+                    **(target_data if isinstance(target_data, dict) else {}),
+                    "documents": {**source_docs, **target_docs},
+                }
+                _atomic_write_text(
+                    target,
+                    json.dumps(merged, ensure_ascii=False, indent=2),
+                )
+                source.unlink()
+                migrated = True
+            except Exception:
+                logger.exception("Failed to merge former default workspace manifest")
+        else:
+            os.replace(source, target)
+            migrated = True
+
+    _atomic_write_text(
+        marker,
+        json.dumps(
+            {
+                "migrated": migrated,
+                "workspace": old_workspace,
+                "created_at": _task_now(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
+    return {"migrated": migrated, "workspace": old_workspace}
 
 
 def _workspace_upload_dir(workspace: str, *, create: bool = False) -> Path:
@@ -295,6 +360,10 @@ async def _remove_workspace_metadata(workspace: str, service) -> dict[str, int]:
         service.graph_reference_dir,
         service.data_dir / "graph_governance_refs",
     )
+    removed_graph_imports = _remove_owned_dir(
+        service.graph_import_dir,
+        service.data_dir / "graph_imports",
+    )
 
     removed_sessions = 0
     for path in SESSIONS_DIR.glob("*.json"):
@@ -321,6 +390,7 @@ async def _remove_workspace_metadata(workspace: str, service) -> dict[str, int]:
         "removed_settings": removed_settings,
         "removed_graph_config": removed_graph_config,
         "removed_graph_reference_files": removed_graph_refs,
+        "removed_graph_import_files": removed_graph_imports,
         "removed_sessions": removed_sessions,
         "removed_index_tasks": removed_tasks,
     }
@@ -466,7 +536,7 @@ DEFAULT_ANSWER_SYSTEM_PROMPT = (
     "禁止把引用编号写成裸数字，禁止输出无意义的连续数字、字母或占位字符。"
 )
 DEFAULT_PROMPT_TEMPLATE_ID = "recommended"
-_LEGACY_TDX_PROMPT_PREFIX = "你是通达信系统技术支持知识库助手"
+_LEGACY_DOMAIN_PROMPT_PREFIX = "你是通达信系统技术支持知识库助手"
 
 
 def _built_in_prompt_templates() -> list[dict[str, Any]]:
@@ -546,7 +616,7 @@ def _load_workspace_settings(workspace: str) -> dict[str, Any]:
         configured = str(
             get_config().get("answer_generation", {}).get("system_prompt") or ""
         ).strip()
-        if configured and not configured.startswith(_LEGACY_TDX_PROMPT_PREFIX):
+        if configured and not configured.startswith(_LEGACY_DOMAIN_PROMPT_PREFIX):
             prompt = configured
     return {
         "workspace": workspace,
@@ -609,6 +679,8 @@ class IndexRequest(BaseModel):
     chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
     chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
     index_mode: Literal["complete", "fast"] = "complete"
+    kg_max_entities: int = Field(default=24, ge=1, le=200)
+    kg_max_records: int = Field(default=48, ge=1, le=400)
 
 class RecallTestRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
@@ -890,6 +962,36 @@ class GraphSuggestResponse(BaseModel):
 class GraphApplyChangesRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
     changes: list[GraphChange]
+
+class GraphImportEntity(BaseModel):
+    entity_name: str = Field(min_length=1, max_length=300)
+    entity_type: str = Field(default="UNKNOWN", max_length=120)
+    description: str = Field(default="", max_length=6000)
+    reason: str = Field(default="", max_length=2000)
+
+class GraphImportRelationship(BaseModel):
+    src_id: str = Field(min_length=1, max_length=300)
+    tgt_id: str = Field(min_length=1, max_length=300)
+    relation_type: str = Field(default="关联", max_length=120)
+    description: str = Field(default="", max_length=6000)
+    keywords: str = Field(default="", max_length=1000)
+    weight: float = Field(default=1.0, ge=0, le=10)
+    reason: str = Field(default="", max_length=2000)
+
+class GraphImportPreviewResponse(BaseModel):
+    file_name: str
+    source_text: str
+    entities: list[GraphImportEntity] = []
+    relationships: list[GraphImportRelationship] = []
+    warnings: list[str] = []
+    used_model: bool = False
+
+class GraphImportConfirmRequest(BaseModel):
+    workspace: str = DEFAULT_WORKSPACE
+    file_name: str
+    source_text: str = Field(min_length=1, max_length=200000)
+    entities: list[GraphImportEntity] = []
+    relationships: list[GraphImportRelationship] = []
 
 class ChatSendResponse(BaseModel):
     session_id: str
@@ -1295,7 +1397,7 @@ def _strip_citation_section(text: str) -> str:
     "[1] 配置说明"), the bare-entry fallback only treats a "[数字] ..." line as
     a citation entry when it contains a known document extension
     (.docx/.pdf/.md/.doc/.txt/.xlsx/.csv, case-insensitive). A trailing block of
-    "[1] 通达信.docx" / "[2] 系统.pdf" is stripped; "[1] 配置说明" is kept.
+    "[1] 产品手册.docx" / "[2] 系统.pdf" is stripped; "[1] 配置说明" is kept.
 
     This is a safety net — the primary fix is in the prompt template. It only
     trims trailing content, so normal answers are never affected.
@@ -2013,7 +2115,9 @@ def _list_sessions(workspace: str | None = None) -> list[dict]:
 _uploaded_files: dict[tuple[str, str], Document] = {}
 _chunk_cache: dict[tuple[str, str], list[dict]] = {}
 _index_task_lock = asyncio.Lock()
-INDEX_DOC_TIMEOUT_SECONDS = int(os.environ.get("TDX_INDEX_DOC_TIMEOUT_SECONDS", "1800"))
+INDEX_DOC_TIMEOUT_SECONDS = int(
+    os.environ.get("LIGHTGRAPHRAG_INDEX_DOC_TIMEOUT_SECONDS", "1800")
+)
 _INDEX_TASK_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 
 
@@ -2218,13 +2322,24 @@ def _public_index_task(task: dict[str, Any]) -> dict[str, Any]:
     return public
 
 
-def _index_request_config(req: IndexRequest | BatchIndexRequest | RebuildIndexRequest) -> dict[str, Any]:
-    return {
-        "separators": list(req.separators),
-        "chunk_size": int(req.chunk_size),
-        "chunk_overlap": int(req.chunk_overlap),
-        "index_mode": getattr(req, "index_mode", "complete"),
+def _index_request_config(
+    req: IndexRequest | BatchIndexRequest | RebuildIndexRequest | GraphBackfillRequest,
+) -> dict[str, Any]:
+    config = {
+        "operation": "kg_backfill" if isinstance(req, GraphBackfillRequest) else "index",
+        "kg_max_entities": int(req.kg_max_entities),
+        "kg_max_records": int(req.kg_max_records),
     }
+    if not isinstance(req, GraphBackfillRequest):
+        config.update(
+            {
+                "separators": list(req.separators),
+                "chunk_size": int(req.chunk_size),
+                "chunk_overlap": int(req.chunk_overlap),
+                "index_mode": getattr(req, "index_mode", "complete"),
+            }
+        )
+    return config
 
 
 def _load_doc_for_index(doc_name: str, workspace: str) -> Document:
@@ -2351,6 +2466,8 @@ async def _start_workspace_rebuild(
         chunk_size=req.chunk_size,
         chunk_overlap=req.chunk_overlap,
         index_mode=req.index_mode,
+        kg_max_entities=req.kg_max_entities,
+        kg_max_records=req.kg_max_records,
     )
     task = await _create_index_task(
         "rebuild",
@@ -2533,6 +2650,8 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                             chunk_overlap=req.chunk_overlap,
                             separators=req.separators,
                             index_mode=index_mode,
+                            kg_max_entities=req.kg_max_entities,
+                            kg_max_records=req.kg_max_records,
                             stage_update_callback=update_rag_stage_timings,
                         ),
                         timeout=INDEX_DOC_TIMEOUT_SECONDS,
@@ -2659,6 +2778,163 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
             results=results,
             errors=errors or [{"doc_name": "", "status": "error", "error": str(exc)}],
             message=f"索引任务异常退出: {exc}",
+            phase="done",
+        )
+
+
+async def _run_graph_backfill_task(task_id: str, req: GraphBackfillRequest) -> None:
+    workspace = sanitize_workspace(req.workspace)
+    service = get_lightrag_service(workspace)
+    doc_names = list(req.doc_names)
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    try:
+        await _update_index_task(task_id, phase="queued", message="等待图谱补建写入锁")
+        async with _get_workspace_rag_lock(workspace):
+            await _update_index_task(
+                task_id,
+                status="running",
+                phase="kg_backfill",
+                message="开始从已有文本块补建知识图谱",
+            )
+            for idx, doc_name in enumerate(doc_names):
+                current_task = _index_tasks.get(task_id, {})
+                if current_task.get("cancel_requested"):
+                    await _update_index_task(
+                        task_id,
+                        status="cancelled",
+                        phase="done",
+                        current_doc="",
+                        current_doc_started_at="",
+                        current_stage="",
+                        current_stage_started_at="",
+                        message="图谱补建任务已取消",
+                    )
+                    return
+
+                stage_timings = _empty_stage_timings()
+
+                async def update_stage(
+                    next_timings: dict[str, float],
+                    stage: str,
+                    event: str,
+                ) -> None:
+                    stage_timings.update(_normalize_stage_timings(next_timings))
+                    updates: dict[str, Any] = {
+                        "current": idx,
+                        "current_doc": doc_name,
+                        "stage_timings": dict(stage_timings),
+                    }
+                    if event == "start":
+                        updates.update(
+                            {
+                                "current_stage": stage,
+                                "current_stage_started_at": _task_now(),
+                                "message": f"正在{_index_stage_label(stage)}: {doc_name}",
+                            }
+                        )
+                    await _update_index_task(task_id, **updates)
+
+                try:
+                    await _update_index_task(
+                        task_id,
+                        current=idx,
+                        current_doc=doc_name,
+                        current_doc_started_at=_task_now(),
+                        current_stage="kg",
+                        current_stage_started_at=_task_now(),
+                        stage_timings=stage_timings,
+                        message=f"正在从已有文本块抽取实体关系: {doc_name}",
+                    )
+                    item = await asyncio.wait_for(
+                        service.backfill_document_graph(
+                            doc_name,
+                            kg_max_entities=req.kg_max_entities,
+                            kg_max_records=req.kg_max_records,
+                            stage_update_callback=update_stage,
+                        ),
+                        timeout=INDEX_DOC_TIMEOUT_SECONDS,
+                    )
+                    stage_timings = _normalize_stage_timings(item.get("stage_timings"))
+                    result = {
+                        "doc_name": doc_name,
+                        "doc_id": item.get("doc_id", ""),
+                        "status": "ok",
+                        "chunks": item.get("chunk_count", 0),
+                        "kg_status": item.get("kg_status", ""),
+                        "kg_entity_count": item.get("kg_entity_count", 0),
+                        "kg_relation_count": item.get("kg_relation_count", 0),
+                        "kg_timed_out_chunks": list(
+                            (item.get("kg_filter") or {}).get("timed_out") or []
+                        ),
+                        "stage_timings": stage_timings,
+                    }
+                    results.append(result)
+                except asyncio.TimeoutError:
+                    error_msg = (
+                        f"图谱补建超时：单个文档超过 {INDEX_DOC_TIMEOUT_SECONDS} 秒未完成"
+                    )
+                    logger.exception("Graph backfill timed out for {}", doc_name)
+                    error = {"doc_name": doc_name, "status": "error", "error": error_msg}
+                    errors.append(error)
+                    results.append(error)
+                except Exception as exc:
+                    logger.exception("Graph backfill failed for {}", doc_name)
+                    error = {"doc_name": doc_name, "status": "error", "error": str(exc)}
+                    errors.append(error)
+                    results.append(error)
+
+                await _update_index_task(
+                    task_id,
+                    current=idx + 1,
+                    current_doc="",
+                    current_doc_started_at="",
+                    current_stage="",
+                    current_stage_started_at="",
+                    results=results,
+                    errors=errors,
+                    stage_timings=stage_timings,
+                    message=f"已完成 {idx + 1}/{len(doc_names)} 个文档的图谱补建",
+                )
+
+        if len(errors) == len(doc_names):
+            status = "failed"
+            message = f"图谱补建失败: {len(errors)} 个文档失败"
+        elif errors:
+            status = "partial"
+            message = (
+                f"图谱补建部分完成: {len(doc_names) - len(errors)} 个成功，"
+                f"{len(errors)} 个失败"
+            )
+        else:
+            status = "succeeded"
+            message = f"图谱补建完成: {len(results)} 个文档"
+        await _update_index_task(
+            task_id,
+            status=status,
+            current=len(doc_names),
+            current_doc="",
+            current_doc_started_at="",
+            current_stage="",
+            current_stage_started_at="",
+            results=results,
+            errors=errors,
+            message=message,
+            phase="done",
+        )
+    except Exception as exc:
+        logger.exception("Graph backfill task crashed: {}", task_id)
+        await _update_index_task(
+            task_id,
+            status="failed",
+            current_doc="",
+            current_doc_started_at="",
+            current_stage="",
+            current_stage_started_at="",
+            results=results,
+            errors=errors or [{"doc_name": "", "status": "error", "error": str(exc)}],
+            message=f"图谱补建任务异常退出: {exc}",
             phase="done",
         )
 
@@ -2936,6 +3212,8 @@ class BatchIndexRequest(BaseModel):
     chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
     chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
     index_mode: Literal["complete", "fast"] = "complete"
+    kg_max_entities: int = Field(default=24, ge=1, le=200)
+    kg_max_records: int = Field(default=48, ge=1, le=400)
 
 class RebuildIndexRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
@@ -2943,6 +3221,14 @@ class RebuildIndexRequest(BaseModel):
     chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
     chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
     index_mode: Literal["complete", "fast"] = "complete"
+    kg_max_entities: int = Field(default=24, ge=1, le=200)
+    kg_max_records: int = Field(default=48, ge=1, le=400)
+
+class GraphBackfillRequest(BaseModel):
+    workspace: str = DEFAULT_WORKSPACE
+    doc_names: list[str]
+    kg_max_entities: int = Field(default=24, ge=1, le=200)
+    kg_max_records: int = Field(default=48, ge=1, le=400)
 
 class ClearKnowledgeBaseRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
@@ -3043,6 +3329,46 @@ async def batch_index(req: BatchIndexRequest):
     return _public_index_task(task)
 
 
+@app.post("/api/kb/graph-backfill")
+async def backfill_document_graph(req: GraphBackfillRequest):
+    """Build KG data from chunks that are already present in LightRAG."""
+    if not req.doc_names:
+        raise HTTPException(400, "No documents selected")
+    try:
+        req.doc_names = [_safe_leaf_name(name) for name in req.doc_names]
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    req.workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(req.workspace)
+    _ensure_embedding_compatible(req.workspace)
+
+    manifest = get_lightrag_service(req.workspace)._load_manifest()
+    by_name = {
+        str(item.get("doc_name") or ""): item
+        for item in manifest.get("documents", {}).values()
+        if isinstance(item, dict)
+    }
+    invalid = [
+        name
+        for name in req.doc_names
+        if name not in by_name or not by_name[name].get("indexed")
+    ]
+    if invalid:
+        raise HTTPException(
+            400,
+            f"Documents must be indexed before graph backfill: {', '.join(invalid)}",
+        )
+
+    task = await _create_index_task(
+        "kg_backfill",
+        list(req.doc_names),
+        req.workspace,
+        _index_request_config(req),
+    )
+    asyncio.create_task(_run_graph_backfill_task(task["task_id"], req))
+    return _public_index_task(task)
+
+
 @app.post("/api/kb/rebuild")
 async def rebuild_index(req: RebuildIndexRequest):
     """Clear current workspace index and rebuild only that workspace's registered documents."""
@@ -3126,6 +3452,8 @@ async def _resume_persisted_index_tasks() -> None:
         separators = list(request_config.get("separators") or _default_index_separators())
         chunk_size = int(request_config.get("chunk_size") or _default_chunk_size())
         chunk_overlap = int(request_config.get("chunk_overlap") or _default_chunk_overlap())
+        kg_max_entities = int(request_config.get("kg_max_entities") or 24)
+        kg_max_records = int(request_config.get("kg_max_records") or 48)
         try:
             doc_names = [
                 _safe_leaf_name(name)
@@ -3148,6 +3476,15 @@ async def _resume_persisted_index_tasks() -> None:
                 errors=[],
                 message="服务重启后恢复索引任务",
             )
+            if task.get("kind") == "kg_backfill":
+                backfill_req = GraphBackfillRequest(
+                    workspace=workspace,
+                    doc_names=doc_names,
+                    kg_max_entities=kg_max_entities,
+                    kg_max_records=kg_max_records,
+                )
+                asyncio.create_task(_run_graph_backfill_task(task_id, backfill_req))
+                continue
             if task.get("kind") == "single" and len(doc_names) == 1:
                 req: IndexRequest | BatchIndexRequest = IndexRequest(
                     workspace=workspace,
@@ -3155,6 +3492,9 @@ async def _resume_persisted_index_tasks() -> None:
                     separators=separators,
                     chunk_size=chunk_size,
                     chunk_overlap=chunk_overlap,
+                    index_mode=request_config.get("index_mode", "complete"),
+                    kg_max_entities=kg_max_entities,
+                    kg_max_records=kg_max_records,
                 )
             else:
                 req = BatchIndexRequest(
@@ -3163,6 +3503,9 @@ async def _resume_persisted_index_tasks() -> None:
                     separators=separators,
                     chunk_size=chunk_size,
                     chunk_overlap=chunk_overlap,
+                    index_mode=request_config.get("index_mode", "complete"),
+                    kg_max_entities=kg_max_entities,
+                    kg_max_records=kg_max_records,
                 )
             asyncio.create_task(_run_index_task(task_id, req))
         except Exception as exc:
@@ -4320,6 +4663,183 @@ def _extract_json_object(text: str) -> Any:
     return json.loads(cleaned[start:end + 1])
 
 
+def _normalize_graph_import_candidates(
+    payload: Any,
+) -> tuple[list[GraphImportEntity], list[GraphImportRelationship], list[str]]:
+    if not isinstance(payload, dict):
+        raise ValueError("Graph import result must be a JSON object")
+    warnings: list[str] = []
+    entities: list[GraphImportEntity] = []
+    relationships: list[GraphImportRelationship] = []
+    seen_entities: set[str] = set()
+    seen_relations: set[tuple[str, str, str]] = set()
+
+    for raw in payload.get("entities") or []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(
+            raw.get("entity_name")
+            or raw.get("name")
+            or raw.get("id")
+            or ""
+        ).strip()
+        if not name or name in seen_entities:
+            continue
+        seen_entities.add(name)
+        try:
+            entities.append(
+                GraphImportEntity(
+                    entity_name=name,
+                    entity_type=str(
+                        raw.get("entity_type") or raw.get("type") or "UNKNOWN"
+                    ).strip(),
+                    description=str(raw.get("description") or "").strip(),
+                    reason=str(raw.get("reason") or "").strip(),
+                )
+            )
+        except Exception:
+            warnings.append(f"已忽略无效实体: {name[:80]}")
+
+    for raw in payload.get("relationships") or payload.get("relations") or []:
+        if not isinstance(raw, dict):
+            continue
+        src_id = str(
+            raw.get("src_id")
+            or raw.get("source")
+            or raw.get("source_entity")
+            or ""
+        ).strip()
+        tgt_id = str(
+            raw.get("tgt_id")
+            or raw.get("target")
+            or raw.get("target_entity")
+            or ""
+        ).strip()
+        relation_type = str(
+            raw.get("relation_type")
+            or raw.get("type")
+            or raw.get("keywords")
+            or "关联"
+        ).strip()
+        endpoint_key = tuple(sorted((src_id, tgt_id)))
+        key = (endpoint_key[0], endpoint_key[1], relation_type)
+        if not src_id or not tgt_id or src_id == tgt_id or key in seen_relations:
+            continue
+        seen_relations.add(key)
+        try:
+            relationships.append(
+                GraphImportRelationship(
+                    src_id=src_id,
+                    tgt_id=tgt_id,
+                    relation_type=relation_type,
+                    description=str(raw.get("description") or "").strip(),
+                    keywords=str(raw.get("keywords") or relation_type).strip(),
+                    weight=raw.get("weight", 1.0),
+                    reason=str(raw.get("reason") or "").strip(),
+                )
+            )
+        except Exception:
+            warnings.append(f"已忽略无效关系: {src_id[:40]} -> {tgt_id[:40]}")
+
+    endpoint_names = {
+        name
+        for relation in relationships
+        for name in (relation.src_id, relation.tgt_id)
+    }
+    missing = sorted(endpoint_names - seen_entities)
+    if missing:
+        warnings.append(
+            f"{len(missing)} 个关系端点没有实体定义，确认导入时会创建 UNKNOWN 实体"
+        )
+    return entities, relationships, warnings
+
+
+async def _preview_graph_import(
+    *,
+    workspace: str,
+    file_name: str,
+    source_text: str,
+) -> GraphImportPreviewResponse:
+    service = get_lightrag_service(workspace)
+    warnings: list[str] = []
+    direct_payload = None
+    suffix = Path(file_name).suffix.lower()
+    if suffix == ".json":
+        try:
+            direct_payload = json.loads(source_text)
+        except Exception as exc:
+            warnings.append(f"JSON 结构解析失败，已改用模型抽取: {exc}")
+
+    used_model = direct_payload is None
+    payload = direct_payload
+    if used_model:
+        cfg = service.load_graph_governance()
+        model_text = source_text[:50000]
+        if len(source_text) > len(model_text):
+            warnings.append("文件超过 50000 字符，本次模型预览只分析前 50000 字符")
+        system_prompt = (
+            "你是知识图谱导入助手。请从用户提供的专用实体关系资料中抽取候选实体和关系，"
+            "只输出 JSON，不输出 Markdown 或解释。不要为了达到数量而补充无依据内容。"
+            "实体必须是稳定、可复用的概念或对象；关系必须由资料直接支持。"
+            "输出格式: {\"entities\":[{\"entity_name\":\"\",\"entity_type\":\"\","
+            "\"description\":\"\",\"reason\":\"\"}],\"relationships\":[{\"src_id\":\"\","
+            "\"tgt_id\":\"\",\"relation_type\":\"\",\"description\":\"\",\"keywords\":\"\","
+            "\"weight\":1.0,\"reason\":\"\"}]}。"
+        )
+        user_payload = {
+            "allowed_entity_types": cfg.get("entity_types") or [],
+            "preferred_relationship_types": cfg.get("relation_types") or [],
+            "extraction_mode": cfg.get("extraction_mode") or "assist",
+            "extraction_guidance": service.graph_extraction_guidance(config=cfg),
+            "source_file": file_name,
+            "source_text": model_text,
+        }
+        runtime_kg = get_runtime_model_config(get_config())["kg"]
+        backend = SiliconFlowBackend(
+            {
+                "base_url": runtime_kg["base_url"],
+                "api_key": runtime_kg["api_key"],
+                "chat_model": runtime_kg["model"],
+                "timeout": runtime_kg.get("timeout", 180),
+            }
+        )
+        try:
+            response = await backend.chat(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": json.dumps(user_payload, ensure_ascii=False),
+                    },
+                ],
+                temperature=0.0,
+                top_p=0.8,
+                max_tokens=min(int(runtime_kg.get("max_tokens", 4096)), 8192),
+            )
+        finally:
+            await backend.close()
+        try:
+            payload = _extract_json_object(response.content)
+        except Exception as exc:
+            raise HTTPException(502, f"Failed to parse graph import candidates: {exc}")
+
+    try:
+        entities, relationships, normalize_warnings = _normalize_graph_import_candidates(payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    warnings.extend(normalize_warnings)
+    if not entities and not relationships:
+        warnings.append("未从文件中识别到可导入的实体或关系")
+    return GraphImportPreviewResponse(
+        file_name=Path(file_name).name,
+        source_text=source_text,
+        entities=entities,
+        relationships=relationships,
+        warnings=warnings,
+        used_model=used_model,
+    )
+
+
 async def _generate_graph_suggestions(req: GraphSuggestRequest) -> GraphSuggestResponse:
     service = get_lightrag_service(req.workspace)
     cfg = service.load_graph_governance()
@@ -4504,6 +5024,53 @@ async def delete_graph_reference(ref_id: str, workspace: str = Query(DEFAULT_WOR
         raise HTTPException(404, "Reference file not found")
 
 
+@app.get("/api/graph/imports")
+async def list_graph_imports(workspace: str = Query(DEFAULT_WORKSPACE)):
+    workspace = sanitize_workspace(workspace)
+    return get_lightrag_service(workspace).list_graph_imports()
+
+
+@app.post("/api/graph/imports/preview", response_model=GraphImportPreviewResponse)
+async def preview_graph_import(
+    file: UploadFile = File(...),
+    workspace: str = Query(DEFAULT_WORKSPACE),
+):
+    workspace = sanitize_workspace(workspace)
+    _ensure_workspace_available(workspace)
+    content = await _read_governance_reference_upload(file)
+    if not content.strip():
+        raise HTTPException(400, "Graph import file is empty")
+    if len(content) > 200000:
+        raise HTTPException(413, "Graph import file exceeds the 200000 character limit")
+    return await _preview_graph_import(
+        workspace=workspace,
+        file_name=file.filename or "graph-import.txt",
+        source_text=content,
+    )
+
+
+@app.post("/api/graph/imports/confirm")
+async def confirm_graph_import(req: GraphImportConfirmRequest):
+    workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(workspace)
+    if not req.entities and not req.relationships:
+        raise HTTPException(400, "No graph candidates selected")
+    async with _get_workspace_rag_lock(workspace):
+        try:
+            result = await get_lightrag_service(workspace).import_custom_graph(
+                file_name=req.file_name,
+                source_text=req.source_text,
+                entities=[item.model_dump() for item in req.entities],
+                relationships=[item.model_dump() for item in req.relationships],
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except Exception as exc:
+            logger.exception("Failed to import reviewed graph candidates")
+            raise HTTPException(500, f"Graph import failed: {exc}")
+    return {"workspace": workspace, **result}
+
+
 @app.post("/api/graph/governance/suggest", response_model=GraphSuggestResponse)
 async def suggest_graph_changes(req: GraphSuggestRequest):
     req.workspace = sanitize_workspace(req.workspace)
@@ -4659,7 +5226,7 @@ def main():
     """Entry point for `python -m src.api.server`."""
     uvicorn.run(
         "src.api.server:app",
-        host=os.environ.get("TDX_HOST", "127.0.0.1"),
+        host=os.environ.get("LIGHTGRAPHRAG_HOST", "127.0.0.1"),
         port=8101,
         reload=True,
     )

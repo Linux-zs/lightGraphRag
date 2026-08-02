@@ -38,7 +38,7 @@ const DEFAULT_ANSWER_SYSTEM_PROMPT =
   '引用资料时在相关句子末尾使用 [数字] 标记，数字必须来自参考资料编号。'
 
 const DEFAULT_CONFIG: ModelConfig = {
-  workspace: 'tdx_default',
+  workspace: 'default',
   embed_model: 'BAAI/bge-large-zh-v1.5',
   embed_base_url: 'https://api.siliconflow.cn/v1',
   rerank_model: 'BAAI/bge-reranker-v2-m3',

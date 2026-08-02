@@ -31,7 +31,7 @@ paths:
         encoding="utf-8",
     )
     monkeypatch.setattr("src.config_loader._DEFAULT_CONFIG_PATH", default)
-    monkeypatch.setenv("TDX_CONFIG_LOCAL_PATH", str(local))
+    monkeypatch.setenv("LIGHTGRAPHRAG_CONFIG_LOCAL_PATH", str(local))
 
     config = load_config()
 
@@ -45,8 +45,8 @@ def test_env_config_path_skips_default_local_override(tmp_path, monkeypatch):
     local = tmp_path / "local.yaml"
     custom.write_text("paths:\n  docs_dir: ./custom-docs\n", encoding="utf-8")
     local.write_text("paths:\n  docs_dir: ./local-docs\n", encoding="utf-8")
-    monkeypatch.setenv("TDX_CONFIG_PATH", str(custom))
-    monkeypatch.setenv("TDX_CONFIG_LOCAL_PATH", str(local))
+    monkeypatch.setenv("LIGHTGRAPHRAG_CONFIG_PATH", str(custom))
+    monkeypatch.setenv("LIGHTGRAPHRAG_CONFIG_LOCAL_PATH", str(local))
 
     config = load_config(Path("ignored.yaml"))
 

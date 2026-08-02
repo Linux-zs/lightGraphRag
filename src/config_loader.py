@@ -34,8 +34,8 @@ def _apply_env_overrides(config: dict) -> dict:
     env_map = {
         "OLLAMA_HOST": ("ollama", "host"),
         "OLLAMA_MODEL": ("ollama", "model"),
-        "TDX_DOCS_DIR": ("paths", "docs_dir"),
-        "TDX_DATA_DIR": ("paths", "data_dir"),
+        "LIGHTGRAPHRAG_DOCS_DIR": ("paths", "docs_dir"),
+        "LIGHTGRAPHRAG_DATA_DIR": ("paths", "data_dir"),
     }
     for env_var, (section, key) in env_map.items():
         value = os.environ.get(env_var)
@@ -66,8 +66,8 @@ def load_config(config_path: Path | None = None) -> dict:
     Args:
         config_path: Optional custom config path. Defaults to config/default.yaml.
             When using the default config, config/local.yaml is loaded as a
-            machine-local override if it exists. TDX_CONFIG_PATH can replace
-            the main config path, and TDX_CONFIG_LOCAL_PATH can replace the
+            machine-local override if it exists. LIGHTGRAPHRAG_CONFIG_PATH can replace
+            the main config path, and LIGHTGRAPHRAG_CONFIG_LOCAL_PATH can replace the
             local override path.
 
     Returns:
@@ -76,12 +76,14 @@ def load_config(config_path: Path | None = None) -> dict:
     Raises:
         ConfigError: If config file cannot be loaded.
     """
-    env_config_path = os.environ.get("TDX_CONFIG_PATH")
+    env_config_path = os.environ.get("LIGHTGRAPHRAG_CONFIG_PATH")
     path = Path(env_config_path) if env_config_path else (config_path or _DEFAULT_CONFIG_PATH)
     config = load_yaml(path)
     default_path = _DEFAULT_CONFIG_PATH.resolve()
     if path.resolve() == default_path:
-        local_path = Path(os.environ.get("TDX_CONFIG_LOCAL_PATH", _LOCAL_CONFIG_PATH))
+        local_path = Path(
+            os.environ.get("LIGHTGRAPHRAG_CONFIG_LOCAL_PATH", _LOCAL_CONFIG_PATH)
+        )
         if local_path.exists():
             config = _deep_merge(config, load_yaml(local_path))
     config = _apply_env_overrides(config)

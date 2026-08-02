@@ -1,4 +1,5 @@
 const BASE = '/api'
+const DEFAULT_WORKSPACE = 'default'
 
 function formatApiError(payload: unknown, fallback: string): string {
   if (!payload) return fallback
@@ -140,6 +141,10 @@ export interface DocInfo {
   index_mode?: 'complete' | 'fast'
   kg_status?: 'complete' | 'skipped' | 'filtered_empty' | 'failed' | string
   kg_model?: string
+  kg_extraction_limits?: {
+    max_entities_per_chunk?: number
+    max_records_per_chunk?: number
+  }
 }
 
 export interface WorkspaceInfo {
@@ -193,7 +198,7 @@ export interface UploadedDocument {
   index_invalidated: boolean
 }
 
-export function uploadDocument(file: File, workspace = 'tdx_default'): Promise<UploadedDocument> {
+export function uploadDocument(file: File, workspace = DEFAULT_WORKSPACE): Promise<UploadedDocument> {
   const form = new FormData()
   form.append('file', file)
   return fetch(`${BASE}/kb/upload?workspace=${encodeURIComponent(workspace)}`, {
@@ -228,6 +233,8 @@ export function indexDocument(params: {
   chunk_size: number
   chunk_overlap: number
   index_mode?: 'complete' | 'fast'
+  kg_max_entities?: number
+  kg_max_records?: number
 }) {
   return request<IndexTask>(
     '/kb/index',
@@ -235,7 +242,7 @@ export function indexDocument(params: {
   )
 }
 
-export function listDocuments(workspace = 'tdx_default') {
+export function listDocuments(workspace = DEFAULT_WORKSPACE) {
   return request<DocInfo[]>(`/kb/documents?workspace=${encodeURIComponent(workspace)}`)
 }
 
@@ -260,7 +267,7 @@ export interface DocumentDeleteCleanup {
   cleanup_error?: string
 }
 
-export function deleteDocument(docName: string, workspace = 'tdx_default') {
+export function deleteDocument(docName: string, workspace = DEFAULT_WORKSPACE) {
   return request<{
     deleted: number
     doc_id: string
@@ -272,7 +279,7 @@ export function deleteDocument(docName: string, workspace = 'tdx_default') {
   )
 }
 
-export function batchDeleteDocuments(docNames: string[], workspace = 'tdx_default') {
+export function batchDeleteDocuments(docNames: string[], workspace = DEFAULT_WORKSPACE) {
   return request<{
     deleted_chunks: number
     doc_count: number
@@ -293,6 +300,8 @@ export function batchIndexDocuments(params: {
   chunk_size: number
   chunk_overlap: number
   index_mode?: 'complete' | 'fast'
+  kg_max_entities?: number
+  kg_max_records?: number
 }) {
   return request<IndexTask>(
     '/kb/batch-index',
@@ -307,6 +316,8 @@ export interface IndexTaskResult {
   chunks?: number
   error?: string
   kg_status?: string
+  kg_entity_count?: number
+  kg_relation_count?: number
   kg_timed_out_chunks?: string[]
   stage_timings?: {
     parse: number
@@ -318,7 +329,7 @@ export interface IndexTaskResult {
 
 export interface IndexTask {
   task_id: string
-  kind: 'single' | 'batch' | 'rebuild'
+  kind: 'single' | 'batch' | 'rebuild' | 'kg_backfill'
   workspace?: string
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'partial' | 'cancelled'
   doc_names: string[]
@@ -342,6 +353,9 @@ export interface IndexTask {
     chunk_size?: number
     chunk_overlap?: number
     index_mode?: 'complete' | 'fast'
+    operation?: 'index' | 'kg_backfill'
+    kg_max_entities?: number
+    kg_max_records?: number
   }
   results: IndexTaskResult[]
   errors: IndexTaskResult[]
@@ -371,13 +385,13 @@ export interface RawTextResponse {
   source: string
 }
 
-export function getDocumentRawText(docName: string, workspace = 'tdx_default') {
+export function getDocumentRawText(docName: string, workspace = DEFAULT_WORKSPACE) {
   return request<RawTextResponse>(
     `/kb/documents/${encodeURIComponent(docName)}/raw-text?workspace=${encodeURIComponent(workspace)}`,
   )
 }
 
-export function updateDocumentRawText(docName: string, raw_text: string, workspace = 'tdx_default') {
+export function updateDocumentRawText(docName: string, raw_text: string, workspace = DEFAULT_WORKSPACE) {
   return request<{ file_name: string; char_count: number; message: string }>(
     `/kb/documents/${encodeURIComponent(docName)}/raw-text?workspace=${encodeURIComponent(workspace)}`,
     { method: 'PUT', body: JSON.stringify({ raw_text }) },
@@ -399,7 +413,7 @@ export interface DocumentChunksResponse {
   chunks: DocumentChunkItem[]
 }
 
-export function getDocumentChunks(docName: string, workspace = 'tdx_default') {
+export function getDocumentChunks(docName: string, workspace = DEFAULT_WORKSPACE) {
   return request<DocumentChunksResponse>(
     `/kb/documents/${encodeURIComponent(docName)}/chunks?workspace=${encodeURIComponent(workspace)}`,
   )
@@ -454,11 +468,11 @@ export function search(params: {
 
 // --- Models ---
 
-export function getModelConfig(workspace = 'tdx_default') {
+export function getModelConfig(workspace = DEFAULT_WORKSPACE) {
   return request<ModelConfig>(`/models/config?workspace=${encodeURIComponent(workspace)}`)
 }
 
-export function updateModelConfig(config: ModelConfig, workspace = 'tdx_default') {
+export function updateModelConfig(config: ModelConfig, workspace = DEFAULT_WORKSPACE) {
   return request<{ status: string }>(
     `/models/config?workspace=${encodeURIComponent(workspace)}`,
     {
@@ -534,6 +548,18 @@ export interface ModelBindings {
   kg: ModelBinding
   embedding: ModelBinding
   rerank: ModelBinding
+}
+
+export function backfillDocumentGraph(params: {
+  workspace?: string
+  doc_names: string[]
+  kg_max_entities?: number
+  kg_max_records?: number
+}) {
+  return request<IndexTask>('/kb/graph-backfill', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  })
 }
 
 export function listModelProfiles() {
@@ -628,7 +654,7 @@ export interface SystemStats {
   lightrag_dir_size?: string
 }
 
-export function getSystemStats(workspace = 'tdx_default') {
+export function getSystemStats(workspace = DEFAULT_WORKSPACE) {
   return request<SystemStats>(`/system/stats?workspace=${encodeURIComponent(workspace)}`)
 }
 
@@ -667,7 +693,7 @@ export interface ClearKnowledgeBaseResult {
   removed_uploads: number
 }
 
-export function clearKnowledgeBase(clearUploads = false, workspace = 'tdx_default') {
+export function clearKnowledgeBase(clearUploads = false, workspace = DEFAULT_WORKSPACE) {
   return request<ClearKnowledgeBaseResult>('/kb/clear', {
     method: 'POST',
     body: JSON.stringify({ workspace, clear_uploads: clearUploads }),
@@ -728,7 +754,7 @@ export interface GraphData {
   }
 }
 
-export function getGraph(limit = 200, workspace = 'tdx_default') {
+export function getGraph(limit = 200, workspace = DEFAULT_WORKSPACE) {
   return request<GraphData>(`/graph?limit=${limit}&workspace=${encodeURIComponent(workspace)}`)
 }
 
@@ -802,13 +828,13 @@ export interface GraphChange {
   target_entity_data?: Record<string, unknown>
 }
 
-export function getGraphGovernanceConfig(workspace = 'tdx_default') {
+export function getGraphGovernanceConfig(workspace = DEFAULT_WORKSPACE) {
   return request<GraphGovernanceConfig>(
     `/graph/governance/config?workspace=${encodeURIComponent(workspace)}`,
   )
 }
 
-export function listGraphRuleTemplates(workspace = 'tdx_default') {
+export function listGraphRuleTemplates(workspace = DEFAULT_WORKSPACE) {
   return request<GraphRuleTemplate[]>(
     `/graph/rule-templates?workspace=${encodeURIComponent(workspace)}`,
   )
@@ -851,7 +877,7 @@ export function updateGraphGovernanceConfig(config: {
   })
 }
 
-export function uploadGraphReference(file: File, workspace = 'tdx_default') {
+export function uploadGraphReference(file: File, workspace = DEFAULT_WORKSPACE) {
   const form = new FormData()
   form.append('file', file)
   return fetch(`${BASE}/graph/governance/references?workspace=${encodeURIComponent(workspace)}`, {
@@ -866,10 +892,84 @@ export function uploadGraphReference(file: File, workspace = 'tdx_default') {
   })
 }
 
-export function deleteGraphReference(refId: string, workspace = 'tdx_default') {
+export function deleteGraphReference(refId: string, workspace = DEFAULT_WORKSPACE) {
   return request<{ deleted: string }>(
     `/graph/governance/references/${encodeURIComponent(refId)}?workspace=${encodeURIComponent(workspace)}`,
     { method: 'DELETE' },
+  )
+}
+
+export interface GraphImportEntity {
+  entity_name: string
+  entity_type: string
+  description: string
+  reason?: string
+}
+
+export interface GraphImportRelationship {
+  src_id: string
+  tgt_id: string
+  relation_type: string
+  description: string
+  keywords: string
+  weight: number
+  reason?: string
+}
+
+export interface GraphImportPreview {
+  file_name: string
+  source_text: string
+  entities: GraphImportEntity[]
+  relationships: GraphImportRelationship[]
+  warnings: string[]
+  used_model: boolean
+}
+
+export interface GraphImportHistoryItem {
+  import_id: string
+  file_name: string
+  entity_count: number
+  relationship_count: number
+  created_at: string
+}
+
+export function previewGraphImport(file: File, workspace = DEFAULT_WORKSPACE) {
+  const form = new FormData()
+  form.append('file', file)
+  return fetch(`${BASE}/graph/imports/preview?workspace=${encodeURIComponent(workspace)}`, {
+    method: 'POST',
+    body: form,
+  }).then(async (r) => {
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ detail: r.statusText }))
+      throw new Error(formatApiError(err, `HTTP ${r.status}`))
+    }
+    return r.json() as Promise<GraphImportPreview>
+  })
+}
+
+export function confirmGraphImport(params: {
+  workspace?: string
+  file_name: string
+  source_text: string
+  entities: GraphImportEntity[]
+  relationships: GraphImportRelationship[]
+}) {
+  return request<{
+    workspace: string
+    import_id: string
+    file_name: string
+    entity_count: number
+    relationship_count: number
+  }>('/graph/imports/confirm', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  })
+}
+
+export function listGraphImports(workspace = DEFAULT_WORKSPACE) {
+  return request<GraphImportHistoryItem[]>(
+    `/graph/imports?workspace=${encodeURIComponent(workspace)}`,
   )
 }
 
@@ -900,7 +1000,7 @@ export function updateGraphEntity(params: {
   })
 }
 
-export function deleteGraphEntity(entityName: string, workspace = 'tdx_default') {
+export function deleteGraphEntity(entityName: string, workspace = DEFAULT_WORKSPACE) {
   return request<{ status: string; data: unknown }>(
     `/graph/entities/${encodeURIComponent(entityName)}?workspace=${encodeURIComponent(workspace)}`,
     { method: 'DELETE' },
@@ -1075,17 +1175,17 @@ export function chatSendStream(params: {
   })
 }
 
-export function listChatSessions(workspace = 'tdx_default') {
+export function listChatSessions(workspace = DEFAULT_WORKSPACE) {
   return request<ChatSessionListItem[]>(`/chat/sessions?workspace=${encodeURIComponent(workspace)}`)
 }
 
-export function getChatSession(sessionId: string, workspace = 'tdx_default') {
+export function getChatSession(sessionId: string, workspace = DEFAULT_WORKSPACE) {
   return request<ChatSession>(
     `/chat/sessions/${encodeURIComponent(sessionId)}?workspace=${encodeURIComponent(workspace)}`,
   )
 }
 
-export function deleteChatSession(sessionId: string, workspace = 'tdx_default') {
+export function deleteChatSession(sessionId: string, workspace = DEFAULT_WORKSPACE) {
   return request<{ deleted: string }>(
     `/chat/sessions/${encodeURIComponent(sessionId)}?workspace=${encodeURIComponent(workspace)}`,
     {
@@ -1097,7 +1197,7 @@ export function deleteChatSession(sessionId: string, workspace = 'tdx_default') 
 export function updateChatSessionSettings(
   sessionId: string,
   settings: ChatSettings,
-  workspace = 'tdx_default',
+  workspace = DEFAULT_WORKSPACE,
 ) {
   return request<ChatSettings>(
     `/chat/sessions/${encodeURIComponent(sessionId)}/settings?workspace=${encodeURIComponent(workspace)}`,
@@ -1108,7 +1208,7 @@ export function updateChatSessionSettings(
   )
 }
 
-export function createChatSession(workspace = 'tdx_default', settings?: ChatSettings) {
+export function createChatSession(workspace = DEFAULT_WORKSPACE, settings?: ChatSettings) {
   return request<ChatSessionListItem>('/chat/sessions', {
     method: 'POST',
     body: JSON.stringify({ workspace, settings }),

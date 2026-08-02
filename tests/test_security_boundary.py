@@ -100,7 +100,7 @@ def test_plaintext_model_key_store_is_migrated(tmp_path):
     ],
 )
 def test_model_api_base_rejects_unsafe_targets(url, monkeypatch):
-    monkeypatch.delenv("TDX_ALLOW_PRIVATE_MODEL_HOSTS", raising=False)
+    monkeypatch.delenv("LIGHTGRAPHRAG_ALLOW_PRIVATE_MODEL_HOSTS", raising=False)
     with pytest.raises(ValueError):
         model_profiles._normalize_api_base(url)
 

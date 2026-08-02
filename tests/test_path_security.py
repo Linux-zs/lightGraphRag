@@ -34,7 +34,7 @@ def test_resolve_upload_path_stays_under_upload_root(tmp_path, monkeypatch):
 
     resolved = server._resolve_upload_path("文档.txt")
 
-    workspace_dir = (upload_dir / "tdx_default").resolve()
+    workspace_dir = (upload_dir / "default").resolve()
     assert resolved == (workspace_dir / "文档.txt").resolve()
     assert resolved.parent == workspace_dir
 
@@ -65,7 +65,7 @@ def test_index_endpoint_rejects_traversal_before_disk_access():
         asyncio.run(
             server.index_document(
                 server.IndexRequest(
-                    workspace="tdx_default",
+                    workspace="default",
                     file_name=r"..\outside.txt",
                 )
             )

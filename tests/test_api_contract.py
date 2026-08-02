@@ -108,6 +108,31 @@ def test_index_stage_progression_is_monotonic():
     assert server._should_advance_index_stage("chunk_vector", "chunk_vector") is False
 
 
+def test_graph_import_candidate_normalization_accepts_common_field_aliases():
+    entities, relationships, warnings = server._normalize_graph_import_candidates(
+        {
+            "entities": [
+                {"name": "A", "type": "system", "description": "source"},
+                {"entity_name": "A", "entity_type": "duplicate"},
+            ],
+            "relations": [
+                {
+                    "source": "A",
+                    "target": "B",
+                    "type": "depends",
+                    "description": "A depends on B",
+                }
+            ],
+        }
+    )
+
+    assert [item.entity_name for item in entities] == ["A"]
+    assert relationships[0].src_id == "A"
+    assert relationships[0].tgt_id == "B"
+    assert relationships[0].relation_type == "depends"
+    assert "UNKNOWN" in warnings[0]
+
+
 def test_system_logs_returns_filtered_tail(tmp_path, monkeypatch):
     log_path = tmp_path / "app.log"
     log_path.write_text(

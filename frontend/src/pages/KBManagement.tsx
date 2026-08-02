@@ -11,6 +11,7 @@ import {
   deleteDocument,
   batchDeleteDocuments,
   batchIndexDocuments,
+  backfillDocumentGraph,
   getIndexTask,
   listIndexTasks,
   cancelIndexTask,
@@ -28,6 +29,16 @@ import {
 } from '../api'
 
 type UploadedFile = UploadedDocument
+type KGExtractionDensity = 'sparse' | 'standard' | 'dense' | 'custom'
+
+const KG_DENSITY_PRESETS: Record<
+  Exclude<KGExtractionDensity, 'custom'>,
+  { label: string; entities: number; records: number; hint: string }
+> = {
+  sparse: { label: '精简', entities: 8, records: 16, hint: '术语少、文本短，优先降噪' },
+  standard: { label: '标准', entities: 24, records: 48, hint: '适合大多数技术和业务文档' },
+  dense: { label: '密集', entities: 40, records: 80, hint: '实体关系丰富的规范资料' },
+}
 
 interface Props {
   workspace: string
@@ -49,6 +60,9 @@ export default function KBManagement({
   const [chunkSize, setChunkSize] = useState(1024)
   const [chunkOverlap, setChunkOverlap] = useState(100)
   const [indexMode, setIndexMode] = useState<'complete' | 'fast'>('complete')
+  const [kgDensity, setKgDensity] = useState<KGExtractionDensity>('standard')
+  const [kgMaxEntities, setKgMaxEntities] = useState(24)
+  const [kgMaxRecords, setKgMaxRecords] = useState(48)
   const [advancedIndexOpen, setAdvancedIndexOpen] = useState(false)
 
   // Preview & index state
@@ -178,11 +192,16 @@ export default function KBManagement({
       const tasks = await listIndexTasks()
       if (!mountedRef.current || taskRunIdRef.current !== runId) return
       const candidates = tasks.filter(
-        (task) => task.workspace === workspace && (task.kind === 'single' || task.kind === 'batch'),
+        (task) => task.workspace === workspace &&
+          (task.kind === 'single' || task.kind === 'batch' || task.kind === 'kg_backfill'),
       )
-      const pickTask = (kind: 'single' | 'batch') =>
-        candidates.find((task) => task.kind === kind && !isTaskTerminal(task)) ||
-        candidates.find((task) => task.kind === kind && isRecentTask(task))
+      const pickTask = (kind: 'single' | 'batch') => {
+        const matches = (task: IndexTask) => kind === 'single'
+          ? task.kind === 'single'
+          : task.kind === 'batch' || task.kind === 'kg_backfill'
+        return candidates.find((task) => matches(task) && !isTaskTerminal(task)) ||
+          candidates.find((task) => matches(task) && isRecentTask(task))
+      }
 
       const singleTask = pickTask('single')
       if (singleTask) {
@@ -253,6 +272,17 @@ export default function KBManagement({
     if (status === 'failed') return 'bg-red-50 text-red-700'
     return 'bg-gray-100 text-gray-600'
   }
+
+  const selectKgDensity = (density: KGExtractionDensity) => {
+    setKgDensity(density)
+    if (density === 'custom') return
+    const preset = KG_DENSITY_PRESETS[density]
+    setKgMaxEntities(preset.entities)
+    setKgMaxRecords(preset.records)
+  }
+
+  const canBackfillGraph = (doc: DocInfo) =>
+    Boolean(doc.indexed) && doc.kg_status !== 'complete'
 
   const handleDeleteWorkspace = async () => {
     if (isDefaultWorkspace || deletingWorkspace) return
@@ -383,6 +413,8 @@ export default function KBManagement({
         chunk_size: chunkSize,
         chunk_overlap: chunkOverlap,
         index_mode: indexMode,
+        kg_max_entities: kgMaxEntities,
+        kg_max_records: kgMaxRecords,
       })
       setIndexTask(task)
       setIndexMsg(`索引任务已创建: ${task.task_id}`)
@@ -522,6 +554,8 @@ export default function KBManagement({
         chunk_size: chunkSize,
         chunk_overlap: chunkOverlap,
         index_mode: indexMode,
+        kg_max_entities: kgMaxEntities,
+        kg_max_records: kgMaxRecords,
       })
       setBatchIndexTask(task)
       setBatchMsg(`批量索引任务已创建: ${task.task_id}`)
@@ -532,6 +566,34 @@ export default function KBManagement({
       if (finalTask.status !== 'failed') setCheckedDocs(new Set())
     } catch (e: unknown) {
       setBatchMsg(`批量索引失败: ${(e as Error).message}`)
+    } finally {
+      setBatchIndexing(false)
+    }
+  }
+
+  const handleGraphBackfill = async (docNames: string[]) => {
+    const eligible = docNames.filter((name) => {
+      const doc = docs.find((item) => item.doc_name === name)
+      return doc ? canBackfillGraph(doc) : false
+    })
+    if (eligible.length === 0) return
+    setBatchIndexing(true)
+    setBatchMsg('')
+    setBatchIndexTask(null)
+    try {
+      const task = await backfillDocumentGraph({
+        workspace,
+        doc_names: eligible,
+        kg_max_entities: kgMaxEntities,
+        kg_max_records: kgMaxRecords,
+      })
+      setBatchIndexTask(task)
+      setBatchMsg(`图谱补建任务已创建: ${task.task_id}`)
+      const finalTask = await pollIndexTask(task.task_id, setBatchIndexTask)
+      setBatchMsg(formatBatchTaskMessage(finalTask))
+      if (finalTask.status !== 'failed') setCheckedDocs(new Set())
+    } catch (e: unknown) {
+      setBatchMsg(`图谱补建失败: ${(e as Error).message || '未知错误'}`)
     } finally {
       setBatchIndexing(false)
     }
@@ -563,18 +625,25 @@ export default function KBManagement({
     const updatedClock = formatClock(task.updated_at)
     const stageTimings = task.stage_timings ?? { parse: 0, chunk_vector: 0, kg: 0, merge: 0 }
     const currentStage = task.current_stage
-    const taskMode = task.request?.index_mode === 'fast' ? '快速索引' : '完整索引'
+    const taskMode = task.kind === 'kg_backfill'
+      ? '图谱补建'
+      : task.request?.index_mode === 'fast'
+        ? '快速索引'
+        : '完整索引'
     const statusDotClass = failed
       ? 'bg-red-500'
       : terminal
         ? 'bg-green-500'
         : 'bg-primary-500 animate-pulse'
-    const STAGE_CARDS: { key: keyof NonNullable<IndexTask['stage_timings']>; label: string }[] = [
+    const ALL_STAGE_CARDS: { key: keyof NonNullable<IndexTask['stage_timings']>; label: string }[] = [
       { key: 'parse', label: '解析' },
       { key: 'chunk_vector', label: 'Chunk向量' },
       { key: 'kg', label: 'KG抽取' },
       { key: 'merge', label: '图谱/落盘' },
     ]
+    const STAGE_CARDS = task.kind === 'kg_backfill'
+      ? ALL_STAGE_CARDS.filter((stage) => stage.key === 'kg' || stage.key === 'merge')
+      : ALL_STAGE_CARDS
 
     return (
       <div className={`mt-3 rounded-lg border p-3 text-sm ${
@@ -840,6 +909,83 @@ export default function KBManagement({
           </div>
         </div>
 
+        <div className="mt-3 rounded-lg border border-gray-200 p-3">
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <div className="text-sm font-medium text-gray-700">图谱抽取密度</div>
+              <p className="mt-0.5 text-xs text-gray-500">
+                数量是每个文本块的上限，不是抽取目标；内容不足时不会强行凑满。
+              </p>
+            </div>
+            <span className="text-xs text-gray-400">用于完整索引和后续图谱补建</span>
+          </div>
+          <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {(Object.entries(KG_DENSITY_PRESETS) as [
+              Exclude<KGExtractionDensity, 'custom'>,
+              (typeof KG_DENSITY_PRESETS)[Exclude<KGExtractionDensity, 'custom'>],
+            ][]).map(([key, preset]) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => selectKgDensity(key)}
+                className={`rounded-lg border px-3 py-2 text-left transition ${
+                  kgDensity === key
+                    ? 'border-primary-300 bg-primary-50 ring-1 ring-primary-100'
+                    : 'border-gray-200 bg-white hover:border-gray-300'
+                }`}
+              >
+                <span className="block text-sm font-medium text-gray-800">{preset.label}</span>
+                <span className="mt-0.5 block text-[11px] text-gray-500">
+                  实体 {preset.entities} / 记录 {preset.records}
+                </span>
+                <span className="mt-1 block text-[11px] leading-4 text-gray-400">{preset.hint}</span>
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={() => selectKgDensity('custom')}
+              className={`rounded-lg border px-3 py-2 text-left transition ${
+                kgDensity === 'custom'
+                  ? 'border-primary-300 bg-primary-50 ring-1 ring-primary-100'
+                  : 'border-gray-200 bg-white hover:border-gray-300'
+              }`}
+            >
+              <span className="block text-sm font-medium text-gray-800">自定义</span>
+              <span className="mt-0.5 block text-[11px] text-gray-500">按文档复杂度设置上限</span>
+            </button>
+          </div>
+          <div className="mt-3 grid max-w-xl grid-cols-1 gap-3 sm:grid-cols-2">
+            <label>
+              <span className="ui-label">每块实体上限</span>
+              <input
+                type="number"
+                min={1}
+                max={200}
+                value={kgMaxEntities}
+                onChange={(e) => {
+                  setKgDensity('custom')
+                  setKgMaxEntities(Math.max(1, Math.min(200, Number(e.target.value) || 1)))
+                }}
+                className="ui-control w-full"
+              />
+            </label>
+            <label>
+              <span className="ui-label">每块实体与关系统计记录上限</span>
+              <input
+                type="number"
+                min={1}
+                max={400}
+                value={kgMaxRecords}
+                onChange={(e) => {
+                  setKgDensity('custom')
+                  setKgMaxRecords(Math.max(1, Math.min(400, Number(e.target.value) || 1)))
+                }}
+                className="ui-control w-full"
+              />
+            </label>
+          </div>
+        </div>
+
         <button
           type="button"
           onClick={() => setAdvancedIndexOpen((open) => !open)}
@@ -973,6 +1119,15 @@ export default function KBManagement({
             >
               {batchIndexing ? '索引中...' : '批量索引'}
             </button>
+            {docs.some((doc) => checkedDocs.has(doc.doc_name) && canBackfillGraph(doc)) && (
+              <button
+                onClick={() => handleGraphBackfill([...checkedDocs])}
+                disabled={batchIndexing}
+                className="px-3 py-1.5 text-xs font-medium rounded border border-violet-200 bg-white text-violet-700 hover:bg-violet-50 disabled:opacity-50 transition-colors"
+              >
+                {batchIndexing ? '处理中...' : '补建图谱'}
+              </button>
+            )}
             <button
               onClick={handleBatchDelete}
               disabled={batchDeleting}
@@ -1054,7 +1209,12 @@ export default function KBManagement({
                     <td className="py-2.5 text-gray-600">{doc.chunk_count}</td>
                     <td className="py-2.5">
                       <span
-                        title={doc.kg_model || ''}
+                        title={[
+                          doc.kg_model,
+                          doc.kg_extraction_limits?.max_entities_per_chunk
+                            ? `每块实体上限 ${doc.kg_extraction_limits.max_entities_per_chunk}，记录上限 ${doc.kg_extraction_limits.max_records_per_chunk}`
+                            : '',
+                        ].filter(Boolean).join(' · ')}
                         className={`text-xs px-2 py-0.5 rounded ${kgStatusClass(doc.kg_status)}`}
                       >
                         {kgStatusLabel(doc.kg_status)}
@@ -1082,14 +1242,26 @@ export default function KBManagement({
                         {doc.status || (doc.indexed ? 'indexed' : 'uploaded')}
                       </span>
                     </td>
-                    <td className="py-2.5 text-right">
-                      <button
-                        onClick={() => handleDelete(doc.doc_name)}
-                        disabled={deleting === doc.doc_name}
-                        className="text-xs text-red-500 hover:text-red-700 disabled:opacity-50"
-                      >
-                        {deleting === doc.doc_name ? '删除中...' : '删除'}
-                      </button>
+                    <td className="py-2.5">
+                      <div className="flex items-center justify-end gap-3">
+                        {canBackfillGraph(doc) && (
+                          <button
+                            onClick={() => handleGraphBackfill([doc.doc_name])}
+                            disabled={batchIndexing}
+                            className="text-xs text-violet-600 hover:text-violet-800 disabled:opacity-50"
+                            title="复用已有文本块，只补建实体和关系"
+                          >
+                            补建图谱
+                          </button>
+                        )}
+                        <button
+                          onClick={() => handleDelete(doc.doc_name)}
+                          disabled={deleting === doc.doc_name}
+                          className="text-xs text-red-500 hover:text-red-700 disabled:opacity-50"
+                        >
+                          {deleting === doc.doc_name ? '删除中...' : '删除'}
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}

@@ -3,25 +3,25 @@
 from __future__ import annotations
 
 
-class TDXKnowledgeBaseError(Exception):
+class KnowledgeBaseError(Exception):
     """Base exception for all workbench errors."""
 
 
-class ConfigError(TDXKnowledgeBaseError):
+class ConfigError(KnowledgeBaseError):
     """Configuration loading or validation error."""
 
 
-class DocProcessError(TDXKnowledgeBaseError):
+class DocProcessError(KnowledgeBaseError):
     """Document processing error (loading, parsing, chunking)."""
 
 
-class EmbeddingError(TDXKnowledgeBaseError):
+class EmbeddingError(KnowledgeBaseError):
     """Embedding generation error."""
 
 
-class GraphError(TDXKnowledgeBaseError):
+class GraphError(KnowledgeBaseError):
     """Knowledge graph operation error."""
 
 
-class LLMError(TDXKnowledgeBaseError):
+class LLMError(KnowledgeBaseError):
     """LLM backend call error."""

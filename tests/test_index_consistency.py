@@ -1,4 +1,6 @@
 import asyncio
+import json
+from contextlib import nullcontext
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -134,6 +136,37 @@ def test_clear_workspace_can_preserve_manifest_for_rebuild(tmp_path):
     assert not (service.workspace_dir / "index.json").exists()
 
 
+def test_former_default_workspace_manifest_is_migrated_to_its_own_workspace(
+    tmp_path,
+    monkeypatch,
+):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    source = data_dir / "lightrag_manifest.json"
+    source.write_text(
+        '{"documents":{"doc_1":{"doc_name":"legacy.txt"}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        server,
+        "get_config",
+        lambda: {
+            "paths": {"data_dir": str(data_dir)},
+            "lightrag": {"workspace": "default"},
+        },
+    )
+
+    result = server._migrate_legacy_default_workspace()
+
+    target = data_dir / "lightrag_manifests" / "tdx_default.json"
+    assert result["migrated"] is True
+    assert not source.exists()
+    assert json.loads(target.read_text(encoding="utf-8"))["documents"]["doc_1"][
+        "doc_name"
+    ] == "legacy.txt"
+    assert server._migrate_legacy_default_workspace()["reason"] == "already_migrated"
+
+
 def test_graph_audit_replay_is_oldest_first_and_does_not_append_audit(tmp_path):
     service = _service(tmp_path)
     config = service.load_graph_governance()
@@ -168,6 +201,141 @@ def test_graph_audit_replay_is_oldest_first_and_does_not_append_audit(tmp_path):
     assert calls == [("create", "A"), ("edit", "A")]
     assert result["applied"] == 2
     assert len(service.load_graph_governance()["audit_log"]) == 2
+
+
+def test_graph_backfill_reuses_existing_chunks_without_chunk_vector_upsert(tmp_path, monkeypatch):
+    service = _service(tmp_path)
+    manifest = _manifest_item(indexed=True)
+    manifest["documents"]["doc_123"]["chunks_list"] = ["chunk-a"]
+    manifest["documents"]["doc_123"]["chunk_count"] = 1
+    service._save_manifest(manifest)
+
+    async def get_by_ids(ids):
+        assert ids == ["chunk-a"]
+        return [{"content": "A depends on B", "chunk_order_index": 0}]
+
+    async def extract(chunks, _status, _lock):
+        assert list(chunks) == ["chunk-a"]
+        return [
+            (
+                {"A": [{"entity_name": "A"}], "B": [{"entity_name": "B"}]},
+                {("A", "B"): [{"description": "depends"}]},
+            )
+        ]
+
+    fake_rag = SimpleNamespace(
+        addon_params={},
+        text_chunks=SimpleNamespace(get_by_ids=get_by_ids),
+        _process_extract_entities=extract,
+        chunk_entity_relation_graph=object(),
+        entities_vdb=object(),
+        relationships_vdb=object(),
+        full_entities=object(),
+        full_relations=object(),
+        llm_response_cache=object(),
+        entity_chunks=object(),
+        relation_chunks=object(),
+        _build_global_config=lambda: {},
+        _insert_done_with_cleanup=AsyncMock(),
+        _discard_pending_index_ops=AsyncMock(),
+    )
+    service._rag = fake_rag
+    monkeypatch.setattr(service, "assert_embedding_compatible", lambda: None)
+    monkeypatch.setattr(service, "_runtime_models", lambda: {"kg": {"model": "kg-model"}})
+    monkeypatch.setattr(
+        service,
+        "_temporary_index_llm_and_kg_filter",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+    merge = AsyncMock()
+    monkeypatch.setattr(lightrag_service, "merge_nodes_and_edges", merge)
+
+    result = asyncio.run(
+        service.backfill_document_graph(
+            "example.txt",
+            kg_max_entities=8,
+            kg_max_records=16,
+        )
+    )
+
+    merge.assert_awaited_once()
+    fake_rag._insert_done_with_cleanup.assert_awaited_once()
+    assert result["kg_status"] == "complete"
+    assert result["kg_entity_count"] == 2
+    assert result["kg_relation_count"] == 1
+    saved = service._load_manifest()["documents"]["doc_123"]
+    assert saved["indexed"] is True
+    assert saved["kg_extraction_limits"]["max_entities_per_chunk"] == 8
+
+
+def test_temporary_kg_limits_are_restored_after_index_operation(tmp_path, monkeypatch):
+    service = _service(tmp_path)
+
+    class FakeRag:
+        llm_model_func = None
+        llm_model_name = "chat"
+        llm_model_kwargs = {}
+        entity_extract_max_entities = 24
+        entity_extract_max_records = 48
+        _role_llm_states = {}
+
+        async def _process_extract_entities(self, *_args, **_kwargs):
+            return []
+
+    rag = FakeRag()
+    monkeypatch.setattr(service, "_runtime_models", lambda: {"kg": {"model": "kg"}})
+    monkeypatch.setattr(service, "_make_kg_llm_func", lambda: AsyncMock())
+    monkeypatch.setattr(service, "_llm_kwargs", lambda _role: {})
+
+    with service._temporary_index_llm_and_kg_filter(
+        rag,
+        skip_kg=False,
+        max_entities=8,
+        max_records=16,
+    ):
+        assert rag.entity_extract_max_entities == 8
+        assert rag.entity_extract_max_records == 16
+
+    assert rag.entity_extract_max_entities == 24
+    assert rag.entity_extract_max_records == 48
+
+
+def test_custom_graph_import_persists_package_and_removes_source_from_vector_recall(
+    tmp_path,
+    monkeypatch,
+):
+    service = _service(tmp_path)
+    fake_rag = SimpleNamespace(
+        ainsert_custom_kg=AsyncMock(),
+        chunks_vdb=SimpleNamespace(delete=AsyncMock()),
+        _insert_done=AsyncMock(),
+    )
+    service._rag = fake_rag
+    monkeypatch.setattr(service, "append_graph_audit", lambda *_args, **_kwargs: {})
+
+    result = asyncio.run(
+        service.import_custom_graph(
+            file_name="relations.txt",
+            source_text="A depends on B",
+            entities=[
+                {"entity_name": "A", "entity_type": "system", "description": "A"},
+                {"entity_name": "B", "entity_type": "system", "description": "B"},
+            ],
+            relationships=[
+                {
+                    "src_id": "A",
+                    "tgt_id": "B",
+                    "relation_type": "depends",
+                    "description": "A depends on B",
+                }
+            ],
+        )
+    )
+
+    fake_rag.ainsert_custom_kg.assert_awaited_once()
+    fake_rag.chunks_vdb.delete.assert_awaited_once_with([result["source_chunk_id"]])
+    assert service._graph_import_path(result["import_id"]).exists()
+    assert service.list_graph_imports()[0]["relationship_count"] == 1
 
 
 def test_workspace_queries_are_blocked_during_rebuild(monkeypatch):

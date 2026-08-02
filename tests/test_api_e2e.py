@@ -148,7 +148,7 @@ else:
 # 7. Recall Test
 print("\n[7/9] Recall Test (需要已索引数据)")
 status, data = req("POST", "/recall/test", {
-    "query": "TDX 是什么",
+    "query": "LightRAG 是什么",
     "mode": "mix",
     "top_k": 5,
     "chunk_top_k": 5,
@@ -156,7 +156,7 @@ status, data = req("POST", "/recall/test", {
 })
 if status == 200:
     test("POST /api/recall/test → 200", True)
-    test("含 query", data.get("query") == "TDX 是什么")
+    test("含 query", data.get("query") == "LightRAG 是什么")
     test("含 mode", data.get("mode") == "mix")
     test("含 context", "context" in data, f"len={len(data.get('context', ''))}")
     test("含 chunks (list)", isinstance(data.get("chunks"), list), f"count={len(data.get('chunks', []))}")
@@ -170,7 +170,7 @@ else:
 # 8. Full Search
 print("\n[8/9] Full RAG Search (需要 LLM API)")
 status, data = req("POST", "/search", {
-    "query": "TDX 是什么",
+    "query": "LightRAG 是什么",
     "mode": "mix",
     "top_k": 3,
     "chunk_top_k": 3,

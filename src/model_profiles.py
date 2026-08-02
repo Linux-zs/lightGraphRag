@@ -174,10 +174,13 @@ def _normalize_api_base(api_base: str) -> str:
     if address is not None:
         if address.is_link_local or address.is_multicast or address.is_unspecified:
             raise ValueError("该 API 地址指向不允许的网络地址")
-        allow_private = os.environ.get("TDX_ALLOW_PRIVATE_MODEL_HOSTS", "") == "1"
+        allow_private = (
+            os.environ.get("LIGHTGRAPHRAG_ALLOW_PRIVATE_MODEL_HOSTS", "") == "1"
+        )
         if address.is_private and not address.is_loopback and not allow_private:
             raise ValueError(
-                "私有网络模型地址默认禁用；确认可信后设置 TDX_ALLOW_PRIVATE_MODEL_HOSTS=1"
+                "私有网络模型地址默认禁用；确认可信后设置 "
+                "LIGHTGRAPHRAG_ALLOW_PRIVATE_MODEL_HOSTS=1"
             )
     return value
 

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { CheckCircle2, FileUp, Loader2 } from 'lucide-react'
 import { useConfirm } from '../components/ConfirmDialog'
 import EntityPicker from '../components/EntityPicker'
 import GraphView from '../components/GraphView'
@@ -7,6 +8,7 @@ import {
   applyGraphRuleTemplate,
   createGraphEntity,
   createGraphRelation,
+  confirmGraphImport,
   deleteGraphEntity,
   deleteGraphReference,
   deleteGraphRuleTemplate,
@@ -17,10 +19,14 @@ import {
   GraphData,
   GraphEdge,
   GraphGovernanceConfig,
+  GraphImportHistoryItem,
+  GraphImportPreview,
   GraphNode,
   GraphRuleTemplate,
+  listGraphImports,
   listGraphRuleTemplates,
   mergeGraphEntities,
+  previewGraphImport,
   saveGraphRuleTemplate,
   suggestGraphChanges,
   updateGraphEntity,
@@ -34,11 +40,12 @@ interface Props {
   workspace: string
 }
 
-type Tab = 'overview' | 'rules' | 'entities' | 'relations' | 'suggestions'
+type Tab = 'overview' | 'rules' | 'import' | 'entities' | 'relations' | 'suggestions'
 
 const TABS: { key: Tab; label: string }[] = [
   { key: 'overview', label: '图谱总览' },
   { key: 'rules', label: '抽取规则' },
+  { key: 'import', label: '图谱导入' },
   { key: 'entities', label: '实体治理' },
   { key: 'relations', label: '关系治理' },
   { key: 'suggestions', label: '修正建议' },
@@ -114,6 +121,13 @@ export default function GraphPage({ workspace }: Props) {
   const [ruleTemplates, setRuleTemplates] = useState<GraphRuleTemplate[]>([])
   const [selectedTemplateId, setSelectedTemplateId] = useState('')
   const [templateName, setTemplateName] = useState('')
+  const [graphImportFile, setGraphImportFile] = useState<File | null>(null)
+  const [graphImportPreview, setGraphImportPreview] = useState<GraphImportPreview | null>(null)
+  const [selectedImportEntities, setSelectedImportEntities] = useState<Set<number>>(new Set())
+  const [selectedImportRelationships, setSelectedImportRelationships] = useState<Set<number>>(new Set())
+  const [graphImportHistory, setGraphImportHistory] = useState<GraphImportHistoryItem[]>([])
+  const [previewingImport, setPreviewingImport] = useState(false)
+  const [applyingImport, setApplyingImport] = useState(false)
 
   const [entityTypesText, setEntityTypesText] = useState('')
   const [relationTypesText, setRelationTypesText] = useState('')
@@ -172,11 +186,15 @@ export default function GraphPage({ workspace }: Props) {
     setRuleTemplates(templates)
   }
 
+  const loadImportHistory = async () => {
+    setGraphImportHistory(await listGraphImports(workspace))
+  }
+
   const loadAll = async (nextLimit = limit) => {
     setLoading(true)
     setError('')
     try {
-      await Promise.all([loadGraph(nextLimit), loadConfig(), loadTemplates()])
+      await Promise.all([loadGraph(nextLimit), loadConfig(), loadTemplates(), loadImportHistory()])
     } catch (e) {
       setError((e as Error).message || '加载失败')
     } finally {
@@ -185,13 +203,17 @@ export default function GraphPage({ workspace }: Props) {
   }
 
   useEffect(() => {
+    setGraphImportFile(null)
+    setGraphImportPreview(null)
+    setSelectedImportEntities(new Set())
+    setSelectedImportRelationships(new Set())
     loadAll(limit)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspace])
 
   useEffect(() => {
     try {
-      const raw = localStorage.getItem(`tdx_latest_evidence_${workspace}`)
+      const raw = localStorage.getItem(`lightgraphrag_latest_evidence_${workspace}`)
       if (!raw) {
         setLatestEvidence(null)
         return
@@ -486,6 +508,67 @@ export default function GraphPage({ workspace }: Props) {
     }, '已应用选中的图谱建议')
   }
 
+  const runGraphImportPreview = async () => {
+    if (!graphImportFile) return
+    setPreviewingImport(true)
+    setError('')
+    setNotice('')
+    try {
+      const preview = await previewGraphImport(graphImportFile, workspace)
+      setGraphImportPreview(preview)
+      setSelectedImportEntities(new Set(preview.entities.map((_, index) => index)))
+      setSelectedImportRelationships(new Set(preview.relationships.map((_, index) => index)))
+      setNotice(
+        `已识别 ${preview.entities.length} 个实体和 ${preview.relationships.length} 条关系，请审阅后确认`,
+      )
+    } catch (e) {
+      setGraphImportPreview(null)
+      setError((e as Error).message || '图谱资料解析失败')
+    } finally {
+      setPreviewingImport(false)
+    }
+  }
+
+  const applyReviewedGraphImport = async () => {
+    if (!graphImportPreview) return
+    const entities = graphImportPreview.entities.filter((_, index) =>
+      selectedImportEntities.has(index),
+    )
+    const relationships = graphImportPreview.relationships.filter((_, index) =>
+      selectedImportRelationships.has(index),
+    )
+    if (entities.length === 0 && relationships.length === 0) return
+    const ok = await confirm({
+      title: '确认导入图谱',
+      message: `将导入 ${entities.length} 个实体和 ${relationships.length} 条关系。专用资料不会进入普通文本向量召回。`,
+      confirmLabel: '确认导入',
+    })
+    if (!ok) return
+    setApplyingImport(true)
+    setError('')
+    try {
+      const result = await confirmGraphImport({
+        workspace,
+        file_name: graphImportPreview.file_name,
+        source_text: graphImportPreview.source_text,
+        entities,
+        relationships,
+      })
+      setNotice(
+        `图谱导入完成：${result.entity_count} 个实体，${result.relationship_count} 条关系`,
+      )
+      setGraphImportFile(null)
+      setGraphImportPreview(null)
+      setSelectedImportEntities(new Set())
+      setSelectedImportRelationships(new Set())
+      await Promise.all([loadGraph(limit), loadImportHistory()])
+    } catch (e) {
+      setError((e as Error).message || '图谱导入失败')
+    } finally {
+      setApplyingImport(false)
+    }
+  }
+
   const renderOverview = () => (
     <div className="space-y-4">
       {latestEvidence && (latestEvidence.nodes.length > 0 || latestEvidence.edges.length > 0) && (
@@ -497,7 +580,7 @@ export default function GraphPage({ workspace }: Props) {
           </div>
           <button
             onClick={() => {
-              localStorage.removeItem(`tdx_latest_evidence_${workspace}`)
+              localStorage.removeItem(`lightgraphrag_latest_evidence_${workspace}`)
               setLatestEvidence(null)
             }}
             className="shrink-0 px-2.5 py-1 text-xs rounded-lg border border-amber-300 bg-white text-amber-700 hover:bg-amber-100"
@@ -825,6 +908,267 @@ export default function GraphPage({ workspace }: Props) {
     </div>
   )
 
+  const renderGraphImport = () => (
+    <div className="space-y-4">
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_300px]">
+        <div className="rounded-lg border border-gray-200 bg-white p-4">
+          <div className="flex items-start gap-3">
+            <span className="grid h-9 w-9 shrink-0 place-items-center rounded-md bg-violet-50 text-violet-700">
+              <FileUp size={18} />
+            </span>
+            <div>
+              <h3 className="text-sm font-semibold text-gray-800">导入实体关系资料</h3>
+              <p className="mt-1 text-xs leading-5 text-gray-500">
+                支持 TXT、Markdown、JSON、YAML 和 CSV。系统先生成候选项，只有人工确认的内容才会写入图谱。
+              </p>
+            </div>
+          </div>
+          <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center">
+            <label className="ui-button-secondary cursor-pointer">
+              选择资料
+              <input
+                type="file"
+                accept=".txt,.md,.json,.yaml,.yml,.csv"
+                className="sr-only"
+                onChange={(event) => {
+                  setGraphImportFile(event.target.files?.[0] || null)
+                  setGraphImportPreview(null)
+                }}
+              />
+            </label>
+            <span className="min-w-0 flex-1 truncate text-sm text-gray-600">
+              {graphImportFile?.name || '尚未选择文件'}
+            </span>
+            <button
+              type="button"
+              onClick={runGraphImportPreview}
+              disabled={!graphImportFile || previewingImport}
+              className="ui-button-primary inline-flex items-center justify-center gap-2"
+            >
+              {previewingImport && <Loader2 size={15} className="animate-spin" />}
+              {previewingImport ? '正在分析' : '生成候选'}
+            </button>
+          </div>
+          <p className="mt-3 text-xs text-gray-400">
+            结构化 JSON 会直接校验；其他格式使用当前知识库的 KG 模型和抽取规则分析。
+          </p>
+        </div>
+
+        <div className="rounded-lg border border-gray-200 bg-white p-4">
+          <h3 className="text-sm font-semibold text-gray-800">最近导入</h3>
+          <div className="mt-3 max-h-36 divide-y divide-gray-100 overflow-y-auto">
+            {graphImportHistory.map((item) => (
+              <div key={item.import_id} className="py-2 text-xs">
+                <div className="truncate font-medium text-gray-700">{item.file_name}</div>
+                <div className="mt-0.5 text-gray-400">
+                  {item.entity_count} 实体 · {item.relationship_count} 关系 · {formatTime(item.created_at)}
+                </div>
+              </div>
+            ))}
+            {graphImportHistory.length === 0 && (
+              <div className="py-5 text-xs text-gray-400">暂无已确认导入记录</div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {graphImportPreview && (
+        <>
+          {graphImportPreview.warnings.length > 0 && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
+              {graphImportPreview.warnings.join('；')}
+            </div>
+          )}
+
+          <div className="rounded-lg border border-gray-200 bg-white">
+            <div className="flex items-center justify-between border-b border-gray-100 px-4 py-3">
+              <div>
+                <h3 className="text-sm font-semibold text-gray-800">候选实体</h3>
+                <p className="mt-0.5 text-xs text-gray-400">
+                  已选 {selectedImportEntities.size}/{graphImportPreview.entities.length}
+                </p>
+              </div>
+              <label className="flex items-center gap-2 text-xs text-gray-500">
+                <input
+                  type="checkbox"
+                  checked={
+                    graphImportPreview.entities.length > 0 &&
+                    selectedImportEntities.size === graphImportPreview.entities.length
+                  }
+                  onChange={(event) =>
+                    setSelectedImportEntities(
+                      event.target.checked
+                        ? new Set(graphImportPreview.entities.map((_, index) => index))
+                        : new Set(),
+                    )
+                  }
+                />
+                全选
+              </label>
+            </div>
+            <div className="max-h-[420px] divide-y divide-gray-100 overflow-y-auto">
+              {graphImportPreview.entities.map((entity, index) => (
+                <div key={`${entity.entity_name}-${index}`} className="grid gap-3 p-4 md:grid-cols-[24px_180px_140px_minmax(0,1fr)]">
+                  <input
+                    type="checkbox"
+                    checked={selectedImportEntities.has(index)}
+                    onChange={(event) => {
+                      setSelectedImportEntities((current) => {
+                        const next = new Set(current)
+                        if (event.target.checked) next.add(index)
+                        else next.delete(index)
+                        return next
+                      })
+                    }}
+                    className="mt-2"
+                  />
+                  <input
+                    value={entity.entity_name}
+                    onChange={(event) =>
+                      setGraphImportPreview((current) => current ? {
+                        ...current,
+                        entities: current.entities.map((item, itemIndex) =>
+                          itemIndex === index ? { ...item, entity_name: event.target.value } : item,
+                        ),
+                      } : current)
+                    }
+                    className="ui-control w-full"
+                    aria-label="实体名称"
+                  />
+                  <input
+                    value={entity.entity_type}
+                    onChange={(event) =>
+                      setGraphImportPreview((current) => current ? {
+                        ...current,
+                        entities: current.entities.map((item, itemIndex) =>
+                          itemIndex === index ? { ...item, entity_type: event.target.value } : item,
+                        ),
+                      } : current)
+                    }
+                    className="ui-control w-full"
+                    aria-label="实体类型"
+                  />
+                  <input
+                    value={entity.description}
+                    onChange={(event) =>
+                      setGraphImportPreview((current) => current ? {
+                        ...current,
+                        entities: current.entities.map((item, itemIndex) =>
+                          itemIndex === index ? { ...item, description: event.target.value } : item,
+                        ),
+                      } : current)
+                    }
+                    className="ui-control w-full"
+                    aria-label="实体描述"
+                    placeholder="实体描述"
+                  />
+                </div>
+              ))}
+              {graphImportPreview.entities.length === 0 && (
+                <div className="p-6 text-sm text-gray-400">未识别到实体候选</div>
+              )}
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-gray-200 bg-white">
+            <div className="flex items-center justify-between border-b border-gray-100 px-4 py-3">
+              <div>
+                <h3 className="text-sm font-semibold text-gray-800">候选关系</h3>
+                <p className="mt-0.5 text-xs text-gray-400">
+                  已选 {selectedImportRelationships.size}/{graphImportPreview.relationships.length}
+                </p>
+              </div>
+              <label className="flex items-center gap-2 text-xs text-gray-500">
+                <input
+                  type="checkbox"
+                  checked={
+                    graphImportPreview.relationships.length > 0 &&
+                    selectedImportRelationships.size === graphImportPreview.relationships.length
+                  }
+                  onChange={(event) =>
+                    setSelectedImportRelationships(
+                      event.target.checked
+                        ? new Set(graphImportPreview.relationships.map((_, index) => index))
+                        : new Set(),
+                    )
+                  }
+                />
+                全选
+              </label>
+            </div>
+            <div className="max-h-[420px] divide-y divide-gray-100 overflow-y-auto">
+              {graphImportPreview.relationships.map((relation, index) => (
+                <div key={`${relation.src_id}-${relation.tgt_id}-${index}`} className="grid gap-3 p-4 md:grid-cols-[24px_160px_160px_120px_minmax(0,1fr)]">
+                  <input
+                    type="checkbox"
+                    checked={selectedImportRelationships.has(index)}
+                    onChange={(event) => {
+                      setSelectedImportRelationships((current) => {
+                        const next = new Set(current)
+                        if (event.target.checked) next.add(index)
+                        else next.delete(index)
+                        return next
+                      })
+                    }}
+                    className="mt-2"
+                  />
+                  {(['src_id', 'tgt_id', 'relation_type', 'description'] as const).map((field) => (
+                    <input
+                      key={field}
+                      value={relation[field]}
+                      onChange={(event) =>
+                        setGraphImportPreview((current) => current ? {
+                          ...current,
+                          relationships: current.relationships.map((item, itemIndex) =>
+                            itemIndex === index ? { ...item, [field]: event.target.value } : item,
+                          ),
+                        } : current)
+                      }
+                      className="ui-control w-full"
+                      aria-label={field}
+                      placeholder={
+                        field === 'src_id'
+                          ? '起点实体'
+                          : field === 'tgt_id'
+                            ? '终点实体'
+                            : field === 'relation_type'
+                              ? '关系类型'
+                              : '关系描述'
+                      }
+                    />
+                  ))}
+                </div>
+              ))}
+              {graphImportPreview.relationships.length === 0 && (
+                <div className="p-6 text-sm text-gray-400">未识别到关系候选</div>
+              )}
+            </div>
+          </div>
+
+          <div className="sticky bottom-4 flex items-center justify-between rounded-lg border border-gray-200 bg-white/95 px-4 py-3 shadow-sm backdrop-blur">
+            <span className="text-sm text-gray-600">
+              将导入 {selectedImportEntities.size} 个实体和 {selectedImportRelationships.size} 条关系
+            </span>
+            <button
+              type="button"
+              onClick={applyReviewedGraphImport}
+              disabled={
+                applyingImport ||
+                (selectedImportEntities.size === 0 && selectedImportRelationships.size === 0)
+              }
+              className="ui-button-primary inline-flex items-center gap-2"
+            >
+              {applyingImport
+                ? <Loader2 size={15} className="animate-spin" />
+                : <CheckCircle2 size={15} />}
+              {applyingImport ? '正在导入' : '确认导入'}
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  )
+
   const renderEntities = () => (
     <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
       <div className="border border-gray-200 rounded-lg bg-white overflow-hidden">
@@ -1120,7 +1464,7 @@ export default function GraphPage({ workspace }: Props) {
         <div>
           <h2 className="text-xl font-bold text-gray-800">知识图谱</h2>
           <p className="text-sm text-gray-500 mt-1">
-            图谱浏览、抽取规则、参考资料和实体关系审校。
+            图谱浏览、抽取规则、资料导入和实体关系审校。
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -1140,7 +1484,7 @@ export default function GraphPage({ workspace }: Props) {
           </select>
           <button
             onClick={() => loadAll()}
-            className="px-3 py-1.5 text-xs rounded-lg bg-primary-500 text-white hover:bg-primary-600"
+            className="whitespace-nowrap px-3 py-1.5 text-xs rounded-lg bg-primary-500 text-white hover:bg-primary-600"
           >
             刷新
           </button>
@@ -1153,7 +1497,7 @@ export default function GraphPage({ workspace }: Props) {
             <button
               key={item.key}
               onClick={() => setTab(item.key)}
-              className={`px-3 py-2 text-sm border-b-2 transition-colors ${
+              className={`whitespace-nowrap px-3 py-2 text-sm border-b-2 transition-colors ${
                 tab === item.key
                   ? 'border-gray-900 text-gray-950 font-medium'
                   : 'border-transparent text-gray-500 hover:text-gray-800'
@@ -1178,6 +1522,7 @@ export default function GraphPage({ workspace }: Props) {
 
       {tab === 'overview' && renderOverview()}
       {tab === 'rules' && renderRules()}
+      {tab === 'import' && renderGraphImport()}
       {tab === 'entities' && renderEntities()}
       {tab === 'relations' && renderRelations()}
       {tab === 'suggestions' && renderSuggestions()}

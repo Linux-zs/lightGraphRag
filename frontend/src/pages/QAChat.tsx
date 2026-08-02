@@ -548,7 +548,7 @@ export default function QAChat({
               if (evidence.nodes.length > 0 || evidence.edges.length > 0) {
                 try {
                   localStorage.setItem(
-                    `tdx_latest_evidence_${workspace}`,
+                    `lightgraphrag_latest_evidence_${workspace}`,
                     JSON.stringify({ workspace, evidence, updated_at: new Date().toISOString() }),
                   )
                 } catch {/* ignore */}

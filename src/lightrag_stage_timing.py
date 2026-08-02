@@ -51,7 +51,7 @@ except Exception:  # pragma: no cover - defensive
 
 # Active collector for the current ainsert scope. Wrappers read this so the
 # timing is attributed to the right document even across concurrent workspaces.
-_ACTIVE_COLLECTOR = contextvars.ContextVar("tdx_stage_collector", default=None)
+_ACTIVE_COLLECTOR = contextvars.ContextVar("lightgraphrag_stage_collector", default=None)
 
 
 class StageTimingCollector:
@@ -101,7 +101,7 @@ def _wrap_async(orig, key: str, *, activate_current_stage: bool = True):
     If no collector is active (e.g. LightRAG is used outside our index flow),
     the wrapper is transparent and adds zero timing overhead.
     """
-    if getattr(orig, "_tdx_timing_wrapped", False):
+    if getattr(orig, "_lightgraphrag_timing_wrapped", False):
         return orig
 
     async def wrapper(*args, **kwargs):
@@ -117,7 +117,7 @@ def _wrap_async(orig, key: str, *, activate_current_stage: bool = True):
             coll.t[key] += time.perf_counter() - start
             await coll.notify(key, "finish")
 
-    wrapper._tdx_timing_wrapped = True
+    wrapper._lightgraphrag_timing_wrapped = True
     return wrapper
 
 
@@ -141,14 +141,14 @@ def _wrap_store_methods(
 def install_stage_timing(rag: Any) -> StageTimingCollector:
     """Install (idempotent) stage-timing wrappers on a LightRAG instance.
 
-    The collector lives on the instance as ``rag._tdx_stage_timing`` so it
+    The collector lives on the instance as ``rag._lightgraphrag_stage_timing`` so it
     survives across calls; wrappers resolve the live collector via the
     :data:`_ACTIVE_COLLECTOR` context var during each scoped ``ainsert``.
     """
-    collector: StageTimingCollector = getattr(rag, "_tdx_stage_timing", None)
+    collector: StageTimingCollector = getattr(rag, "_lightgraphrag_stage_timing", None)
     if collector is None:
         collector = StageTimingCollector()
-        rag._tdx_stage_timing = collector
+        rag._lightgraphrag_stage_timing = collector
 
     if collector.installed:
         return collector
@@ -162,13 +162,17 @@ def install_stage_timing(rag: Any) -> StageTimingCollector:
 
     # KG extraction -> "kg"
     kg_orig = getattr(type(rag), "_process_extract_entities", None)
-    if kg_orig is not None and not getattr(kg_orig, "_tdx_timing_wrapped", False):
+    if kg_orig is not None and not getattr(
+        kg_orig, "_lightgraphrag_timing_wrapped", False
+    ):
         type(rag)._process_extract_entities = _wrap_async(kg_orig, "kg")
 
     # Graph merge -> "merge"
     if _lr_pipeline is not None:
         mne = getattr(_lr_pipeline, "merge_nodes_and_edges", None)
-        if mne is not None and not getattr(mne, "_tdx_timing_wrapped", False):
+        if mne is not None and not getattr(
+            mne, "_lightgraphrag_timing_wrapped", False
+        ):
             _lr_pipeline.merge_nodes_and_edges = _wrap_async(mne, "merge")
 
     # Non-chunk flushes (entities, relationships, graph, caches) -> "merge".
