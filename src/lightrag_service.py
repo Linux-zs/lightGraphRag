@@ -8,6 +8,8 @@ import json
 import os
 import shutil
 import tempfile
+from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -235,6 +237,7 @@ class LightRAGService:
         self._rag: LightRAG | None = None
         self._init_lock = asyncio.Lock()
         self._last_stage_timings: dict[str, float] = {}
+        self._last_kg_filter_stats: dict[str, Any] = {}
 
     @property
     def rag(self) -> LightRAG:
@@ -431,6 +434,12 @@ class LightRAGService:
                     llm_model_kwargs=self._llm_kwargs(),
                     entity_extraction_use_json=lightrag_cfg.get("entity_extraction_use_json", True),
                     entity_extract_max_gleaning=lightrag_cfg.get("entity_extract_max_gleaning", 1),
+                    entity_extract_max_records=int(
+                        lightrag_cfg.get("entity_extract_max_records", 48)
+                    ),
+                    entity_extract_max_entities=int(
+                        lightrag_cfg.get("entity_extract_max_entities", 24)
+                    ),
                     llm_model_max_async=lightrag_cfg.get("llm_model_max_async", 4),
                     rerank_model_func=self._make_rerank_func(),
                     addon_params={
@@ -624,8 +633,9 @@ class LightRAGService:
             return {"enable_thinking": False}
         return {}
 
-    def _llm_kwargs(self) -> dict[str, Any]:
-        chat = self._runtime_models()["chat"]
+    def _llm_kwargs(self, purpose: str = "chat") -> dict[str, Any]:
+        runtime = self._runtime_models()
+        chat = runtime.get(purpose) or runtime["chat"]
         kwargs: dict[str, Any] = {
             "temperature": chat.get("temperature", self.config.get("llm", {}).get("temperature", 0.7)),
             "top_p": chat.get("top_p", self.config.get("llm", {}).get("top_p", 0.9)),
@@ -640,8 +650,9 @@ class LightRAGService:
                 kwargs["extra_body"] = extra_body
         return kwargs
 
-    def _make_llm_func(self):
-        chat = self._runtime_models()["chat"]
+    def _make_llm_func_for(self, purpose: str):
+        runtime = self._runtime_models()
+        chat = runtime.get(purpose) or runtime["chat"]
         model = chat["model"]
         base_url = chat["base_url"]
         api_key = chat["api_key"]
@@ -667,6 +678,12 @@ class LightRAGService:
             )
 
         return siliconflow_complete
+
+    def _make_llm_func(self):
+        return self._make_llm_func_for("chat")
+
+    def _make_kg_llm_func(self):
+        return self._make_llm_func_for("kg")
 
     def _make_rerank_func(self):
         rerank = self._runtime_models()["rerank"]
@@ -713,6 +730,255 @@ class LightRAGService:
 
     def _runtime_models(self) -> dict[str, Any]:
         return get_runtime_model_config(self.config)
+
+    def _kg_filter_settings(self) -> dict[str, Any]:
+        cfg = self.config.get("lightrag", {})
+        return {
+            "enabled": bool(cfg.get("kg_skip_low_value_chunks", True)),
+            "min_substantive_chars": int(cfg.get("kg_min_substantive_chars", 8)),
+            "symbol_ratio_threshold": float(cfg.get("kg_symbol_ratio_threshold", 0.78)),
+            "structured_line_ratio": float(cfg.get("kg_structured_line_ratio", 0.72)),
+            "skip_timed_out_chunks": bool(cfg.get("kg_skip_timed_out_chunks", True)),
+            "max_timed_out_chunks": max(0, int(cfg.get("kg_max_timed_out_chunks", 3))),
+        }
+
+    @staticmethod
+    def _chunk_text(chunk: Any) -> str:
+        if isinstance(chunk, dict):
+            return str(chunk.get("content") or chunk.get("text") or "")
+        return str(getattr(chunk, "content", "") or getattr(chunk, "text", "") or "")
+
+    def _low_value_kg_chunk_reason(self, text: str, settings: dict[str, Any]) -> str:
+        compact = re.sub(r"\s+", "", text or "")
+        if not compact:
+            return "blank"
+        substantive = re.findall(r"[0-9A-Za-z\u4e00-\u9fff]", text)
+        if len(substantive) < settings["min_substantive_chars"]:
+            return "too_few_text_chars"
+
+        substantive_ratio = len(substantive) / max(len(compact), 1)
+        if substantive_ratio < (1 - settings["symbol_ratio_threshold"]):
+            return "symbol_noise"
+
+        lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+        if len(lines) >= 4:
+            table_lines = sum(1 for line in lines if line.count("|") >= 2 or re.fullmatch(r"[-:| ]+", line))
+            code_lines = sum(
+                1
+                for line in lines
+                if line.startswith(("```", "    ", "\t"))
+                or len(re.findall(r"[{}();=<>/\\]", line)) >= 6
+            )
+            toc_lines = sum(
+                1
+                for line in lines
+                if re.search(r"\.{3,}\s*\d+$", line)
+                or re.fullmatch(r"(\d+[.)、]?\s*){1,4}.{0,24}", line)
+            )
+            threshold = settings["structured_line_ratio"]
+            if table_lines / len(lines) >= threshold and substantive_ratio < 0.45:
+                return "table_noise"
+            if code_lines / len(lines) >= threshold and substantive_ratio < 0.45:
+                return "code_noise"
+            if toc_lines / len(lines) >= threshold:
+                return "toc_noise"
+        return ""
+
+    def _filter_kg_chunks(self, chunks: Any) -> tuple[Any, dict[str, Any]]:
+        settings = self._kg_filter_settings()
+        if not settings["enabled"] or not isinstance(chunks, dict):
+            return chunks, {"enabled": settings["enabled"], "total": len(chunks) if isinstance(chunks, dict) else 0, "kept": len(chunks) if isinstance(chunks, dict) else 0, "skipped": 0, "reasons": {}}
+
+        kept: dict[str, Any] = {}
+        reasons: dict[str, int] = {}
+        examples: list[dict[str, str]] = []
+        for chunk_id, chunk in chunks.items():
+            reason = self._low_value_kg_chunk_reason(self._chunk_text(chunk), settings)
+            if reason:
+                reasons[reason] = reasons.get(reason, 0) + 1
+                if len(examples) < 5:
+                    examples.append({"chunk_id": str(chunk_id), "reason": reason})
+                continue
+            kept[chunk_id] = chunk
+
+        stats = {
+            "enabled": True,
+            "total": len(chunks),
+            "kept": len(kept),
+            "skipped": len(chunks) - len(kept),
+            "reasons": reasons,
+            "examples": examples,
+        }
+        return kept, stats
+
+    @staticmethod
+    def _timed_out_chunk_id(chunks: dict[str, Any], error: BaseException) -> str:
+        message = str(error)
+        if "timeout" not in message.lower():
+            return ""
+        matches = [str(chunk_id) for chunk_id in chunks if str(chunk_id) in message]
+        return max(matches, key=len, default="")
+
+    async def _extract_entities_with_timeout_recovery(
+        self,
+        original_extract: Callable[..., Awaitable[Any]],
+        chunks: dict[str, Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        stats: dict[str, Any],
+    ) -> Any:
+        settings = self._kg_filter_settings()
+        remaining = dict(chunks)
+        timed_out: list[str] = []
+
+        while remaining:
+            try:
+                return await original_extract(remaining, *args, **kwargs)
+            except TimeoutError as exc:
+                chunk_id = self._timed_out_chunk_id(remaining, exc)
+                can_skip = (
+                    settings["skip_timed_out_chunks"]
+                    and bool(chunk_id)
+                    and len(timed_out) < settings["max_timed_out_chunks"]
+                )
+                if not can_skip:
+                    raise
+
+                timed_out.append(chunk_id)
+                remaining.pop(chunk_id, None)
+                stats["timed_out"] = list(timed_out)
+                stats["kept"] = len(remaining)
+                stats["skipped"] = int(stats.get("skipped") or 0) + 1
+                reasons = stats.setdefault("reasons", {})
+                reasons["llm_timeout"] = int(reasons.get("llm_timeout") or 0) + 1
+                self._last_kg_filter_stats = stats
+                logger.warning(
+                    "KG extraction timed out for chunk {} in workspace {}; "
+                    "skipping this chunk and continuing ({}/{})",
+                    chunk_id,
+                    self.workspace,
+                    len(timed_out),
+                    settings["max_timed_out_chunks"],
+                )
+
+        return []
+
+    @contextmanager
+    def _temporary_index_llm_and_kg_filter(self, rag: LightRAG, *, skip_kg: bool):
+        original_llm_func = getattr(rag, "llm_model_func", None)
+        original_llm_name = getattr(rag, "llm_model_name", None)
+        original_llm_kwargs = getattr(rag, "llm_model_kwargs", None)
+        original_extract = getattr(rag, "_process_extract_entities", None)
+        role_states = getattr(rag, "_role_llm_states", {}) or {}
+        original_extract_role = None
+        extract_state = role_states.get("extract")
+        if extract_state is not None:
+            original_extract_role = {
+                "raw_func": extract_state.raw_func,
+                "kwargs": deepcopy(extract_state.kwargs),
+                "max_async": extract_state.max_async,
+                "timeout": extract_state.timeout,
+                "metadata": deepcopy(extract_state.metadata),
+            }
+        self._last_kg_filter_stats = {}
+
+        if not skip_kg:
+            kg_runtime = self._runtime_models().get("kg", {})
+            kg_llm_func = self._make_kg_llm_func()
+            kg_llm_kwargs = self._llm_kwargs("kg")
+            rag.llm_model_func = kg_llm_func
+            rag.llm_model_name = kg_runtime.get("model") or original_llm_name
+            rag.llm_model_kwargs = kg_llm_kwargs
+            if hasattr(rag, "update_llm_role_config"):
+                rag.update_llm_role_config(
+                    "extract",
+                    model_func=kg_llm_func,
+                    model_kwargs=kg_llm_kwargs,
+                    timeout=kg_runtime.get("timeout"),
+                    model=kg_runtime.get("model"),
+                    host=kg_runtime.get("base_url"),
+                )
+
+            if original_extract is not None:
+                async def filtered_extract(*args: Any, **kwargs: Any):
+                    if not args:
+                        return await original_extract(*args, **kwargs)
+                    filtered_chunks, stats = self._filter_kg_chunks(args[0])
+                    self._last_kg_filter_stats = stats
+                    if stats.get("skipped"):
+                        logger.info(
+                            "Skipped {} low-value KG chunks in workspace {}: {}",
+                            stats.get("skipped"),
+                            self.workspace,
+                            stats.get("reasons", {}),
+                        )
+                    if isinstance(filtered_chunks, dict) and not filtered_chunks:
+                        return []
+                    if isinstance(filtered_chunks, dict):
+                        return await self._extract_entities_with_timeout_recovery(
+                            original_extract,
+                            filtered_chunks,
+                            args[1:],
+                            kwargs,
+                            stats,
+                        )
+                    return await original_extract(filtered_chunks, *args[1:], **kwargs)
+
+                rag._process_extract_entities = filtered_extract
+
+        try:
+            yield
+        finally:
+            rag.llm_model_func = original_llm_func
+            rag.llm_model_name = original_llm_name
+            rag.llm_model_kwargs = original_llm_kwargs
+            if original_extract_role is not None and hasattr(rag, "update_llm_role_config"):
+                rag.update_llm_role_config(
+                    "extract",
+                    model_func=original_extract_role["raw_func"],
+                    model_kwargs=original_extract_role["kwargs"],
+                    max_async=original_extract_role["max_async"],
+                    timeout=original_extract_role["timeout"],
+                )
+                restored_state = getattr(rag, "_role_llm_states", {}).get("extract")
+                if restored_state is not None:
+                    restored_state.metadata = original_extract_role["metadata"]
+            if original_extract is not None:
+                if hasattr(rag, "_process_extract_entities"):
+                    try:
+                        delattr(rag, "_process_extract_entities")
+                    except AttributeError:
+                        pass
+
+    async def _insert_document_text(
+        self,
+        rag: LightRAG,
+        doc: Document,
+        doc_id: str,
+        *,
+        skip_kg: bool,
+    ) -> str:
+        if not skip_kg:
+            return await rag.ainsert(doc.raw_text, ids=[doc_id], file_paths=[doc.file_path])
+
+        track_id = await rag.apipeline_enqueue_documents(
+            doc.raw_text,
+            ids=[doc_id],
+            file_paths=[doc.file_path],
+            process_options="!",
+        )
+        await rag.apipeline_process_enqueue_documents()
+        return track_id
+
+    def _kg_status_for_success(self, *, skip_kg: bool) -> str:
+        if skip_kg:
+            return "skipped"
+        stats = self._last_kg_filter_stats or {}
+        if stats.get("timed_out"):
+            return "partial"
+        if stats.get("enabled") and stats.get("total") and not stats.get("kept"):
+            return "filtered_empty"
+        return "complete"
 
     def _load_manifest(self) -> dict[str, Any]:
         if not self.manifest_path.exists():
@@ -872,23 +1138,40 @@ class LightRAGService:
         self._save_custom_graph_rule_templates(next_custom)
         return {"deleted": template_id}
 
-    def apply_graph_rule_template(self, template_id: str) -> dict[str, Any]:
+    def apply_graph_rule_template(
+        self,
+        template_id: str,
+        *,
+        extraction_mode: str = "assist",
+        allow_other_entity_type: bool = True,
+    ) -> dict[str, Any]:
         template = next((item for item in self.list_graph_rule_templates() if item.get("id") == template_id), None)
         if template is None:
             raise KeyError(template_id)
+        extraction_mode = str(extraction_mode or "assist")
+        if extraction_mode not in GRAPH_EXTRACTION_MODES:
+            raise ValueError(f"Unsupported graph extraction mode: {extraction_mode}")
         cfg = self.save_graph_governance(
             {
                 "rule_template_id": template["id"],
                 "rule_template_name": template["name"],
-                "extraction_mode": "assist",
-                "allow_other_entity_type": True,
+                "extraction_mode": extraction_mode,
+                "allow_other_entity_type": bool(allow_other_entity_type),
                 "entity_types": list(template.get("entity_types") or []),
                 "relation_types": list(template.get("relation_types") or []),
                 "aliases_text": str(template.get("aliases_text") or ""),
                 "extraction_prompt": str(template.get("extraction_prompt") or ""),
             }
         )
-        self.append_graph_audit("apply_rule_template", {"template_id": template_id, "template_name": template["name"]})
+        self.append_graph_audit(
+            "apply_rule_template",
+            {
+                "template_id": template_id,
+                "template_name": template["name"],
+                "extraction_mode": extraction_mode,
+                "allow_other_entity_type": bool(allow_other_entity_type),
+            },
+        )
         return self.load_graph_governance()
 
     def graph_governance_summary(self) -> dict[str, Any]:
@@ -1215,11 +1498,14 @@ class LightRAGService:
         chunk_size: int | None = None,
         chunk_overlap: int | None = None,
         separators: list[str] | None = None,
+        index_mode: str = "complete",
         stage_update_callback: Callable[[dict[str, float], str, str], Awaitable[None] | None] | None = None,
     ) -> dict[str, Any]:
         self.assert_embedding_compatible()
         rag = await self.get_rag()
         await self.cleanup_interrupted_index_docs()
+        index_mode = "fast" if str(index_mode).lower() == "fast" else "complete"
+        skip_kg = index_mode == "fast"
         if chunk_size is not None:
             rag.chunk_token_size = chunk_size
         if chunk_overlap is not None:
@@ -1252,10 +1538,14 @@ class LightRAGService:
             collector = install_stage_timing(rag)
             collector.on_update = stage_update_callback
             try:
-                with collector.scope():
-                    result = await rag.ainsert(
-                        doc.raw_text, ids=[doc_id], file_paths=[doc.file_path]
-                    )
+                with self._temporary_index_llm_and_kg_filter(rag, skip_kg=skip_kg):
+                    with collector.scope():
+                        result = await self._insert_document_text(
+                            rag,
+                            doc,
+                            doc_id,
+                            skip_kg=skip_kg,
+                        )
                 self._last_stage_timings = collector.to_stages()
             finally:
                 collector.on_update = None
@@ -1273,6 +1563,10 @@ class LightRAGService:
                         "chunk_overlap": chunk_overlap,
                         "separators": separators,
                     },
+                    "index_mode": index_mode,
+                    "kg_status": "skipped" if skip_kg else "failed",
+                    "kg_filter": self._last_kg_filter_stats,
+                    "kg_model": self._runtime_models().get("kg", {}).get("model", ""),
                     "graph_rule": self.graph_governance_summary(),
                     "updated_at": _now_iso(),
                 }
@@ -1299,6 +1593,10 @@ class LightRAGService:
                         "chunk_overlap": chunk_overlap,
                         "separators": separators,
                     },
+                    "index_mode": index_mode,
+                    "kg_status": self._kg_status_for_success(skip_kg=skip_kg),
+                    "kg_filter": self._last_kg_filter_stats,
+                    "kg_model": "" if skip_kg else self._runtime_models().get("kg", {}).get("model", ""),
                     "graph_rule": self.graph_governance_summary(),
                     "last_insert_result": result,
                     "updated_at": _now_iso(),

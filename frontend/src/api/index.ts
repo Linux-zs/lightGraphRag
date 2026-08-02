@@ -137,6 +137,9 @@ export interface DocInfo {
   status?: string
   error_msg?: string
   graph_rule?: GraphRuleSummary
+  index_mode?: 'complete' | 'fast'
+  kg_status?: 'complete' | 'skipped' | 'filtered_empty' | 'failed' | string
+  kg_model?: string
 }
 
 export interface WorkspaceInfo {
@@ -155,10 +158,20 @@ export function listWorkspaces() {
   return request<WorkspaceInfo[]>('/kb/workspaces')
 }
 
-export function createWorkspace(workspace: string) {
+export function createWorkspace(
+  workspace: string,
+  ruleTemplateId: string,
+  extractionMode: 'assist' | 'enhanced' | 'strict' = 'enhanced',
+  allowOtherEntityType = false,
+) {
   return request<WorkspaceInfo>('/kb/workspaces', {
     method: 'POST',
-    body: JSON.stringify({ workspace }),
+    body: JSON.stringify({
+      workspace,
+      rule_template_id: ruleTemplateId,
+      extraction_mode: extractionMode,
+      allow_other_entity_type: allowOtherEntityType,
+    }),
   })
 }
 
@@ -214,6 +227,7 @@ export function indexDocument(params: {
   separators: string[]
   chunk_size: number
   chunk_overlap: number
+  index_mode?: 'complete' | 'fast'
 }) {
   return request<IndexTask>(
     '/kb/index',
@@ -278,6 +292,7 @@ export function batchIndexDocuments(params: {
   separators: string[]
   chunk_size: number
   chunk_overlap: number
+  index_mode?: 'complete' | 'fast'
 }) {
   return request<IndexTask>(
     '/kb/batch-index',
@@ -291,6 +306,8 @@ export interface IndexTaskResult {
   status: 'ok' | 'error'
   chunks?: number
   error?: string
+  kg_status?: string
+  kg_timed_out_chunks?: string[]
   stage_timings?: {
     parse: number
     chunk_vector: number
@@ -320,6 +337,12 @@ export interface IndexTask {
     kg: number
     merge: number
   } | null
+  request?: {
+    separators?: string[]
+    chunk_size?: number
+    chunk_overlap?: number
+    index_mode?: 'complete' | 'fast'
+  }
   results: IndexTaskResult[]
   errors: IndexTaskResult[]
   created_at: string
@@ -508,6 +531,7 @@ export interface ModelBinding {
 
 export interface ModelBindings {
   chat: ModelBinding
+  kg: ModelBinding
   embedding: ModelBinding
   rerank: ModelBinding
 }
@@ -655,6 +679,7 @@ export function rebuildIndex(params: {
   separators: string[]
   chunk_size: number
   chunk_overlap: number
+  index_mode?: 'complete' | 'fast'
 }) {
   return request<IndexTask & { clear_result?: ClearKnowledgeBaseResult }>('/kb/rebuild', {
     method: 'POST',

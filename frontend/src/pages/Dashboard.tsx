@@ -1,5 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { FileText, GitBranch, Layers3, ListChecks, Network, RefreshCw, ScrollText } from 'lucide-react'
+import {
+  ChevronDown,
+  FileText,
+  GitBranch,
+  Layers3,
+  ListChecks,
+  Network,
+  RefreshCw,
+  ScrollText,
+} from 'lucide-react'
 import { useConfirm } from '../components/ConfirmDialog'
 import {
   clearKnowledgeBase,
@@ -32,7 +41,9 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
   const [logContains, setLogContains] = useState('')
   const [logMsg, setLogMsg] = useState('')
   const [logsLoading, setLogsLoading] = useState(false)
+  const [recentTasksOpen, setRecentTasksOpen] = useState(false)
   const pollingTaskIdRef = useRef<string | null>(null)
+  const logViewportRef = useRef<HTMLDivElement | null>(null)
   const mountedRef = useRef(true)
 
   useEffect(() => {
@@ -96,6 +107,30 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
     return '重建索引'
   }
 
+  const formatIndexStage = (stage: NonNullable<IndexTask['current_stage']>) => {
+    if (stage === 'parse') return '解析'
+    if (stage === 'chunk_vector') return 'Chunk 向量'
+    if (stage === 'kg') return 'KG 抽取'
+    if (stage === 'merge') return '图谱/落盘'
+    return ''
+  }
+
+  const formatTaskStatus = (status: IndexTask['status']) => {
+    if (status === 'queued') return '等待中'
+    if (status === 'running') return '进行中'
+    if (status === 'succeeded') return '已完成'
+    if (status === 'partial') return '部分完成'
+    if (status === 'failed') return '失败'
+    return '已取消'
+  }
+
+  const taskDotClass = (task: IndexTask) => {
+    if (task.status === 'failed' || task.status === 'partial') return 'bg-red-500'
+    if (task.status === 'cancelled') return 'bg-gray-400'
+    if (isTaskTerminal(task)) return 'bg-emerald-500'
+    return 'bg-blue-500 animate-pulse'
+  }
+
   const loadObservability = useCallback(async () => {
     setLogsLoading(true)
     setLogMsg('')
@@ -123,6 +158,24 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
       if (mountedRef.current) setLogsLoading(false)
     }
   }, [logContains, logLevel, workspace])
+
+  useEffect(() => {
+    if (logsLoading || logs.length === 0) return
+    const frame = window.requestAnimationFrame(() => {
+      const viewport = logViewportRef.current
+      if (viewport) viewport.scrollTop = viewport.scrollHeight
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [logs, logsLoading])
+
+  useEffect(() => {
+    const hasActiveTask = recentTasks.some((task) => !isTaskTerminal(task))
+    if (!hasActiveTask) return
+    const timer = window.setInterval(() => {
+      void loadObservability()
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [loadObservability, recentTasks])
 
   const pollTask = useCallback(async (taskId: string) => {
     if (pollingTaskIdRef.current === taskId) return
@@ -211,6 +264,7 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
         separators: ['\n\n', '\n', '。', '！', '？', '；', '  '],
         chunk_size: 1024,
         chunk_overlap: 100,
+        index_mode: 'complete',
       })
       setRebuildTask(task)
       setOpMsg(`重建任务已创建: ${task.task_id}`)
@@ -250,7 +304,7 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
   ]
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-5 sm:space-y-8">
       <div>
         <h2 className="text-xl font-bold text-gray-800">系统状态</h2>
         <p className="text-sm text-gray-500 mt-1">知识库运行状态与统计概览。</p>
@@ -272,7 +326,7 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
       </div>
 
       {/* Config info */}
-      <div className="rounded-lg border border-gray-200 bg-white p-6">
+      <div className="rounded-lg border border-gray-200 bg-white p-4 sm:p-6">
         <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide mb-4">
           配置信息
         </h3>
@@ -296,8 +350,8 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
         </dl>
       </div>
 
-      <div className="rounded-lg border border-gray-200 bg-white p-6">
-        <div className="flex items-start justify-between gap-4">
+      <div className="rounded-lg border border-gray-200 bg-white p-4 sm:p-6">
+        <div className="flex flex-col items-stretch gap-4 sm:flex-row sm:items-start sm:justify-between">
           <div>
             <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide">
               知识库运维
@@ -306,7 +360,7 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
               清空或重建 LightRAG 索引。默认保留上传目录里的原始文档。
             </p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex shrink-0 gap-2">
             <button
               onClick={handleRebuild}
               disabled={operating}
@@ -339,31 +393,13 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
               <span className="text-xs text-gray-500">{rebuildTask.status}</span>
             </div>
             <div className="text-xs text-gray-500 mt-1">
-              {rebuildTask.message}，进度 {rebuildTask.current}/{rebuildTask.total}
+              {rebuildTask.message}，文档 {rebuildTask.current}/{rebuildTask.total}
             </div>
             <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-gray-400">
               {rebuildTask.current_doc && <span>当前文档：{rebuildTask.current_doc}</span>}
               {rebuildTask.timeout_seconds && <span>单文档超时：{rebuildTask.timeout_seconds}s</span>}
               {rebuildTask.updated_at && <span>最后更新：{formatTaskTime(rebuildTask.updated_at)}</span>}
               {isTaskTerminal(rebuildTask) && rebuildTask.updated_at && <span>完成时间：{formatTaskTime(rebuildTask.updated_at)}</span>}
-            </div>
-            <div className="mt-3">
-              <div className="mb-1 flex items-center justify-between text-[11px] text-gray-400">
-                <span>文档进度</span>
-                <span>{rebuildTask.progress}%</span>
-              </div>
-              <div className="h-2 overflow-hidden rounded-full border border-gray-100 bg-white">
-                <div
-                  className={`h-full transition-all ${
-                    rebuildTask.status === 'failed' || rebuildTask.status === 'partial'
-                      ? 'bg-red-500'
-                      : isTaskTerminal(rebuildTask)
-                        ? 'bg-green-500'
-                        : 'bg-primary-500'
-                  }`}
-                  style={{ width: `${Math.max(2, rebuildTask.progress)}%` }}
-                />
-              </div>
             </div>
             <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
               {(['parse', 'chunk_vector', 'kg', 'merge'] as const).map((key) => {
@@ -419,80 +455,121 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
         )}
       </div>
 
-      <div className="rounded-lg border border-gray-200 bg-white p-6">
-        <div className="mb-4 flex items-start justify-between gap-4">
-          <div>
-            <h3 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-gray-600">
-              <ListChecks size={16} />
-              最近索引任务
-            </h3>
-            <p className="mt-1 text-sm text-gray-500">显示当前知识库最近 8 条索引、批量索引和重建任务。</p>
-          </div>
+      <div className="rounded-lg border border-gray-200 bg-white p-4 sm:p-6">
+        <div className="flex items-center justify-between gap-4">
+          <button
+            type="button"
+            onClick={() => setRecentTasksOpen((open) => !open)}
+            className="group flex min-w-0 flex-1 items-center gap-3 text-left"
+            aria-expanded={recentTasksOpen}
+          >
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-gray-50 text-gray-500 ring-1 ring-gray-200">
+              <ListChecks size={17} />
+            </span>
+            <span className="min-w-0">
+              <span className="flex items-center gap-2 text-sm font-semibold text-gray-800">
+                最近索引任务
+                <span className="rounded bg-gray-100 px-1.5 py-0.5 text-[11px] font-medium text-gray-500">
+                  {recentTasks.length}
+                </span>
+              </span>
+              <span className="mt-0.5 block truncate text-xs text-gray-500">
+                {recentTasks.some((task) => !isTaskTerminal(task))
+                  ? '有索引任务正在运行，状态将自动刷新'
+                  : '当前知识库最近的索引记录'}
+              </span>
+            </span>
+            <ChevronDown
+              size={16}
+              className={`ml-auto shrink-0 text-gray-400 transition-transform ${
+                recentTasksOpen ? 'rotate-180' : ''
+              }`}
+            />
+          </button>
           <button
             onClick={loadObservability}
-            className="ui-button-secondary inline-flex items-center gap-2"
+            className="ui-button-secondary inline-flex shrink-0 items-center gap-2"
+            title="刷新最近任务"
           >
             <RefreshCw size={14} />
             刷新
           </button>
         </div>
-        {recentTasks.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-gray-200 p-8 text-center text-sm text-gray-400">
-            当前知识库暂无索引任务记录
-          </div>
-        ) : (
-          <div className="space-y-3">
-            {recentTasks.map((task) => (
-              <div key={task.task_id} className="rounded-lg border border-gray-200 p-3">
-                <div className="flex flex-wrap items-center gap-2 text-sm">
-                  <span className="font-medium text-gray-900">{formatTaskKind(task.kind)}</span>
-                  <span className="font-mono text-xs text-gray-400">{task.task_id}</span>
-                  <span className={`rounded px-2 py-0.5 text-xs ${
-                    taskTone(task) === 'red'
-                      ? 'bg-red-50 text-red-700'
-                      : taskTone(task) === 'green'
-                        ? 'bg-green-50 text-green-700'
-                        : taskTone(task) === 'gray'
-                          ? 'bg-gray-100 text-gray-600'
-                          : 'bg-primary-50 text-primary-700'
-                  }`}>
-                    {task.status}
-                  </span>
-                  <span className="ml-auto text-xs text-gray-400">{formatTaskTime(task.updated_at)}</span>
-                </div>
-                <div className="mt-2 text-xs text-gray-500">
-                  {task.message}，进度 {task.current}/{task.total}
-                  {task.current_doc && `，当前文档 ${task.current_doc}`}
-                </div>
-                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-gray-100">
-                  <div
-                    className={`h-full ${
-                      taskTone(task) === 'red'
-                        ? 'bg-red-500'
-                        : taskTone(task) === 'green'
-                          ? 'bg-green-500'
-                          : 'bg-primary-500'
-                    }`}
-                    style={{ width: `${Math.max(2, task.progress)}%` }}
-                  />
-                </div>
-                {task.errors.length > 0 && (
-                  <div className="mt-2 space-y-1 rounded-md bg-red-50 p-2">
-                    {task.errors.slice(0, 4).map((err) => (
-                      <div key={`${task.task_id}-${err.doc_name}-${err.error}`} className="text-xs text-red-700">
-                        {err.doc_name || '任务'}: {err.error}
-                      </div>
-                    ))}
-                  </div>
-                )}
+
+        {recentTasksOpen && (
+          <div className="mt-5 border-t border-gray-100 pt-2">
+            {recentTasks.length === 0 ? (
+              <div className="py-8 text-center text-sm text-gray-400">
+                当前知识库暂无索引任务记录
               </div>
-            ))}
+            ) : (
+              <div className="divide-y divide-gray-100">
+                {recentTasks.map((task) => (
+                  <details key={task.task_id} className="group/task">
+                    <summary className="flex cursor-pointer list-none items-center gap-3 py-3 text-sm [&::-webkit-details-marker]:hidden">
+                      <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${taskDotClass(task)}`} />
+                      <span className="min-w-0 flex-1">
+                        <span className="flex min-w-0 items-center gap-2">
+                          <span className="font-medium text-gray-900">{formatTaskKind(task.kind)}</span>
+                          <span className="truncate font-mono text-[11px] text-gray-400">{task.task_id}</span>
+                        </span>
+                        <span className="mt-0.5 block truncate text-xs text-gray-500">
+                          {task.current_doc || task.message}
+                        </span>
+                      </span>
+                      <span className="shrink-0 text-xs text-gray-500">
+                        {formatTaskStatus(task.status)}
+                      </span>
+                      <span className="w-14 shrink-0 text-right text-xs text-gray-400">
+                        {formatTaskTime(task.updated_at)}
+                      </span>
+                      <ChevronDown
+                        size={15}
+                        className="shrink-0 text-gray-400 transition-transform group-open/task:rotate-180"
+                      />
+                    </summary>
+                    <div className="mb-3 ml-5 border-l border-gray-200 pl-4 text-xs text-gray-500">
+                      <div className="flex flex-wrap gap-x-4 gap-y-1">
+                        <span>文档 {task.current}/{task.total}</span>
+                        {task.request?.index_mode && (
+                          <span>{task.request.index_mode === 'fast' ? '快速索引' : '完整索引'}</span>
+                        )}
+                        {task.current_stage && <span>阶段：{formatIndexStage(task.current_stage)}</span>}
+                        <span>更新于 {formatTaskTime(task.updated_at)}</span>
+                      </div>
+                      <p className="mt-1.5 break-words text-gray-600">{task.message}</p>
+                      {task.results.some((result) => result.kg_status === 'partial') && (
+                        <div className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-amber-800">
+                          {task.results
+                            .filter((result) => result.kg_status === 'partial')
+                            .map((result) => (
+                              <div key={`${task.task_id}-${result.doc_name}-kg-partial`}>
+                                {result.doc_name}: 已保留文本和向量，跳过{' '}
+                                {result.kg_timed_out_chunks?.length || 0} 个超时 KG 块
+                              </div>
+                            ))}
+                        </div>
+                      )}
+                      {task.errors.length > 0 && (
+                        <div className="mt-2 space-y-1 rounded-md bg-red-50 px-3 py-2 text-red-700">
+                          {task.errors.slice(0, 4).map((err) => (
+                            <div key={`${task.task_id}-${err.doc_name}-${err.error}`}>
+                              {err.doc_name || '任务'}: {err.error}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </details>
+                ))}
+              </div>
+            )}
           </div>
         )}
       </div>
 
-      <div className="rounded-lg border border-gray-200 bg-white p-6">
-        <div className="mb-4 flex items-start justify-between gap-4">
+      <div className="rounded-lg border border-gray-200 bg-white p-4 sm:p-6">
+        <div className="mb-4 flex flex-col items-stretch gap-4 sm:flex-row sm:items-start sm:justify-between">
           <div>
             <h3 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-gray-600">
               <ScrollText size={16} />
@@ -538,7 +615,10 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
             {logMsg}
           </div>
         )}
-        <div className="mt-3 max-h-[420px] overflow-auto rounded-lg bg-gray-950 p-3 font-mono text-xs leading-relaxed text-gray-200">
+        <div
+          ref={logViewportRef}
+          className="mt-3 max-h-[420px] overflow-auto rounded-lg bg-gray-950 p-3 font-mono text-xs leading-relaxed text-gray-200"
+        >
           {logs.length === 0 ? (
             <div className="py-8 text-center text-gray-500">暂无可显示日志</div>
           ) : (

@@ -911,19 +911,19 @@ export default function QAChat({
   )
 
   const renderComposerToolbar = () => (
-    <div className="mb-2 flex min-h-10 flex-wrap items-center gap-1.5 rounded-lg border border-gray-200 bg-gray-50/70 p-1.5">
+    <div className="mb-2 grid min-h-10 grid-cols-2 items-center gap-1.5 rounded-lg border border-gray-200 bg-gray-50/70 p-1.5 sm:flex sm:flex-wrap">
       <WorkspaceSwitcher
         workspace={workspace}
         workspaces={workspaces}
         onChange={handleWorkspaceSelection}
         placement="top"
         compact
-        className="w-44 shrink-0"
+        className="w-full min-w-0 sm:w-44 sm:shrink-0"
       />
 
-      <span className="h-5 w-px bg-gray-200" />
+      <span className="hidden h-5 w-px bg-gray-200 sm:block" />
 
-      <label className="flex h-8 min-w-[180px] flex-1 items-center gap-1.5 rounded-md border border-transparent bg-white px-2 text-xs text-gray-600 shadow-sm hover:border-gray-200">
+      <label className="flex h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md border border-transparent bg-white px-2 text-xs text-gray-600 shadow-sm hover:border-gray-200 sm:min-w-[180px]">
         <Sparkles size={14} strokeWidth={1.8} />
         <select
           value={selectedModelValue}
@@ -959,7 +959,7 @@ export default function QAChat({
 
       <button
         onClick={() => setShowSettings((visible) => !visible)}
-        className={`flex h-8 items-center gap-1.5 rounded-md px-2 text-xs transition ${
+        className={`col-span-2 flex h-8 items-center justify-center gap-1.5 rounded-md px-2 text-xs transition sm:col-auto sm:justify-start ${
           showSettings ? 'bg-gray-100 text-gray-900' : 'text-gray-600 hover:bg-gray-50'
         }`}
         aria-expanded={showSettings}
@@ -1023,14 +1023,14 @@ export default function QAChat({
     <div className="flex h-full bg-white overflow-hidden">
       <div className="flex-1 flex flex-col min-w-0">
         {/* Header */}
-        <div className="flex h-12 shrink-0 items-center justify-between border-b border-gray-100 px-5">
+        <div className="hidden h-12 shrink-0 items-center justify-between border-b border-gray-100 px-5 md:flex">
           <h3 className="truncate text-sm font-medium text-gray-800">
             {activeId ? sessions.find((s) => s.id === activeId)?.title || '对话' : '新对话'}
           </h3>
         </div>
 
         {/* Messages */}
-        <div className="flex-1 overflow-y-auto px-4 py-6">
+        <div className="flex-1 overflow-y-auto px-3 py-4 sm:px-4 sm:py-6">
           {loadingSession ? (
             <div className="flex items-center justify-center py-12 text-gray-400">
               <div className="animate-spin w-5 h-5 border-2 border-primary-500 border-t-transparent rounded-full mr-2" />
@@ -1052,7 +1052,7 @@ export default function QAChat({
               <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 <div className={`${
                   msg.role === 'user'
-                    ? 'max-w-[72%] rounded-3xl bg-gray-100 px-4 py-2.5 text-gray-900'
+                    ? 'max-w-[88%] rounded-3xl bg-gray-100 px-4 py-2.5 text-gray-900 sm:max-w-[72%]'
                     : 'w-full text-gray-900'
                 }`}>
                   {msg.role === 'user' ? (
@@ -1101,7 +1101,7 @@ export default function QAChat({
         </div>
 
         {/* Input */}
-        <div className="shrink-0 px-4 pb-4 pt-2">
+        <div className="shrink-0 px-3 pb-3 pt-2 sm:px-4 sm:pb-4">
           <div className="relative mx-auto max-w-3xl">
             {showSettings && renderSettingsPanel()}
             {renderComposerToolbar()}

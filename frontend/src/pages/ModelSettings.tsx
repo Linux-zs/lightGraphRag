@@ -54,6 +54,7 @@ const DEFAULT_CONFIG: ModelConfig = {
 
 const DEFAULT_BINDINGS: ModelBindings = {
   chat: { profile_id: 'siliconflow-default', model: 'Qwen/Qwen2.5-7B-Instruct' },
+  kg: { profile_id: 'siliconflow-default', model: 'Qwen/Qwen2.5-7B-Instruct' },
   embedding: {
     profile_id: 'siliconflow-default',
     model: 'BAAI/bge-large-zh-v1.5',
@@ -371,9 +372,9 @@ export default function ModelSettings({ workspace }: Props) {
     setTesting(purpose)
     setMessage('')
     try {
-      if (purpose === 'chat') {
+      if (purpose === 'chat' || purpose === 'kg') {
         await testChatModel(binding.profile_id, binding.model)
-        setMessage('大语言模型测试通过')
+        setMessage(purpose === 'kg' ? 'KG 抽取模型测试通过' : '大语言模型测试通过')
       } else if (purpose === 'embedding') {
         const result = await testEmbeddingModel(binding.profile_id, binding.model)
         updateBinding('embedding', { embed_dim: result.dimensions })
@@ -482,7 +483,7 @@ export default function ModelSettings({ workspace }: Props) {
       <div>
         <h2 className="text-xl font-bold text-gray-800">模型设置</h2>
         <p className="text-sm text-gray-500 mt-1">
-          管理 OpenAI-compatible 连接档案，并分别绑定大语言、嵌入和 Rerank 模型。
+          管理 OpenAI-compatible 连接档案，并分别绑定问答、KG 抽取、嵌入和 Rerank 模型。
         </p>
       </div>
 
@@ -600,6 +601,7 @@ export default function ModelSettings({ workspace }: Props) {
 
         <section className="space-y-4">
           {renderBinding('chat', '大语言模型', '用于问答生成、图谱修正建议和 LightRAG 查询。')}
+          {renderBinding('kg', 'KG 抽取模型', '用于文档索引时抽取实体和关系；可选择更快或更适合 JSON 抽取的模型。')}
           {renderBinding('embedding', '嵌入模型', '用于索引和检索向量。模型或维度变化后需要重建索引。')}
           {renderBinding('rerank', 'Rerank 模型', '用于召回结果重排序；如果供应商不支持，可以关闭。')}
 

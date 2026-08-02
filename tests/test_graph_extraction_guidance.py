@@ -46,3 +46,22 @@ def test_graph_guidance_strict_mode_is_explicit(tmp_path):
     assert "strict whitelist" in guidance
     assert "hard constraints" in guidance
     assert "do not use `Other`" in guidance
+
+
+def test_apply_graph_rule_template_supports_noise_reducing_profile(tmp_path):
+    service = LightRAGService(
+        config={"paths": {"data_dir": str(tmp_path), "lightrag_dir": str(tmp_path / "lightrag")}},
+        workspace="new_workspace",
+    )
+
+    config = service.apply_graph_rule_template(
+        "general_knowledge",
+        extraction_mode="enhanced",
+        allow_other_entity_type=False,
+    )
+
+    assert config["rule_template_id"] == "general_knowledge"
+    assert config["extraction_mode"] == "enhanced"
+    assert config["allow_other_entity_type"] is False
+    assert "domain enhanced" in config["effective_extraction_prompt"]
+    assert "do not use `Other`" in config["effective_extraction_prompt"]

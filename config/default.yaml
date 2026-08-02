@@ -30,12 +30,26 @@ lightrag:
   # 实体抽取的“查漏补缺”轮数。1 = 每块抽两遍（质量高但 LLM 调用 ×2）；
   # 0 = 只抽一遍，调用次数减半（推荐，7B 级模型 gleaning 增益很小）。
   entity_extract_max_gleaning: 0
+  # 限制单个文本块一次抽取返回的候选规模，避免模型把普通短语和弱关系全部写入图谱。
+  # 只影响未来索引；已有知识图谱需要重建索引才能生效。
+  entity_extract_max_entities: 24
+  entity_extract_max_records: 48
   # 并发调用大模型的最大数量。提高可加快索引，但可能触发接口限流。
   # 付费/Pro 档可到 8~16；免费档模型限流严格，调高也没用。
   llm_model_max_async: 8
   # 混合思考型模型（Qwen3/GLM-4.5+/DeepSeek-V3.1+ 等）默认开启隐藏思维链，
   # 单次抽取可拖慢到 60~300 秒且易返回空 JSON。true = 自动关闭思考模式（推荐）。
   disable_thinking: true
+  # KG 抽取前跳过明显低价值 chunk（空白、纯符号、目录/表格/代码噪声）。
+  # 向量索引仍保留这些 chunk，只是不把它们送进实体关系抽取。
+  kg_skip_low_value_chunks: true
+  kg_min_substantive_chars: 8
+  kg_symbol_ratio_threshold: 0.78
+  kg_structured_line_ratio: 0.72
+  # 单个 KG chunk 超时不应拖垮整份文档。超时 chunk 仍保留文本和向量，
+  # 只跳过该块的实体关系抽取；超过上限后才终止文档索引。
+  kg_skip_timed_out_chunks: true
+  kg_max_timed_out_chunks: 3
   workspace: tdx_default
 llm:
   backend: siliconflow
@@ -66,6 +80,10 @@ siliconflow:
   embed_max_tokens: 480
   embed_model: BAAI/bge-large-zh-v1.5
   frequency_penalty: 0.3
+  # KG 抽取使用独立的生成预算和超时。限制输出长度可减少模型在单块上
+  # 长时间生成；LightRAG worker 超时约为此值的 2 倍。
+  kg_max_tokens: 1536
+  kg_timeout: 90
   presence_penalty: 0.2
   rerank_model: BAAI/bge-reranker-v2-m3
   timeout: 90

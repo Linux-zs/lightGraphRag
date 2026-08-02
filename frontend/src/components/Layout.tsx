@@ -5,13 +5,19 @@ import {
   Database,
   FileSearch,
   GitBranch,
+  Menu,
   MessageSquarePlus,
   Search,
   SlidersHorizontal,
   Trash2,
   X,
 } from 'lucide-react'
-import { ChatSessionListItem, WorkspaceInfo } from '../api'
+import {
+  ChatSessionListItem,
+  GraphRuleTemplate,
+  listGraphRuleTemplates,
+  WorkspaceInfo,
+} from '../api'
 import WorkspaceSwitcher from './WorkspaceSwitcher'
 
 type Page = 'chat' | 'kb' | 'recall' | 'graph' | 'models' | 'dashboard'
@@ -22,8 +28,7 @@ interface Props {
   workspace: string
   workspaces: WorkspaceInfo[]
   onWorkspaceChange: (workspace: string) => void
-  onCreateWorkspace: (name: string) => Promise<void>
-  onDeleteWorkspace: (workspace: string) => void
+  onCreateWorkspace: (name: string, ruleTemplateId: string) => Promise<void>
   chatSessions: ChatSessionListItem[]
   activeChatId: string | null
   onNewChat: () => void
@@ -66,7 +71,6 @@ export default function Layout({
   workspaces,
   onWorkspaceChange,
   onCreateWorkspace,
-  onDeleteWorkspace,
   chatSessions,
   activeChatId,
   onNewChat,
@@ -82,6 +86,21 @@ export default function Layout({
   const [workspaceName, setWorkspaceName] = useState('')
   const [createError, setCreateError] = useState('')
   const [creating, setCreating] = useState(false)
+  const [ruleTemplates, setRuleTemplates] = useState<GraphRuleTemplate[]>([])
+  const [selectedRuleTemplateId, setSelectedRuleTemplateId] = useState('')
+  const [ruleTemplatesLoading, setRuleTemplatesLoading] = useState(false)
+  const [ruleTemplatesError, setRuleTemplatesError] = useState('')
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
+
+  const navigateTo = (page: Page) => {
+    onNavigate(page)
+    setMobileNavOpen(false)
+  }
+
+  const changeWorkspace = (nextWorkspace: string) => {
+    onWorkspaceChange(nextWorkspace)
+    setMobileNavOpen(false)
+  }
 
   const setSection = (
     setter: (value: boolean) => void,
@@ -97,6 +116,10 @@ export default function Layout({
     if (!keyword) return chatSessions
     return chatSessions.filter((item) => item.title.toLowerCase().includes(keyword))
   }, [chatSearch, chatSessions])
+  const selectedRuleTemplate = useMemo(
+    () => ruleTemplates.find((item) => item.id === selectedRuleTemplateId),
+    [ruleTemplates, selectedRuleTemplateId],
+  )
 
   useEffect(() => {
     if (!createOpen) return
@@ -107,10 +130,44 @@ export default function Layout({
     return () => document.removeEventListener('keydown', handleEscape)
   }, [createOpen, creating])
 
+  useEffect(() => {
+    if (!mobileNavOpen) return
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMobileNavOpen(false)
+    }
+    const handleResize = () => {
+      if (window.innerWidth >= 768) setMobileNavOpen(false)
+    }
+    document.addEventListener('keydown', handleEscape)
+    window.addEventListener('resize', handleResize)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      document.removeEventListener('keydown', handleEscape)
+      window.removeEventListener('resize', handleResize)
+    }
+  }, [mobileNavOpen])
+
   const openCreateDialog = () => {
     setWorkspaceName('')
     setCreateError('')
+    setRuleTemplates([])
+    setSelectedRuleTemplateId('')
+    setRuleTemplatesError('')
     setCreateOpen(true)
+    setRuleTemplatesLoading(true)
+    void listGraphRuleTemplates(workspace)
+      .then((templates) => {
+        setRuleTemplates(templates)
+        const preferred = templates.find((item) => item.id === 'general_knowledge') || templates[0]
+        setSelectedRuleTemplateId(preferred?.id || '')
+        if (!preferred) setRuleTemplatesError('暂无可用抽取规则，请先在知识图谱页面创建规则')
+      })
+      .catch((error) => {
+        setRuleTemplatesError((error as Error).message || '抽取规则加载失败')
+      })
+      .finally(() => setRuleTemplatesLoading(false))
   }
 
   const submitWorkspace = async (event: FormEvent) => {
@@ -124,10 +181,14 @@ export default function Layout({
       setCreateError('该知识库已经存在')
       return
     }
+    if (!selectedRuleTemplateId) {
+      setCreateError('请选择抽取规则')
+      return
+    }
     setCreating(true)
     setCreateError('')
     try {
-      await onCreateWorkspace(name)
+      await onCreateWorkspace(name, selectedRuleTemplateId)
       setCreateOpen(false)
     } catch (error) {
       setCreateError((error as Error).message || '创建知识库失败')
@@ -138,7 +199,21 @@ export default function Layout({
 
   return (
     <div className="flex h-screen bg-white">
-      <aside className="flex w-[248px] shrink-0 flex-col border-r border-gray-200 bg-[#f7f7f8]">
+      {mobileNavOpen && (
+        <button
+          type="button"
+          className="fixed inset-0 z-[70] bg-gray-950/30 backdrop-blur-[1px] md:hidden"
+          onClick={() => setMobileNavOpen(false)}
+          aria-label="关闭导航"
+        />
+      )}
+
+      <aside
+        id="app-navigation"
+        className={`fixed inset-y-0 left-0 z-[80] flex w-[280px] shrink-0 flex-col border-r border-gray-200 bg-[#f7f7f8] shadow-xl transition-transform duration-200 ease-out md:static md:z-auto md:w-[248px] md:translate-x-0 md:shadow-none ${
+          mobileNavOpen ? 'translate-x-0' : '-translate-x-full'
+        }`}
+      >
         <div className="px-3 pb-2 pt-3">
           <div className="flex items-center gap-2 px-2 py-1.5">
             <BrandMark />
@@ -148,6 +223,14 @@ export default function Layout({
               </h1>
               <p className="truncate text-[11px] text-gray-500">LightRAG 知识库工作台</p>
             </div>
+            <button
+              type="button"
+              onClick={() => setMobileNavOpen(false)}
+              className="ui-icon-button ml-auto md:hidden"
+              aria-label="关闭导航"
+            >
+              <X size={17} />
+            </button>
           </div>
         </div>
 
@@ -155,10 +238,9 @@ export default function Layout({
           <WorkspaceSwitcher
             workspace={workspace}
             workspaces={workspaces}
-            onChange={onWorkspaceChange}
-            onManage={() => onNavigate('kb')}
+            onChange={changeWorkspace}
+            onManage={() => navigateTo('kb')}
             onCreate={openCreateDialog}
-            onDelete={onDeleteWorkspace}
           />
         </div>
 
@@ -177,7 +259,7 @@ export default function Layout({
                   </div>
                 )}
                 <button
-                  onClick={() => onNavigate(item.key)}
+                  onClick={() => navigateTo(item.key)}
                   className={`flex h-9 w-full items-center gap-2.5 rounded-md px-3 text-left text-sm transition-colors ${
                     active
                       ? 'bg-gray-200 text-gray-950'
@@ -209,7 +291,10 @@ export default function Layout({
           {sessionsOpen && (
             <>
               <button
-                onClick={onNewChat}
+                onClick={() => {
+                  onNewChat()
+                  setMobileNavOpen(false)
+                }}
                 className="mt-1 flex h-9 w-full items-center gap-2.5 rounded-md px-2 text-sm text-gray-800 hover:bg-gray-200/70"
               >
                 <MessageSquarePlus size={16} strokeWidth={1.8} />
@@ -238,11 +323,15 @@ export default function Layout({
                         key={session.id}
                         role="button"
                         tabIndex={0}
-                        onClick={() => onSelectChat(session.id)}
+                        onClick={() => {
+                          onSelectChat(session.id)
+                          setMobileNavOpen(false)
+                        }}
                         onKeyDown={(event) => {
                           if (event.key === 'Enter' || event.key === ' ') {
                             event.preventDefault()
                             onSelectChat(session.id)
+                            setMobileNavOpen(false)
                           }
                         }}
                         className={`group flex h-9 w-full items-center gap-2 rounded-md px-2 text-left transition-colors ${
@@ -278,8 +367,29 @@ export default function Layout({
       </aside>
 
       <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        <div className="flex h-12 shrink-0 items-center gap-3 border-b border-gray-200 bg-white px-3 md:hidden">
+          <button
+            type="button"
+            onClick={() => setMobileNavOpen(true)}
+            className="ui-icon-button"
+            aria-label="打开导航"
+            aria-controls="app-navigation"
+            aria-expanded={mobileNavOpen}
+          >
+            <Menu size={19} />
+          </button>
+          <BrandMark />
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-sm font-semibold text-gray-900">
+              LightGraphRAG
+            </div>
+            <div className="truncate text-[11px] text-gray-500">
+              {workspace} · {PAGE_LABELS[currentPage]}
+            </div>
+          </div>
+        </div>
         {currentPage !== 'models' && (
-          <div className="flex h-11 shrink-0 items-center gap-2 border-b border-gray-200 bg-white px-6 text-xs">
+          <div className="hidden h-11 shrink-0 items-center gap-2 border-b border-gray-200 bg-white px-6 text-xs md:flex">
             <span className="flex items-center gap-1.5 font-medium text-gray-500">
               <Database size={14} className="text-primary-600" />
               知识库工作区
@@ -295,7 +405,15 @@ export default function Layout({
           {currentPage === 'chat' ? (
             children
           ) : (
-            <div className="mx-auto max-w-5xl px-8 py-6">
+            <div
+              className={`mx-auto w-full px-4 py-4 sm:px-6 sm:py-5 lg:px-8 lg:py-6 ${
+                currentPage === 'graph'
+                  ? 'max-w-[1440px]'
+                  : currentPage === 'models'
+                    ? 'max-w-6xl'
+                    : 'max-w-5xl'
+              }`}
+            >
               {children}
             </div>
           )}
@@ -349,6 +467,47 @@ export default function Layout({
                 />
               </label>
               <p className="mt-2 text-xs text-gray-400">支持字母、数字、下划线和短横线。</p>
+
+              <label className="mt-5 block">
+                <span className="ui-label">实体关系抽取规则</span>
+                <select
+                  value={selectedRuleTemplateId}
+                  onChange={(event) => {
+                    setSelectedRuleTemplateId(event.target.value)
+                    setCreateError('')
+                  }}
+                  className="ui-control w-full"
+                  disabled={ruleTemplatesLoading || ruleTemplates.length === 0}
+                >
+                  {ruleTemplatesLoading && <option value="">正在加载抽取规则...</option>}
+                  {!ruleTemplatesLoading && ruleTemplates.length === 0 && (
+                    <option value="">暂无可用抽取规则</option>
+                  )}
+                  {ruleTemplates.map((template) => (
+                    <option key={template.id} value={template.id}>
+                      {template.name}{template.built_in ? ' / 内置' : ' / 自定义'}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {selectedRuleTemplate && (
+                <div className="mt-2 rounded-md border border-gray-200 bg-gray-50 px-3 py-2">
+                  <p className="text-xs leading-5 text-gray-600">
+                    {selectedRuleTemplate.description || '当前模板没有补充说明。'}
+                  </p>
+                  <p className="mt-1 text-[11px] text-gray-400">
+                    {selectedRuleTemplate.entity_types.length} 类实体 · {selectedRuleTemplate.relation_types.length} 类关系
+                  </p>
+                </div>
+              )}
+              <p className="mt-2 text-xs leading-5 text-gray-400">
+                新知识库默认采用增强抽取：规则用于优先归类和过滤噪声，不作为严格白名单；创建后可在知识图谱中调整。
+              </p>
+              {ruleTemplatesError && (
+                <p className="mt-2 rounded-md bg-red-50 px-3 py-2 text-xs text-red-600">
+                  {ruleTemplatesError}
+                </p>
+              )}
               {createError && (
                 <p className="mt-3 rounded-md bg-red-50 px-3 py-2 text-xs text-red-600">
                   {createError}
@@ -364,7 +523,11 @@ export default function Layout({
               >
                 取消
               </button>
-              <button type="submit" className="ui-button-primary" disabled={creating}>
+              <button
+                type="submit"
+                className="ui-button-primary"
+                disabled={creating || ruleTemplatesLoading || !selectedRuleTemplateId}
+              >
                 {creating ? '创建中...' : '创建知识库'}
               </button>
             </div>

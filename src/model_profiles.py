@@ -241,6 +241,13 @@ def _default_store(config: dict[str, Any] | None = None) -> dict[str, Any]:
                 "profile_id": DEFAULT_PROFILE_ID,
                 "model": sf.get("chat_model", "Qwen/Qwen2.5-7B-Instruct"),
             },
+            "kg": {
+                "profile_id": DEFAULT_PROFILE_ID,
+                "model": sf.get(
+                    "kg_model",
+                    sf.get("chat_model", "Qwen/Qwen2.5-7B-Instruct"),
+                ),
+            },
             "embedding": {
                 "profile_id": DEFAULT_PROFILE_ID,
                 "model": sf.get("embed_model", "BAAI/bge-large-zh-v1.5"),
@@ -340,7 +347,7 @@ def get_bindings(config: dict[str, Any] | None = None) -> dict[str, Any]:
 def save_bindings(bindings: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
     store = _load_store(config)
     current = store["bindings"]
-    for purpose in ("chat", "embedding", "rerank"):
+    for purpose in ("chat", "kg", "embedding", "rerank"):
         if purpose in bindings and isinstance(bindings[purpose], dict):
             current[purpose] = {**current.get(purpose, {}), **bindings[purpose]}
     store["bindings"] = current
@@ -423,6 +430,7 @@ def get_runtime_model_config(config: dict[str, Any] | None = None) -> dict[str, 
         return {**binding, **profile}
 
     chat = resolve("chat")
+    kg = resolve("kg")
     embedding = resolve("embedding")
     rerank = resolve("rerank")
     return {
@@ -436,6 +444,17 @@ def get_runtime_model_config(config: dict[str, Any] | None = None) -> dict[str, 
             "frequency_penalty": sf.get("frequency_penalty", 0.3),
             "presence_penalty": sf.get("presence_penalty", 0.2),
             "timeout": sf.get("timeout", 90),
+        },
+        "kg": {
+            "base_url": kg.get("api_base", chat.get("api_base", DEFAULT_BASE_URL)),
+            "api_key": kg.get("api_key", chat.get("api_key", "")),
+            "model": kg.get("model") or chat.get("model") or sf.get("chat_model", "Qwen/Qwen2.5-7B-Instruct"),
+            "temperature": sf.get("kg_temperature", 0.0),
+            "top_p": sf.get("kg_top_p", 0.9),
+            "max_tokens": sf.get("kg_max_tokens", 1536),
+            "frequency_penalty": sf.get("kg_frequency_penalty", 0.0),
+            "presence_penalty": sf.get("kg_presence_penalty", 0.0),
+            "timeout": sf.get("kg_timeout", sf.get("timeout", 90)),
         },
         "embedding": {
             "base_url": embedding.get("api_base", DEFAULT_BASE_URL),

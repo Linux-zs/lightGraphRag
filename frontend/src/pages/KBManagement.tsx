@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { ChevronDown, ShieldCheck, SlidersHorizontal, Trash2 } from 'lucide-react'
 import FileUpload from '../components/FileUpload'
 import ChunkPreview from '../components/ChunkPreview'
 import { RangeField } from '../components/ui'
@@ -30,9 +31,15 @@ type UploadedFile = UploadedDocument
 
 interface Props {
   workspace: string
+  isDefaultWorkspace: boolean
+  onDeleteWorkspace: () => Promise<void>
 }
 
-export default function KBManagement({ workspace }: Props) {
+export default function KBManagement({
+  workspace,
+  isDefaultWorkspace,
+  onDeleteWorkspace,
+}: Props) {
   // Upload state
   const [uploaded, setUploaded] = useState<UploadedFile | null>(null)
   const [uploading, setUploading] = useState(false)
@@ -41,6 +48,8 @@ export default function KBManagement({ workspace }: Props) {
   const [separators, setSeparators] = useState('\\n\\n, \\n, 。, ！, ？, ；,  ')
   const [chunkSize, setChunkSize] = useState(1024)
   const [chunkOverlap, setChunkOverlap] = useState(100)
+  const [indexMode, setIndexMode] = useState<'complete' | 'fast'>('complete')
+  const [advancedIndexOpen, setAdvancedIndexOpen] = useState(false)
 
   // Preview & index state
   const [chunks, setChunks] = useState<ChunkPreviewItem[]>([])
@@ -53,6 +62,8 @@ export default function KBManagement({ workspace }: Props) {
   // Document list
   const [docs, setDocs] = useState<DocInfo[]>([])
   const [deleting, setDeleting] = useState<string | null>(null)
+  const [deletingWorkspace, setDeletingWorkspace] = useState(false)
+  const [workspaceDeleteError, setWorkspaceDeleteError] = useState('')
 
   // Batch operations
   const [checkedDocs, setCheckedDocs] = useState<Set<string>>(new Set())
@@ -225,6 +236,37 @@ export default function KBManagement({ workspace }: Props) {
 
   const formatStageSeconds = (seconds: number) => `${seconds.toFixed(1)}s`
 
+  const kgStatusLabel = (status?: string) => {
+    if (status === 'complete') return '已建图谱'
+    if (status === 'partial') return '部分图谱'
+    if (status === 'skipped') return '跳过KG'
+    if (status === 'filtered_empty') return '无有效KG块'
+    if (status === 'failed') return 'KG失败'
+    return status || '未记录'
+  }
+
+  const kgStatusClass = (status?: string) => {
+    if (status === 'complete') return 'bg-violet-50 text-violet-700'
+    if (status === 'partial') return 'bg-amber-50 text-amber-700'
+    if (status === 'skipped') return 'bg-gray-100 text-gray-600'
+    if (status === 'filtered_empty') return 'bg-amber-50 text-amber-700'
+    if (status === 'failed') return 'bg-red-50 text-red-700'
+    return 'bg-gray-100 text-gray-600'
+  }
+
+  const handleDeleteWorkspace = async () => {
+    if (isDefaultWorkspace || deletingWorkspace) return
+    setDeletingWorkspace(true)
+    setWorkspaceDeleteError('')
+    try {
+      await onDeleteWorkspace()
+    } catch (error) {
+      setWorkspaceDeleteError((error as Error).message || '删除知识库失败')
+    } finally {
+      setDeletingWorkspace(false)
+    }
+  }
+
   const activeStageSeconds = (startedAt: string | undefined, fallback: number) => {
     if (!startedAt) return fallback
     const start = new Date(startedAt).getTime()
@@ -340,6 +382,7 @@ export default function KBManagement({ workspace }: Props) {
         separators: sepArray,
         chunk_size: chunkSize,
         chunk_overlap: chunkOverlap,
+        index_mode: indexMode,
       })
       setIndexTask(task)
       setIndexMsg(`索引任务已创建: ${task.task_id}`)
@@ -478,6 +521,7 @@ export default function KBManagement({ workspace }: Props) {
         separators: sepArray,
         chunk_size: chunkSize,
         chunk_overlap: chunkOverlap,
+        index_mode: indexMode,
       })
       setBatchIndexTask(task)
       setBatchMsg(`批量索引任务已创建: ${task.task_id}`)
@@ -519,7 +563,7 @@ export default function KBManagement({ workspace }: Props) {
     const updatedClock = formatClock(task.updated_at)
     const stageTimings = task.stage_timings ?? { parse: 0, chunk_vector: 0, kg: 0, merge: 0 }
     const currentStage = task.current_stage
-    const showDocumentProgress = task.total > 1
+    const taskMode = task.request?.index_mode === 'fast' ? '快速索引' : '完整索引'
     const statusDotClass = failed
       ? 'bg-red-500'
       : terminal
@@ -546,6 +590,7 @@ export default function KBManagement({ workspace }: Props) {
               <span className={`mr-2 inline-block h-2.5 w-2.5 rounded-full ${statusDotClass}`} />
               任务 {task.task_id}
               <span className="ml-2 text-xs text-gray-500">{task.status}</span>
+              <span className="ml-2 rounded bg-white/70 px-1.5 py-0.5 text-[11px] text-gray-500">{taskMode}</span>
             </div>
             <div className="text-xs text-gray-500 mt-0.5">
               {task.message}，进度 {task.current}/{task.total}
@@ -569,22 +614,6 @@ export default function KBManagement({ workspace }: Props) {
             </button>
           )}
         </div>
-        {showDocumentProgress && (
-          <div className="mt-3">
-            <div className="mb-1 flex items-center justify-between text-[11px] text-gray-400">
-              <span>文档进度</span>
-              <span>{task.progress}%</span>
-            </div>
-            <div className="h-2 overflow-hidden rounded-full border border-gray-100 bg-white">
-              <div
-                className={`h-full transition-all ${
-                  failed ? 'bg-red-500' : terminal ? 'bg-green-500' : 'bg-primary-500'
-                }`}
-                style={{ width: `${Math.max(2, task.progress)}%` }}
-              />
-            </div>
-          </div>
-        )}
         <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
           {STAGE_CARDS.map(({ key, label }) => {
             const v = stageTimings[key]
@@ -617,6 +646,18 @@ export default function KBManagement({ workspace }: Props) {
                 {err.doc_name}: {err.error}
               </div>
             ))}
+          </div>
+        )}
+        {task.results.some((result) => result.kg_status === 'partial') && (
+          <div className="mt-2 space-y-1 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            {task.results
+              .filter((result) => result.kg_status === 'partial')
+              .map((result) => (
+                <div key={`${result.doc_name}-kg-partial`}>
+                  {result.doc_name}: 已保留文本和向量，跳过{' '}
+                  {result.kg_timed_out_chunks?.length || 0} 个超时 KG 块
+                </div>
+              ))}
           </div>
         )}
       </div>
@@ -684,6 +725,7 @@ export default function KBManagement({ workspace }: Props) {
     setBatchIndexing(false)
     setIndexMsg('')
     setBatchMsg('')
+    setWorkspaceDeleteError('')
     loadDocs()
     loadGraphRule()
     restoreIndexTasks(runId)
@@ -695,7 +737,7 @@ export default function KBManagement({ workspace }: Props) {
   }, [workspace])
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-5 sm:space-y-8">
       {/* Page header */}
       <div>
         <h2 className="text-xl font-bold text-gray-800">知识库管理</h2>
@@ -705,30 +747,31 @@ export default function KBManagement({ workspace }: Props) {
       </div>
 
       {/* Upload section */}
-      <section className="rounded-lg border border-gray-200 bg-white p-6">
+      <section className="rounded-lg border border-gray-200 bg-white p-4 sm:p-6">
         <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide mb-4">
           上传文档
         </h3>
         <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <div className="font-medium text-amber-900">
-                当前图谱抽取规则：{graphRule?.rule_template_name || '加载中'}
-              </div>
-              <p className="mt-1 text-xs text-amber-800 leading-relaxed">
-                索引时 LightRAG 会按这套规则引导实体和关系抽取。切换规则后，已索引文档需要重新索引才会重建图谱。
-              </p>
-            </div>
-            <div className="shrink-0 text-right text-xs text-amber-800">
-              <div>实体类型 {graphRule?.entity_types?.length ?? 0}</div>
-              <div>关系类型 {graphRule?.relation_types?.length ?? 0}</div>
-            </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-medium text-amber-900">
+              抽取规则：{graphRule?.rule_template_name || '加载中'}
+            </span>
+            <span className="rounded bg-white/70 px-2 py-0.5 text-[11px] text-amber-800">
+              {graphRule?.entity_types?.length ?? 0} 类实体
+            </span>
+            <span className="rounded bg-white/70 px-2 py-0.5 text-[11px] text-amber-800">
+              {graphRule?.relation_types?.length ?? 0} 类关系
+            </span>
           </div>
-          {graphRule?.extraction_prompt && (
-            <p className="mt-2 line-clamp-2 text-xs text-amber-700">
-              {graphRule.extraction_prompt}
+          <details className="mt-2 text-xs text-amber-800">
+            <summary className="cursor-pointer select-none font-medium">查看规则说明</summary>
+            <p className="mt-2 leading-relaxed">
+              索引时 LightRAG 会按这套规则引导实体和关系抽取。切换规则后，已索引文档需要重新索引才会重建图谱。
             </p>
-          )}
+            {graphRule?.extraction_prompt && (
+              <p className="mt-2 line-clamp-3 text-amber-700">{graphRule.extraction_prompt}</p>
+            )}
+          </details>
         </div>
         <FileUpload onUpload={handleUpload} onMultiUpload={handleMultiUpload} uploading={uploading} />
 
@@ -761,59 +804,110 @@ export default function KBManagement({ workspace }: Props) {
         )}
       </section>
 
-      {/* Chunking config */}
-      <section className="rounded-lg border border-gray-200 bg-white p-6">
+      {/* Index config */}
+      <section className="rounded-lg border border-gray-200 bg-white p-4 sm:p-6">
         <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide mb-4">
-          切分配置
+          索引配置
         </h3>
 
-        <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(320px,0.85fr)]">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              分隔符 (逗号分隔)
-            </label>
-            <input
-              type="text"
-              value={separators}
-              onChange={(e) => setSeparators(e.target.value)}
-              className="ui-control w-full"
-              placeholder="\n\n, \n, 。, ！"
-            />
-            <p className="text-[11px] text-gray-400 mt-1">
-              输入 <code className="bg-gray-100 px-1 rounded">\n</code> 表示换行，
-              <code className="bg-gray-100 px-1 rounded">\n\n</code> 表示段落
-            </p>
-          </div>
-
-          <div className="space-y-4">
-            <div>
-              <RangeField
-                label="Chunk Size"
-                value={chunkSize}
-                min={100}
-                max={2000}
-                step={50}
-                onChange={setChunkSize}
-              />
-            <p className="text-[11px] text-gray-400">每个文本块的最大字符数</p>
-            <p className="text-[11px] text-amber-600 mt-1">LightRAG 实际按 token 处理，此处作为索引参数传入。</p>
-            </div>
-
-            <div>
-              <RangeField
-                label="Overlap"
-                value={chunkOverlap}
-                min={0}
-                max={500}
-                step={10}
-                onChange={setChunkOverlap}
-              />
-            <p className="text-[11px] text-gray-400">相邻文本块的重叠字符数</p>
-            </div>
+        <div className="rounded-lg border border-gray-200 bg-gray-50 p-3">
+          <div className="mb-2 text-sm font-medium text-gray-700">索引模式</div>
+          <div className="grid gap-2 md:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => setIndexMode('complete')}
+              className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                indexMode === 'complete'
+                  ? 'border-primary-300 bg-white text-gray-900 ring-1 ring-primary-100'
+                  : 'border-gray-200 bg-white text-gray-600 hover:border-gray-300'
+              }`}
+            >
+              <div className="text-sm font-medium">完整索引</div>
+              <div className="mt-0.5 text-xs text-gray-500">生成向量并抽取实体关系，问答和图谱都完整。</div>
+            </button>
+            <button
+              type="button"
+              onClick={() => setIndexMode('fast')}
+              className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                indexMode === 'fast'
+                  ? 'border-primary-300 bg-white text-gray-900 ring-1 ring-primary-100'
+                  : 'border-gray-200 bg-white text-gray-600 hover:border-gray-300'
+              }`}
+            >
+              <div className="text-sm font-medium">快速索引</div>
+              <div className="mt-0.5 text-xs text-gray-500">只写入文本块和向量，跳过 KG 抽取，适合先验证问答。</div>
+            </button>
           </div>
         </div>
 
-        <div className="flex gap-3 mt-6">
+        <button
+          type="button"
+          onClick={() => setAdvancedIndexOpen((open) => !open)}
+          className="mt-4 flex w-full items-center gap-3 rounded-lg border border-gray-200 px-3 py-2.5 text-left transition hover:bg-gray-50"
+          aria-expanded={advancedIndexOpen}
+        >
+          <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-gray-100 text-gray-500">
+            <SlidersHorizontal size={16} />
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block text-sm font-medium text-gray-800">高级索引设置</span>
+            <span className="block truncate text-xs text-gray-500">
+              Chunk {chunkSize} · Overlap {chunkOverlap} · 自定义分隔符
+            </span>
+          </span>
+          <ChevronDown
+            size={16}
+            className={`shrink-0 text-gray-400 transition-transform ${advancedIndexOpen ? 'rotate-180' : ''}`}
+          />
+        </button>
+
+        {advancedIndexOpen && (
+          <div className="mt-3 grid grid-cols-1 gap-6 rounded-lg border border-gray-200 bg-gray-50/60 p-4 lg:grid-cols-[minmax(0,1fr)_minmax(320px,0.85fr)]">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                分隔符（逗号分隔）
+              </label>
+              <input
+                type="text"
+                value={separators}
+                onChange={(e) => setSeparators(e.target.value)}
+                className="ui-control w-full"
+                placeholder="\n\n, \n, 。, ！"
+              />
+              <p className="mt-1 text-xs text-gray-400">
+                <code className="rounded bg-gray-100 px-1">\n</code> 表示换行，
+                <code className="rounded bg-gray-100 px-1">\n\n</code> 表示段落
+              </p>
+            </div>
+
+            <div className="space-y-4">
+              <div>
+                <RangeField
+                  label="Chunk Size"
+                  value={chunkSize}
+                  min={100}
+                  max={2000}
+                  step={50}
+                  onChange={setChunkSize}
+                />
+                <p className="text-xs text-gray-400">每个文本块的最大 token 数</p>
+              </div>
+              <div>
+                <RangeField
+                  label="Overlap"
+                  value={chunkOverlap}
+                  min={0}
+                  max={500}
+                  step={10}
+                  onChange={setChunkOverlap}
+                />
+                <p className="text-xs text-gray-400">相邻文本块的重叠 token 数</p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="mt-5 flex flex-wrap gap-3">
           <button
             onClick={handlePreview}
             disabled={!uploaded || previewing}
@@ -843,7 +937,7 @@ export default function KBManagement({ workspace }: Props) {
       </section>
 
       {/* Chunk preview */}
-      <section className="rounded-lg border border-gray-200 bg-white p-6">
+      <section className="rounded-lg border border-gray-200 bg-white p-4 sm:p-6">
         <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide mb-4">
           切分预览 {chunks.length > 0 && <span className="text-gray-400">({chunks.length} 块)</span>}
         </h3>
@@ -856,7 +950,7 @@ export default function KBManagement({ workspace }: Props) {
       </section>
 
       {/* Document list */}
-      <section className="rounded-lg border border-gray-200 bg-white p-6">
+      <section className="rounded-lg border border-gray-200 bg-white p-4 sm:p-6">
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide">
             文档清单
@@ -926,6 +1020,7 @@ export default function KBManagement({ workspace }: Props) {
                   <th className="pb-2 font-medium text-gray-500">文档名</th>
                   <th className="pb-2 font-medium text-gray-500">类型</th>
                   <th className="pb-2 font-medium text-gray-500">块数</th>
+                  <th className="pb-2 font-medium text-gray-500">KG</th>
                   <th className="pb-2 font-medium text-gray-500">抽取规则</th>
                   <th className="pb-2 font-medium text-gray-500">状态</th>
                   <th className="pb-2 font-medium text-gray-500 text-right">操作</th>
@@ -957,6 +1052,14 @@ export default function KBManagement({ workspace }: Props) {
                       </span>
                     </td>
                     <td className="py-2.5 text-gray-600">{doc.chunk_count}</td>
+                    <td className="py-2.5">
+                      <span
+                        title={doc.kg_model || ''}
+                        className={`text-xs px-2 py-0.5 rounded ${kgStatusClass(doc.kg_status)}`}
+                      >
+                        {kgStatusLabel(doc.kg_status)}
+                      </span>
+                    </td>
                     <td className="py-2.5 text-gray-600">
                       <span
                         title={doc.graph_rule?.extraction_prompt_preview || ''}
@@ -993,6 +1096,45 @@ export default function KBManagement({ workspace }: Props) {
               </tbody>
             </table>
           </div>
+        )}
+      </section>
+
+      {/* Workspace settings */}
+      <section className="rounded-lg border border-gray-200 bg-white p-4 sm:p-6">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex min-w-0 items-start gap-3">
+            <span
+              className={`grid h-9 w-9 shrink-0 place-items-center rounded-md ${
+                isDefaultWorkspace
+                  ? 'bg-gray-100 text-gray-500'
+                  : 'bg-red-50 text-red-600'
+              }`}
+            >
+              {isDefaultWorkspace ? <ShieldCheck size={17} /> : <Trash2 size={17} />}
+            </span>
+            <div className="min-w-0">
+              <h3 className="text-sm font-semibold text-gray-800">知识库设置</h3>
+              <p className="mt-1 text-xs leading-5 text-gray-500">
+                {isDefaultWorkspace
+                  ? '当前为默认知识库，系统已保护其工作区，不能删除。'
+                  : `删除“${workspace}”会同时移除上传文档、索引、图谱和会话入口。`}
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={handleDeleteWorkspace}
+            disabled={isDefaultWorkspace || deletingWorkspace}
+            className="ui-button shrink-0 self-start border border-red-200 bg-white text-red-600 hover:border-red-300 hover:bg-red-50 disabled:cursor-not-allowed disabled:border-gray-200 disabled:text-gray-300 disabled:hover:bg-white sm:self-auto"
+          >
+            <Trash2 size={15} />
+            {deletingWorkspace ? '删除中...' : '删除知识库'}
+          </button>
+        </div>
+        {workspaceDeleteError && (
+          <p className="mt-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+            {workspaceDeleteError}
+          </p>
         )}
       </section>
 

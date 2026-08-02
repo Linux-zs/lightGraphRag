@@ -133,8 +133,8 @@ export default function App() {
     localStorage.setItem('tdx_workspace', next)
   }
 
-  const handleCreateWorkspace = async (name: string) => {
-    const created = await createWorkspace(name)
+  const handleCreateWorkspace = async (name: string, ruleTemplateId: string) => {
+    const created = await createWorkspace(name, ruleTemplateId)
     await loadWorkspaces()
     handleWorkspaceChange(created.workspace)
   }
@@ -198,7 +198,6 @@ export default function App() {
       workspaces={workspaces}
       onWorkspaceChange={handleWorkspaceChange}
       onCreateWorkspace={handleCreateWorkspace}
-      onDeleteWorkspace={handleDeleteWorkspace}
       chatSessions={chatSessions}
       activeChatId={activeChatId}
       onNewChat={handleNewChat}
@@ -216,7 +215,15 @@ export default function App() {
           reloadSessions={reloadCurrentChatSessions}
         />
       )}
-      {page === 'kb' && <KBManagement workspace={workspace} />}
+      {page === 'kb' && (
+        <KBManagement
+          workspace={workspace}
+          isDefaultWorkspace={
+            workspaces.find((item) => item.workspace === workspace)?.is_default !== false
+          }
+          onDeleteWorkspace={() => handleDeleteWorkspace(workspace)}
+        />
+      )}
       {page === 'recall' && <RecallTest workspace={workspace} />}
       {page === 'graph' && <GraphPage workspace={workspace} />}
       {page === 'models' && <ModelSettings workspace={workspace} />}

@@ -17,7 +17,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import uvicorn
 import yaml
@@ -608,6 +608,7 @@ class IndexRequest(BaseModel):
     separators: list[str] = Field(default_factory=_default_index_separators)
     chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
     chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
+    index_mode: Literal["complete", "fast"] = "complete"
 
 class RecallTestRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
@@ -2068,6 +2069,9 @@ _index_tasks: dict[str, dict[str, Any]] = _load_persisted_index_tasks()
 
 class WorkspaceCreateRequest(BaseModel):
     workspace: str
+    rule_template_id: str = "general_knowledge"
+    extraction_mode: Literal["assist", "enhanced", "strict"] = "enhanced"
+    allow_other_entity_type: bool = False
 
 
 def _workspace_info(workspace: str) -> dict[str, Any]:
@@ -2219,6 +2223,7 @@ def _index_request_config(req: IndexRequest | BatchIndexRequest | RebuildIndexRe
         "separators": list(req.separators),
         "chunk_size": int(req.chunk_size),
         "chunk_overlap": int(req.chunk_overlap),
+        "index_mode": getattr(req, "index_mode", "complete"),
     }
 
 
@@ -2345,6 +2350,7 @@ async def _start_workspace_rebuild(
         separators=req.separators,
         chunk_size=req.chunk_size,
         chunk_overlap=req.chunk_overlap,
+        index_mode=req.index_mode,
     )
     task = await _create_index_task(
         "rebuild",
@@ -2423,6 +2429,8 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
     doc_names = [req.file_name] if isinstance(req, IndexRequest) else list(req.doc_names)
     workspace = sanitize_workspace(req.workspace)
     service = get_lightrag_service(workspace)
+    index_mode = getattr(req, "index_mode", "complete")
+    mode_label = "快速索引（跳过KG）" if index_mode == "fast" else "完整索引（向量+KG）"
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
@@ -2433,7 +2441,7 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                 task_id,
                 status="running",
                 phase="indexing",
-                message="开始索引",
+                message=f"开始{mode_label}",
             )
             for idx, doc_name in enumerate(doc_names):
                 current_task = _index_tasks.get(task_id, {})
@@ -2516,7 +2524,7 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                         task_id,
                         current=idx,
                         stage_timings=stage_timings,
-                        message=f"正在写入 LightRAG: {doc_name}，单文档超时 {INDEX_DOC_TIMEOUT_SECONDS}s",
+                        message=f"正在{mode_label}: {doc_name}，单文档超时 {INDEX_DOC_TIMEOUT_SECONDS}s",
                     )
                     item = await asyncio.wait_for(
                         service.index_document(
@@ -2524,6 +2532,7 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                             chunk_size=req.chunk_size,
                             chunk_overlap=req.chunk_overlap,
                             separators=req.separators,
+                            index_mode=index_mode,
                             stage_update_callback=update_rag_stage_timings,
                         ),
                         timeout=INDEX_DOC_TIMEOUT_SECONDS,
@@ -2540,6 +2549,10 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                         "doc_id": item["doc_id"],
                         "status": "ok",
                         "chunks": item.get("chunk_count", 0),
+                        "kg_status": item.get("kg_status", ""),
+                        "kg_timed_out_chunks": list(
+                            (item.get("kg_filter") or {}).get("timed_out") or []
+                        ),
                         "stage_timings": stage_timings,
                     }
                     results.append(result)
@@ -2615,6 +2628,11 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
         else:
             status = "succeeded"
             message = f"索引完成: {len(results)} 个文档"
+            kg_partial_count = sum(
+                1 for result in results if result.get("kg_status") == "partial"
+            )
+            if kg_partial_count:
+                message += f"，其中 {kg_partial_count} 个文档跳过了超时 KG 块"
         await _update_index_task(
             task_id,
             status=status,
@@ -2658,8 +2676,21 @@ async def create_workspace(req: WorkspaceCreateRequest):
     """Create an empty LightRAG knowledge-base workspace."""
     workspace = sanitize_workspace(req.workspace)
     service = get_lightrag_service(workspace)
+    template_id = req.rule_template_id.strip() or "general_knowledge"
+    if not any(item.get("id") == template_id for item in service.list_graph_rule_templates()):
+        raise HTTPException(400, f"Graph extraction rule template not found: {template_id}")
     result = service.ensure_workspace()
-    return {**_workspace_info(workspace), **result}
+    graph_rule = service.apply_graph_rule_template(
+        template_id,
+        extraction_mode=req.extraction_mode,
+        allow_other_entity_type=req.allow_other_entity_type,
+    )
+    return {
+        **_workspace_info(workspace),
+        **result,
+        "graph_rule": service.graph_governance_summary(),
+        "graph_governance": graph_rule,
+    }
 
 
 @app.delete("/api/kb/workspaces/{workspace}")
@@ -2904,12 +2935,14 @@ class BatchIndexRequest(BaseModel):
     separators: list[str] = Field(default_factory=_default_index_separators)
     chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
     chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
+    index_mode: Literal["complete", "fast"] = "complete"
 
 class RebuildIndexRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
     separators: list[str] = Field(default_factory=_default_index_separators)
     chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
     chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
+    index_mode: Literal["complete", "fast"] = "complete"
 
 class ClearKnowledgeBaseRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
