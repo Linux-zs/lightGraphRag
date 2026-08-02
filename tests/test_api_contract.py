@@ -80,6 +80,34 @@ def test_recall_returns_conflict_for_incompatible_embedding(monkeypatch):
     assert "重建索引" in response.json()["detail"]
 
 
+def test_public_index_task_includes_default_stage_timings():
+    public = server._public_index_task(
+        {
+            "task_id": "abc123abc123",
+            "status": "running",
+            "cancel_requested": False,
+        }
+    )
+
+    assert "cancel_requested" not in public
+    assert public["current_stage"] == ""
+    assert public["current_stage_started_at"] == ""
+    assert public["stage_timings"] == {
+        "parse": 0.0,
+        "chunk_vector": 0.0,
+        "kg": 0.0,
+        "merge": 0.0,
+    }
+
+
+def test_index_stage_progression_is_monotonic():
+    assert server._should_advance_index_stage("", "chunk_vector") is True
+    assert server._should_advance_index_stage("chunk_vector", "kg") is True
+    assert server._should_advance_index_stage("kg", "merge") is True
+    assert server._should_advance_index_stage("kg", "chunk_vector") is False
+    assert server._should_advance_index_stage("chunk_vector", "chunk_vector") is False
+
+
 def test_system_logs_returns_filtered_tail(tmp_path, monkeypatch):
     log_path = tmp_path / "app.log"
     log_path.write_text(

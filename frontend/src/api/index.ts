@@ -311,6 +311,8 @@ export interface IndexTask {
   message: string
   current_doc?: string
   current_doc_started_at?: string
+  current_stage?: 'parse' | 'chunk_vector' | 'kg' | 'merge' | ''
+  current_stage_started_at?: string
   timeout_seconds?: number
   stage_timings?: {
     parse: number

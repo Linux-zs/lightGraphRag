@@ -39,8 +39,8 @@ export default function KBManagement({ workspace }: Props) {
 
   // Chunking params
   const [separators, setSeparators] = useState('\\n\\n, \\n, 。, ！, ？, ；,  ')
-  const [chunkSize, setChunkSize] = useState(512)
-  const [chunkOverlap, setChunkOverlap] = useState(50)
+  const [chunkSize, setChunkSize] = useState(1024)
+  const [chunkOverlap, setChunkOverlap] = useState(100)
 
   // Preview & index state
   const [chunks, setChunks] = useState<ChunkPreviewItem[]>([])
@@ -221,6 +221,15 @@ export default function KBManagement({ workspace }: Props) {
     const mins = Math.floor(seconds / 60)
     const rest = seconds % 60
     return `${mins}m ${rest}s`
+  }
+
+  const formatStageSeconds = (seconds: number) => `${seconds.toFixed(1)}s`
+
+  const activeStageSeconds = (startedAt: string | undefined, fallback: number) => {
+    if (!startedAt) return fallback
+    const start = new Date(startedAt).getTime()
+    if (!Number.isFinite(start)) return fallback
+    return Math.max(fallback, (Date.now() - start) / 1000)
   }
 
   const formatClock = (iso?: string) => {
@@ -508,12 +517,19 @@ export default function KBManagement({ workspace }: Props) {
     const fail = task.errors.length
     const currentElapsed = formatDuration(task.current_doc_started_at)
     const updatedClock = formatClock(task.updated_at)
-    const stageTimings = task.stage_timings
+    const stageTimings = task.stage_timings ?? { parse: 0, chunk_vector: 0, kg: 0, merge: 0 }
+    const currentStage = task.current_stage
+    const showDocumentProgress = task.total > 1
+    const statusDotClass = failed
+      ? 'bg-red-500'
+      : terminal
+        ? 'bg-green-500'
+        : 'bg-primary-500 animate-pulse'
     const STAGE_CARDS: { key: keyof NonNullable<IndexTask['stage_timings']>; label: string }[] = [
       { key: 'parse', label: '解析' },
       { key: 'chunk_vector', label: 'Chunk向量' },
       { key: 'kg', label: 'KG抽取' },
-      { key: 'merge', label: '图谱merge' },
+      { key: 'merge', label: '图谱/落盘' },
     ]
 
     return (
@@ -527,6 +543,7 @@ export default function KBManagement({ workspace }: Props) {
         <div className="flex items-center justify-between gap-3">
           <div>
             <div className="font-medium text-gray-800">
+              <span className={`mr-2 inline-block h-2.5 w-2.5 rounded-full ${statusDotClass}`} />
               任务 {task.task_id}
               <span className="ml-2 text-xs text-gray-500">{task.status}</span>
             </div>
@@ -552,32 +569,47 @@ export default function KBManagement({ workspace }: Props) {
             </button>
           )}
         </div>
-        <div className="mt-3 h-2 rounded-full bg-white overflow-hidden border border-gray-100">
-          <div
-            className={`h-full transition-all ${
-              failed ? 'bg-red-500' : terminal ? 'bg-green-500' : 'bg-primary-500'
-            }`}
-            style={{ width: `${Math.max(2, task.progress)}%` }}
-          />
-        </div>
-        {stageTimings && (
-          <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
-            {STAGE_CARDS.map(({ key, label }) => {
-              const v = stageTimings[key]
-              return (
-                <div
-                  key={key}
-                  className="rounded-md border border-gray-200 bg-white px-2.5 py-2"
-                >
-                  <div className="text-[11px] text-gray-400">{label}</div>
-                  <div className="text-sm font-semibold text-gray-800">
-                    {typeof v === 'number' ? `${v.toFixed(1)}s` : '—'}
-                  </div>
-                </div>
-              )
-            })}
+        {showDocumentProgress && (
+          <div className="mt-3">
+            <div className="mb-1 flex items-center justify-between text-[11px] text-gray-400">
+              <span>文档进度</span>
+              <span>{task.progress}%</span>
+            </div>
+            <div className="h-2 overflow-hidden rounded-full border border-gray-100 bg-white">
+              <div
+                className={`h-full transition-all ${
+                  failed ? 'bg-red-500' : terminal ? 'bg-green-500' : 'bg-primary-500'
+                }`}
+                style={{ width: `${Math.max(2, task.progress)}%` }}
+              />
+            </div>
           </div>
         )}
+        <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+          {STAGE_CARDS.map(({ key, label }) => {
+            const v = stageTimings[key]
+            const active = !terminal && currentStage === key
+            const displaySeconds = active
+              ? activeStageSeconds(task.current_stage_started_at, typeof v === 'number' ? v : 0)
+              : typeof v === 'number' ? v : 0
+            return (
+              <div
+                key={key}
+                className={`rounded-md border bg-white px-2.5 py-2 ${
+                  active ? 'border-primary-300 ring-1 ring-primary-100' : 'border-gray-200'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2 text-[11px] text-gray-400">
+                  <span>{label}</span>
+                  {active && <span className="text-primary-600">进行中</span>}
+                </div>
+                <div className="text-sm font-semibold text-gray-800">
+                  {formatStageSeconds(displaySeconds)}
+                </div>
+              </div>
+            )
+          })}
+        </div>
         {task.errors.length > 0 && (
           <div className="mt-2 space-y-1">
             {task.errors.slice(0, 3).map((err) => (

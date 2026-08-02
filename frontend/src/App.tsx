@@ -19,14 +19,39 @@ import {
 import { useConfirm } from './components/ConfirmDialog'
 
 type Page = 'chat' | 'kb' | 'recall' | 'graph' | 'models' | 'dashboard'
+const PAGES: Page[] = ['chat', 'kb', 'recall', 'graph', 'models', 'dashboard']
+const DEFAULT_PAGE: Page = 'chat'
+
+function isPage(value: string | null): value is Page {
+  return !!value && PAGES.includes(value as Page)
+}
+
+function pageFromHash(): Page | null {
+  const raw = window.location.hash.replace(/^#\/?/, '').split('/')[0]
+  return isPage(raw) ? raw : null
+}
+
+function initialPage(): Page {
+  return pageFromHash() || (isPage(localStorage.getItem('tdx_page')) ? localStorage.getItem('tdx_page') as Page : DEFAULT_PAGE)
+}
+
+function pageHash(page: Page) {
+  return `#/${page}`
+}
+
+function chatStorageKey(workspace: string) {
+  return `tdx_active_chat_${workspace}`
+}
 
 export default function App() {
   const confirm = useConfirm()
-  const [page, setPage] = useState<Page>('chat')
+  const [page, setPage] = useState<Page>(() => initialPage())
   const [workspace, setWorkspace] = useState(() => localStorage.getItem('tdx_workspace') || 'tdx_default')
   const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([])
   const [chatSessions, setChatSessions] = useState<ChatSessionListItem[]>([])
-  const [activeChatId, setActiveChatId] = useState<string | null>(null)
+  const [activeChatId, setActiveChatId] = useState<string | null>(
+    () => localStorage.getItem(chatStorageKey(localStorage.getItem('tdx_workspace') || 'tdx_default')),
+  )
 
   const loadWorkspaces = async (current = workspace) => {
     try {
@@ -45,24 +70,65 @@ export default function App() {
     try {
       const data = await listChatSessions(targetWorkspace)
       setChatSessions(data)
+      return data
     } catch {/* ignore */}
+    return []
+  }
+
+  const reloadCurrentChatSessions = async () => {
+    await loadChatSessions(workspace)
   }
 
   useEffect(() => {
     loadWorkspaces()
+    if (!pageFromHash()) {
+      window.history.replaceState(null, '', pageHash(page))
+    }
+    const handleHashChange = () => {
+      const next = pageFromHash()
+      if (!next) return
+      setPage(next)
+      localStorage.setItem('tdx_page', next)
+    }
+    window.addEventListener('hashchange', handleHashChange)
+    return () => window.removeEventListener('hashchange', handleHashChange)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
-    setActiveChatId(null)
+    const storedActive = localStorage.getItem(chatStorageKey(workspace))
+    setActiveChatId(storedActive)
     setChatSessions([])
-    void loadChatSessions(workspace)
+    void loadChatSessions(workspace).then((sessions) => {
+      if (storedActive && !sessions.some((session) => session.id === storedActive)) {
+        setActiveChatId(null)
+        localStorage.removeItem(chatStorageKey(workspace))
+      }
+    })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspace])
 
+  const handleNavigate = (next: Page) => {
+    setPage(next)
+    localStorage.setItem('tdx_page', next)
+    const nextHash = pageHash(next)
+    if (window.location.hash !== nextHash) {
+      window.location.hash = nextHash
+    }
+  }
+
+  const handleSetActiveChatId = (id: string | null) => {
+    setActiveChatId(id)
+    if (id) {
+      localStorage.setItem(chatStorageKey(workspace), id)
+    } else {
+      localStorage.removeItem(chatStorageKey(workspace))
+    }
+  }
+
   const handleWorkspaceChange = (next: string) => {
     if (next === workspace) return
-    setActiveChatId(null)
+    setActiveChatId(localStorage.getItem(chatStorageKey(next)))
     setWorkspace(next)
     localStorage.setItem('tdx_workspace', next)
   }
@@ -90,10 +156,10 @@ export default function App() {
         const next = nextWorkspaces[0]?.workspace || 'tdx_default'
         setWorkspace(next)
         localStorage.setItem('tdx_workspace', next)
-        setActiveChatId(null)
+        handleSetActiveChatId(null)
         setChatSessions([])
         void loadChatSessions(next)
-        setPage('chat')
+        handleNavigate('chat')
       }
     } catch (error) {
       throw new Error((error as Error).message || '删除知识库失败')
@@ -104,14 +170,14 @@ export default function App() {
     try {
       const created = await createChatSession(workspace)
       setChatSessions((prev) => [created, ...prev])
-      setActiveChatId(created.id)
-      setPage('chat')
+      handleSetActiveChatId(created.id)
+      handleNavigate('chat')
     } catch {/* ignore */}
   }
 
   const handleSelectChat = (id: string) => {
-    setActiveChatId(id)
-    setPage('chat')
+    handleSetActiveChatId(id)
+    handleNavigate('chat')
   }
 
   const handleDeleteChat = async (id: string) => {
@@ -119,7 +185,7 @@ export default function App() {
       await deleteChatSession(id, workspace)
       setChatSessions((prev) => prev.filter((item) => item.id !== id))
       if (activeChatId === id) {
-        setActiveChatId(null)
+        handleSetActiveChatId(null)
       }
     } catch {/* ignore */}
   }
@@ -127,7 +193,7 @@ export default function App() {
   return (
     <Layout
       currentPage={page}
-      onNavigate={setPage}
+      onNavigate={handleNavigate}
       workspace={workspace}
       workspaces={workspaces}
       onWorkspaceChange={handleWorkspaceChange}
@@ -146,8 +212,8 @@ export default function App() {
           onWorkspaceChange={handleWorkspaceChange}
           sessions={chatSessions}
           activeId={activeChatId}
-          setActiveId={setActiveChatId}
-          reloadSessions={loadChatSessions}
+          setActiveId={handleSetActiveChatId}
+          reloadSessions={reloadCurrentChatSessions}
         />
       )}
       {page === 'kb' && <KBManagement workspace={workspace} />}

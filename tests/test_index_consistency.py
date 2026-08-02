@@ -3,11 +3,13 @@ from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import numpy as np
 import pytest
 from fastapi import HTTPException
 from starlette.datastructures import UploadFile
 
 from src.api import server
+from src import lightrag_service
 from src.lightrag_service import LightRAGDocStatus, LightRAGService
 
 
@@ -37,6 +39,50 @@ def _manifest_item(indexed=False):
             }
         }
     }
+
+
+def test_prepare_embedding_text_removes_non_bmp_chars(tmp_path):
+    service = _service(tmp_path)
+
+    safe = service._prepare_embedding_text("# Title 📖\x00 body | TCP/IP (config)", 700)
+
+    assert "📖" not in safe
+    assert "\x00" not in safe
+    assert "|" not in safe
+    assert "/" not in safe
+    assert "(" not in safe
+    assert safe == "# Title body TCP IP config"
+    assert service._prepare_embedding_text("📖\x00", 700) == "empty document chunk"
+
+
+def test_embedding_fallback_splits_batch_and_shortens_bad_text(tmp_path, monkeypatch):
+    service = _service(tmp_path)
+    calls: list[list[str]] = []
+
+    async def fake_embed(texts, **_kwargs):
+        calls.append(list(texts))
+        if len(texts) > 1:
+            raise RuntimeError("Error code: 400 - {'code': 20015, 'message': 'The parameter is invalid.'}")
+        if len(texts[0]) > 120:
+            raise RuntimeError("Error code: 400 - {'code': 20015, 'message': 'The parameter is invalid.'}")
+        return np.ones((len(texts), 1024), dtype=np.float32)
+
+    monkeypatch.setattr(lightrag_service.openai_embed, "func", fake_embed)
+
+    result = asyncio.run(
+        service._embed_texts_with_fallback(
+            ["normal chunk", "x" * 480],
+            embed_model="embed",
+            base_url="https://example.test/v1",
+            api_key="key",
+            max_tokens=480,
+        )
+    )
+
+    assert result.shape == (2, 1024)
+    assert ["normal chunk", "x" * 480] in calls
+    assert ["normal chunk"] in calls
+    assert any(len(batch) == 1 and len(batch[0]) <= 120 for batch in calls)
 
 
 def test_delete_uses_actual_lightrag_status_even_if_manifest_is_not_indexed(tmp_path):

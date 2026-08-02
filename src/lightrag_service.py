@@ -11,10 +11,11 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
 import networkx as nx
+import numpy as np
 import re
 from lightrag import LightRAG, QueryParam
 from lightrag.base import DocStatus
@@ -31,6 +32,10 @@ from src.model_profiles import get_runtime_model_config
 DEFAULT_WORKSPACE = "tdx_default"
 DEFAULT_MODE = "mix"
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+NON_BMP_CHARS_RE = re.compile(r"[\U00010000-\U0010ffff]")
+EMBEDDING_STRUCTURAL_CHARS_RE = re.compile(r"[|()\[\]{}<>`/\\]+")
+EMBEDDING_WHITESPACE_RE = re.compile(r"\s+")
+EMBEDDING_STRICT_SAFE_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff，。？！；：、,.!?;: _-]+")
 WORKSPACE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -339,6 +344,74 @@ class LightRAGService:
                 f"当前: {current.get('model')} / {current.get('embed_dim')}"
             )
 
+    async def cleanup_interrupted_index_docs(self) -> list[dict[str, str]]:
+        """Remove stale non-terminal LightRAG docs left by an interrupted index.
+
+        LightRAG resumes pending/processing documents on the next ``ainsert``.
+        If our API timed out or the backend was killed, an unrelated old
+        document can therefore block every later small document. We keep the
+        uploaded files and manifest entries, but remove stale LightRAG queue
+        records so the user can explicitly re-index those documents.
+        """
+        rag = await self.get_rag()
+        stale_statuses = (
+            DocStatus.PENDING,
+            DocStatus.PARSING,
+            DocStatus.ANALYZING,
+            DocStatus.PROCESSING,
+            DocStatus.PREPROCESSED,
+        )
+        manifest = self._load_manifest()
+        cleaned: list[dict[str, str]] = []
+        for status in stale_statuses:
+            try:
+                items = await rag.get_docs_by_status(status)
+            except Exception as exc:
+                logger.warning("Failed to inspect LightRAG {} docs: {}", status.value, exc)
+                continue
+            for doc_id in list((items or {}).keys()):
+                try:
+                    deletion = await rag.adelete_by_doc_id(doc_id)
+                    deletion_status = str(getattr(deletion, "status", "") or "").lower()
+                    if deletion_status not in {"success", "not_found"}:
+                        logger.warning(
+                            "Failed to remove stale LightRAG doc {}: {}",
+                            doc_id,
+                            getattr(deletion, "message", deletion),
+                        )
+                        continue
+                except Exception as exc:
+                    logger.warning("Failed to remove stale LightRAG doc {}: {}", doc_id, exc)
+                    continue
+                item = manifest.get("documents", {}).get(doc_id)
+                doc_name = item.get("doc_name", doc_id) if isinstance(item, dict) else doc_id
+                if isinstance(item, dict):
+                    item.update(
+                        {
+                            "indexed": False,
+                            "status": "failed",
+                            "error_msg": "上一次索引中断，已从 LightRAG 待处理队列清理，请重新索引。",
+                            "updated_at": _now_iso(),
+                        }
+                    )
+                    manifest["documents"][doc_id] = item
+                cleaned.append({"doc_id": doc_id, "doc_name": doc_name, "status": status.value})
+        if cleaned:
+            self._save_manifest(manifest)
+            logger.warning("Cleaned {} stale LightRAG index docs: {}", len(cleaned), cleaned)
+        return cleaned
+
+    async def discard_lightrag_doc(self, doc_id: str) -> None:
+        """Best-effort removal of one LightRAG doc without deleting source files."""
+        if not doc_id:
+            return
+        rag = await self.get_rag()
+        deletion = await rag.adelete_by_doc_id(doc_id)
+        deletion_status = str(getattr(deletion, "status", "") or "").lower()
+        if deletion_status not in {"success", "not_found"}:
+            message = getattr(deletion, "message", "") or str(deletion)
+            raise RuntimeError(f"LightRAG document cleanup failed: {message}")
+
     async def get_rag(self) -> LightRAG:
         if self._rag is not None:
             return self._rag
@@ -403,14 +476,97 @@ class LightRAGService:
                 self._prepare_embedding_text(text, embed_max_chars, embed_max_tokens)
                 for text in texts
             ]
-            return await openai_embed.func(
+            return await self._embed_texts_with_fallback(
                 safe_texts,
+                embed_model=embed_model,
+                base_url=base_url,
+                api_key=api_key,
+                max_tokens=embed_max_tokens,
+            )
+
+        return siliconflow_embed
+
+    @staticmethod
+    def _is_invalid_embedding_payload_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return "20015" in msg or "parameter is invalid" in msg
+
+    def _embedding_retry_variants(self, text: str, max_tokens: int | None) -> list[str]:
+        strict = EMBEDDING_STRICT_SAFE_RE.sub(" ", text)
+        strict = EMBEDDING_WHITESPACE_RE.sub(" ", strict).strip()
+        variants = [
+            self._prepare_embedding_text(text[:360], 360, min(max_tokens or 360, 360)),
+            self._prepare_embedding_text(text[:240], 240, min(max_tokens or 240, 240)),
+            self._prepare_embedding_text(strict[:240], 240, min(max_tokens or 240, 240)),
+            self._prepare_embedding_text(strict[:120], 120, min(max_tokens or 120, 120)),
+            "empty document chunk",
+        ]
+        unique: list[str] = []
+        for item in variants:
+            cleaned = item.strip() or "empty document chunk"
+            if cleaned not in unique:
+                unique.append(cleaned)
+        return unique
+
+    async def _embed_texts_with_fallback(
+        self,
+        texts: list[str],
+        *,
+        embed_model: str,
+        base_url: str,
+        api_key: str,
+        max_tokens: int | None,
+    ) -> np.ndarray:
+        async def embed_batch(batch: list[str]) -> np.ndarray:
+            return await openai_embed.func(
+                batch,
                 model=embed_model,
                 base_url=base_url,
                 api_key=api_key,
             )
 
-        return siliconflow_embed
+        try:
+            return await embed_batch(texts)
+        except Exception as exc:
+            if not self._is_invalid_embedding_payload_error(exc):
+                raise
+            if len(texts) > 1:
+                mid = max(1, len(texts) // 2)
+                left = await self._embed_texts_with_fallback(
+                    texts[:mid],
+                    embed_model=embed_model,
+                    base_url=base_url,
+                    api_key=api_key,
+                    max_tokens=max_tokens,
+                )
+                right = await self._embed_texts_with_fallback(
+                    texts[mid:],
+                    embed_model=embed_model,
+                    base_url=base_url,
+                    api_key=api_key,
+                    max_tokens=max_tokens,
+                )
+                return np.vstack([left, right])
+
+            original = texts[0] if texts else ""
+            last_exc: Exception = exc
+            for variant in self._embedding_retry_variants(original, max_tokens):
+                if variant == original:
+                    continue
+                try:
+                    result = await embed_batch([variant])
+                    if variant != original:
+                        logger.warning(
+                            "Embedding payload was rejected; indexed one chunk with a shortened fallback ({} -> {} chars)",
+                            len(original),
+                            len(variant),
+                        )
+                    return result
+                except Exception as variant_exc:
+                    last_exc = variant_exc
+                    if not self._is_invalid_embedding_payload_error(variant_exc):
+                        raise
+            raise last_exc
 
     def _prepare_embedding_text(
         self,
@@ -430,9 +586,14 @@ class LightRAGService:
         tokenizer can be loaded.
         """
         safe = CONTROL_CHARS_RE.sub(" ", text or "")
-        safe = safe.strip()
+        safe = NON_BMP_CHARS_RE.sub("", safe)
+        # SiliconFlow embedding can reject long markdown/table/code fragments
+        # with emoji, dense separators, parentheses, or slash-heavy tokens.
+        # Normalize only the embedding input; stored source chunks stay intact.
+        safe = EMBEDDING_STRUCTURAL_CHARS_RE.sub(" ", safe)
+        safe = EMBEDDING_WHITESPACE_RE.sub(" ", safe).strip()
         if not safe:
-            safe = " "
+            safe = "empty document chunk"
         if max_tokens and max_tokens > 0:
             try:
                 enc = _get_embed_tokenizer()
@@ -1054,9 +1215,11 @@ class LightRAGService:
         chunk_size: int | None = None,
         chunk_overlap: int | None = None,
         separators: list[str] | None = None,
+        stage_update_callback: Callable[[dict[str, float], str, str], Awaitable[None] | None] | None = None,
     ) -> dict[str, Any]:
         self.assert_embedding_compatible()
         rag = await self.get_rag()
+        await self.cleanup_interrupted_index_docs()
         if chunk_size is not None:
             rag.chunk_token_size = chunk_size
         if chunk_overlap is not None:
@@ -1087,11 +1250,15 @@ class LightRAGService:
                     )
                 logger.info("Removed existing LightRAG doc before re-index: {}", doc_id)
             collector = install_stage_timing(rag)
-            with collector.scope():
-                result = await rag.ainsert(
-                    doc.raw_text, ids=[doc_id], file_paths=[doc.file_path]
-                )
-            self._last_stage_timings = collector.to_stages()
+            collector.on_update = stage_update_callback
+            try:
+                with collector.scope():
+                    result = await rag.ainsert(
+                        doc.raw_text, ids=[doc_id], file_paths=[doc.file_path]
+                    )
+                self._last_stage_timings = collector.to_stages()
+            finally:
+                collector.on_update = None
             status = await self.get_doc_status(doc_id)
             if status and status.status == "failed":
                 item.update(
@@ -1145,6 +1312,14 @@ class LightRAGService:
             item.update({"indexed": False, "status": "failed", "updated_at": _now_iso()})
             manifest["documents"][doc_id] = item
             self._save_manifest(manifest)
+            try:
+                await self.discard_lightrag_doc(doc_id)
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "Failed to cleanup LightRAG doc after index error {}: {}",
+                    doc_id,
+                    cleanup_exc,
+                )
             raise
 
     async def get_doc_status(self, doc_id: str) -> LightRAGDocStatus | None:

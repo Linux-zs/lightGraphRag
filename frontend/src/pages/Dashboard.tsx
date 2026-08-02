@@ -81,6 +81,15 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
     }
   }
 
+  const formatStageSeconds = (seconds: number) => `${seconds.toFixed(1)}s`
+
+  const activeStageSeconds = (startedAt: string | undefined, fallback: number) => {
+    if (!startedAt) return fallback
+    const start = new Date(startedAt).getTime()
+    if (!Number.isFinite(start)) return fallback
+    return Math.max(fallback, (Date.now() - start) / 1000)
+  }
+
   const formatTaskKind = (kind: IndexTask['kind']) => {
     if (kind === 'single') return '单文档索引'
     if (kind === 'batch') return '批量索引'
@@ -200,8 +209,8 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
       const task = await rebuildIndex({
         workspace,
         separators: ['\n\n', '\n', '。', '！', '？', '；', '  '],
-        chunk_size: 512,
-        chunk_overlap: 50,
+        chunk_size: 1024,
+        chunk_overlap: 100,
       })
       setRebuildTask(task)
       setOpMsg(`重建任务已创建: ${task.task_id}`)
@@ -338,44 +347,57 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
               {rebuildTask.updated_at && <span>最后更新：{formatTaskTime(rebuildTask.updated_at)}</span>}
               {isTaskTerminal(rebuildTask) && rebuildTask.updated_at && <span>完成时间：{formatTaskTime(rebuildTask.updated_at)}</span>}
             </div>
-            <div className="mt-3 h-2 rounded-full bg-white overflow-hidden border border-gray-100">
-              <div
-                className={`h-full transition-all ${
-                  rebuildTask.status === 'failed' || rebuildTask.status === 'partial'
-                    ? 'bg-red-500'
-                    : isTaskTerminal(rebuildTask)
-                      ? 'bg-green-500'
-                      : 'bg-primary-500'
-                }`}
-                style={{ width: `${Math.max(2, rebuildTask.progress)}%` }}
-              />
-            </div>
-            {rebuildTask.stage_timings && (
-              <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
-                {(['parse', 'chunk_vector', 'kg', 'merge'] as const).map((key) => {
-                  const label =
-                    key === 'parse'
-                      ? '解析'
-                      : key === 'chunk_vector'
-                        ? 'Chunk向量'
-                        : key === 'kg'
-                          ? 'KG抽取'
-                          : '图谱merge'
-                  const v = rebuildTask.stage_timings?.[key]
-                  return (
-                    <div
-                      key={key}
-                      className="rounded-md border border-gray-200 bg-white px-2.5 py-2"
-                    >
-                      <div className="text-[11px] text-gray-400">{label}</div>
-                      <div className="text-sm font-semibold text-gray-800">
-                        {typeof v === 'number' ? `${v.toFixed(1)}s` : '—'}
-                      </div>
-                    </div>
-                  )
-                })}
+            <div className="mt-3">
+              <div className="mb-1 flex items-center justify-between text-[11px] text-gray-400">
+                <span>文档进度</span>
+                <span>{rebuildTask.progress}%</span>
               </div>
-            )}
+              <div className="h-2 overflow-hidden rounded-full border border-gray-100 bg-white">
+                <div
+                  className={`h-full transition-all ${
+                    rebuildTask.status === 'failed' || rebuildTask.status === 'partial'
+                      ? 'bg-red-500'
+                      : isTaskTerminal(rebuildTask)
+                        ? 'bg-green-500'
+                        : 'bg-primary-500'
+                  }`}
+                  style={{ width: `${Math.max(2, rebuildTask.progress)}%` }}
+                />
+              </div>
+            </div>
+            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+              {(['parse', 'chunk_vector', 'kg', 'merge'] as const).map((key) => {
+                const label =
+                  key === 'parse'
+                    ? '解析'
+                    : key === 'chunk_vector'
+                      ? 'Chunk向量'
+                      : key === 'kg'
+                        ? 'KG抽取'
+                        : '图谱/落盘'
+                const v = rebuildTask.stage_timings?.[key] ?? 0
+                const active = !isTaskTerminal(rebuildTask) && rebuildTask.current_stage === key
+                const displaySeconds = active
+                  ? activeStageSeconds(rebuildTask.current_stage_started_at, typeof v === 'number' ? v : 0)
+                  : typeof v === 'number' ? v : 0
+                return (
+                  <div
+                    key={key}
+                    className={`rounded-md border bg-white px-2.5 py-2 ${
+                      active ? 'border-primary-300 ring-1 ring-primary-100' : 'border-gray-200'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2 text-[11px] text-gray-400">
+                      <span>{label}</span>
+                      {active && <span className="text-primary-600">进行中</span>}
+                    </div>
+                    <div className="text-sm font-semibold text-gray-800">
+                      {formatStageSeconds(displaySeconds)}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
             {rebuildTask.errors.length > 0 && (
               <div className="mt-2 space-y-1">
                 {rebuildTask.errors.slice(0, 3).map((err) => (

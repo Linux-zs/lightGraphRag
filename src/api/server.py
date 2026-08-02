@@ -571,14 +571,31 @@ def _save_workspace_settings(workspace: str, settings: dict[str, Any]) -> dict[s
     _atomic_write_text(path, json.dumps(current, ensure_ascii=False, indent=2))
     return current
 
+
+def _default_index_separators() -> list[str]:
+    return list(
+        get_config()
+        .get("chunking", {})
+        .get("separators", ["\n\n", "\n", "。", "！", "？", "；", "  "])
+    )
+
+
+def _default_chunk_size() -> int:
+    return int(get_config().get("chunking", {}).get("chunk_size", 512))
+
+
+def _default_chunk_overlap() -> int:
+    return int(get_config().get("chunking", {}).get("chunk_overlap", 50))
+
+
 # --- Pydantic Models ---
 
 class ChunkPreviewRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
     file_name: str
-    separators: list[str] = Field(default=["\n\n", "\n", "。", "！", "？", "；", " ", ""])
-    chunk_size: int = Field(default=512, ge=100, le=2000)
-    chunk_overlap: int = Field(default=50, ge=0, le=500)
+    separators: list[str] = Field(default_factory=_default_index_separators)
+    chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
+    chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
 
 class ChunkPreviewItem(BaseModel):
     index: int
@@ -588,9 +605,9 @@ class ChunkPreviewItem(BaseModel):
 class IndexRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
     file_name: str
-    separators: list[str] = Field(default=["\n\n", "\n", "。", "！", "？", "；", " ", ""])
-    chunk_size: int = Field(default=512, ge=100, le=2000)
-    chunk_overlap: int = Field(default=50, ge=0, le=500)
+    separators: list[str] = Field(default_factory=_default_index_separators)
+    chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
+    chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
 
 class RecallTestRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
@@ -2099,6 +2116,44 @@ def _task_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_INDEX_STAGE_KEYS = ("parse", "chunk_vector", "kg", "merge")
+_INDEX_STAGE_LABELS = {
+    "parse": "解析",
+    "chunk_vector": "Chunk向量",
+    "kg": "KG抽取",
+    "merge": "图谱/落盘",
+}
+_INDEX_STAGE_ORDER = {
+    "parse": 0,
+    "chunk_vector": 1,
+    "kg": 2,
+    "merge": 3,
+}
+
+
+def _empty_stage_timings() -> dict[str, float]:
+    return {key: 0.0 for key in _INDEX_STAGE_KEYS}
+
+
+def _index_stage_label(stage: str) -> str:
+    return _INDEX_STAGE_LABELS.get(stage, stage)
+
+
+def _should_advance_index_stage(current_stage: str, next_stage: str) -> bool:
+    return _INDEX_STAGE_ORDER.get(next_stage, -1) > _INDEX_STAGE_ORDER.get(current_stage, -1)
+
+
+def _normalize_stage_timings(value: Any) -> dict[str, float]:
+    timings = _empty_stage_timings()
+    if isinstance(value, dict):
+        for key in _INDEX_STAGE_KEYS:
+            try:
+                timings[key] = round(float(value.get(key, 0.0) or 0.0), 3)
+            except (TypeError, ValueError):
+                timings[key] = 0.0
+    return timings
+
+
 async def _create_index_task(
     kind: str,
     doc_names: list[str],
@@ -2121,6 +2176,9 @@ async def _create_index_task(
         "current_doc": "",
         "current_doc_started_at": "",
         "timeout_seconds": INDEX_DOC_TIMEOUT_SECONDS,
+        "current_stage": "",
+        "current_stage_started_at": "",
+        "stage_timings": _empty_stage_timings(),
         "results": [],
         "errors": [],
         "cancel_requested": False,
@@ -2149,7 +2207,11 @@ async def _update_index_task(task_id: str, **updates: Any) -> dict[str, Any]:
 
 
 def _public_index_task(task: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in task.items() if k != "cancel_requested"}
+    public = {k: v for k, v in task.items() if k != "cancel_requested"}
+    public["stage_timings"] = _normalize_stage_timings(public.get("stage_timings"))
+    public.setdefault("current_stage", "")
+    public.setdefault("current_stage_started_at", "")
+    return public
 
 
 def _index_request_config(req: IndexRequest | BatchIndexRequest | RebuildIndexRequest) -> dict[str, Any]:
@@ -2382,12 +2444,14 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                         phase="done",
                         current_doc="",
                         current_doc_started_at="",
+                        current_stage="",
+                        current_stage_started_at="",
                         message="任务已取消",
                     )
                     return
 
                 doc: Document | None = None
-                stage_timings: dict[str, float] | None = None
+                stage_timings: dict[str, float] = _empty_stage_timings()
                 service._last_stage_timings = {}
                 try:
                     await _update_index_task(
@@ -2395,19 +2459,63 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                         current=idx,
                         current_doc=doc_name,
                         current_doc_started_at=_task_now(),
+                        current_stage="parse",
+                        current_stage_started_at=_task_now(),
+                        stage_timings=stage_timings,
                         message=f"正在解析: {doc_name}",
                     )
                     parse_start = time.perf_counter()
                     doc = _load_doc_for_index(doc_name, workspace)
                     parse_seconds = time.perf_counter() - parse_start
+                    stage_timings["parse"] = round(parse_seconds, 3)
                     service.mark_document_status(doc, status="processing", indexed=False)
+                    await _update_index_task(
+                        task_id,
+                        current=idx,
+                        current_doc=doc_name,
+                        current_stage="",
+                        current_stage_started_at="",
+                        stage_timings=stage_timings,
+                    )
 
                     if not doc.raw_text.strip():
                         raise ValueError("Document text is empty")
 
+                    active_stage = ""
+
+                    async def update_rag_stage_timings(
+                        rag_stage_timings: dict[str, float],
+                        raw_stage: str,
+                        event: str,
+                    ) -> None:
+                        nonlocal active_stage
+                        public_stage = "chunk_vector" if raw_stage == "vector" else raw_stage
+                        merged = _normalize_stage_timings(
+                            {
+                                **rag_stage_timings,
+                                "parse": stage_timings.get("parse", 0.0),
+                            }
+                        )
+                        stage_timings.update(merged)
+                        updates: dict[str, Any] = {
+                            "current": idx,
+                            "current_doc": doc_name,
+                            "stage_timings": dict(stage_timings),
+                        }
+                        if event == "start":
+                            if _should_advance_index_stage(active_stage, public_stage):
+                                active_stage = public_stage
+                                updates["current_stage"] = public_stage
+                                updates["current_stage_started_at"] = _task_now()
+                                updates["message"] = (
+                                    f"正在{_index_stage_label(public_stage)}: {doc_name}"
+                                )
+                        await _update_index_task(task_id, **updates)
+
                     await _update_index_task(
                         task_id,
                         current=idx,
+                        stage_timings=stage_timings,
                         message=f"正在写入 LightRAG: {doc_name}，单文档超时 {INDEX_DOC_TIMEOUT_SECONDS}s",
                     )
                     item = await asyncio.wait_for(
@@ -2416,6 +2524,7 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                             chunk_size=req.chunk_size,
                             chunk_overlap=req.chunk_overlap,
                             separators=req.separators,
+                            stage_update_callback=update_rag_stage_timings,
                         ),
                         timeout=INDEX_DOC_TIMEOUT_SECONDS,
                     )
@@ -2443,6 +2552,12 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                             service.mark_document_status(doc, status="failed", indexed=False, error_msg=error_msg)
                         except Exception:
                             logger.exception("Failed to mark timeout index status for {}", doc_name)
+                        try:
+                            await service.discard_lightrag_doc(
+                                str(doc.metadata.get("lightrag_doc_id") or "")
+                            )
+                        except Exception:
+                            logger.exception("Failed to cleanup timed-out LightRAG doc for {}", doc_name)
                     error = {"doc_name": doc_name, "status": "error", "error": error_msg}
                     errors.append(error)
                     results.append(error)
@@ -2465,6 +2580,8 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                     current=idx + 1,
                     current_doc="",
                     current_doc_started_at="",
+                    current_stage="",
+                    current_stage_started_at="",
                     results=results,
                     errors=errors,
                     stage_timings=stage_timings,
@@ -2504,6 +2621,8 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
             current=len(doc_names),
             current_doc="",
             current_doc_started_at="",
+            current_stage="",
+            current_stage_started_at="",
             results=results,
             errors=errors,
             message=message,
@@ -2517,6 +2636,8 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
             status="failed",
             current_doc="",
             current_doc_started_at="",
+            current_stage="",
+            current_stage_started_at="",
             results=results,
             errors=errors or [{"doc_name": "", "status": "error", "error": str(exc)}],
             message=f"索引任务异常退出: {exc}",
@@ -2780,15 +2901,15 @@ class BatchDeleteRequest(BaseModel):
 class BatchIndexRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
     doc_names: list[str]
-    separators: list[str] = Field(default_factory=lambda: ["\n\n", "\n", "。", "！", "？", "；", "  "])
-    chunk_size: int = Field(default=512, ge=100, le=2000)
-    chunk_overlap: int = Field(default=50, ge=0, le=500)
+    separators: list[str] = Field(default_factory=_default_index_separators)
+    chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
+    chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
 
 class RebuildIndexRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
-    separators: list[str] = Field(default_factory=lambda: ["\n\n", "\n", "。", "！", "？", "；", "  "])
-    chunk_size: int = Field(default=512, ge=100, le=2000)
-    chunk_overlap: int = Field(default=50, ge=0, le=500)
+    separators: list[str] = Field(default_factory=_default_index_separators)
+    chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
+    chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
 
 class ClearKnowledgeBaseRequest(BaseModel):
     workspace: str = DEFAULT_WORKSPACE
@@ -2969,9 +3090,9 @@ async def _resume_persisted_index_tasks() -> None:
         task_id = str(task["task_id"])
         workspace = sanitize_workspace(task.get("workspace", DEFAULT_WORKSPACE))
         request_config = task.get("request") or {}
-        separators = list(request_config.get("separators") or ["\n\n", "\n", "。", "！", "？", "；", "  "])
-        chunk_size = int(request_config.get("chunk_size") or 512)
-        chunk_overlap = int(request_config.get("chunk_overlap") or 50)
+        separators = list(request_config.get("separators") or _default_index_separators())
+        chunk_size = int(request_config.get("chunk_size") or _default_chunk_size())
+        chunk_overlap = int(request_config.get("chunk_overlap") or _default_chunk_overlap())
         try:
             doc_names = [
                 _safe_leaf_name(name)
@@ -3012,7 +3133,7 @@ async def _resume_persisted_index_tasks() -> None:
                 )
             asyncio.create_task(_run_index_task(task_id, req))
         except Exception as exc:
-            logger.exception("Failed to resume persisted index task {}", task_id)
+            logger.warning("Failed to resume persisted index task {}: {}", task_id, exc)
             await _update_index_task(
                 task_id,
                 status="failed",
