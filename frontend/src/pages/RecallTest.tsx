@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowDown, ArrowRight, ArrowUp, FileSearch, LoaderCircle, Route, Search } from 'lucide-react'
 import {
   recallTest,
@@ -52,6 +52,20 @@ export default function RecallTest({ workspace }: Props) {
     sequence: number
   } | null>(null)
   const [runSequence, setRunSequence] = useState(0)
+  const requestRef = useRef(0)
+  const requestAbortRef = useRef<AbortController | null>(null)
+
+  useEffect(() => {
+    requestAbortRef.current?.abort()
+    requestRef.current += 1
+    setContextResult(null)
+    setTextResult(null)
+    setError('')
+    setLoading(false)
+    setActiveQuery('')
+    setLastRun(null)
+    return () => requestAbortRef.current?.abort()
+  }, [workspace])
 
   const handleRun = async () => {
     if (!query.trim()) return
@@ -59,6 +73,10 @@ export default function RecallTest({ workspace }: Props) {
     const submittedTab = tab
     const startedAt = performance.now()
     const sequence = runSequence + 1
+    const requestId = ++requestRef.current
+    requestAbortRef.current?.abort()
+    const controller = new AbortController()
+    requestAbortRef.current = controller
     setRunSequence(sequence)
     setActiveQuery(submittedQuery)
     setLoading(true)
@@ -70,21 +88,25 @@ export default function RecallTest({ workspace }: Props) {
     }
     try {
       if (submittedTab === 'context') {
-        setContextResult(await recallTest({
+        const result = await recallTest({
           workspace,
           query: submittedQuery,
           mode,
           top_k: topK,
           chunk_top_k: chunkTopK,
           enable_rerank: enableRerank,
-        }))
+        }, controller.signal)
+        if (requestId !== requestRef.current) return
+        setContextResult(result)
       } else {
-        setTextResult(await textRecallTest({
+        const result = await textRecallTest({
           workspace,
           query: submittedQuery,
           top_k: chunkTopK,
           enable_rerank: enableRerank,
-        }))
+        }, controller.signal)
+        if (requestId !== requestRef.current) return
+        setTextResult(result)
       }
       setLastRun({
         query: submittedQuery,
@@ -94,8 +116,11 @@ export default function RecallTest({ workspace }: Props) {
         sequence,
       })
     } catch (caught: unknown) {
+      if (requestId !== requestRef.current) return
+      if (controller.signal.aborted) return
       setError((caught as Error).message || '召回测试失败')
     } finally {
+      if (requestId !== requestRef.current) return
       setLoading(false)
       setActiveQuery('')
     }

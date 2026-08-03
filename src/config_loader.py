@@ -18,6 +18,16 @@ _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "defa
 _LOCAL_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "local.yaml"
 
 
+def get_effective_write_config_path() -> Path:
+    """Return the YAML file that UI changes must update."""
+    custom = os.environ.get("LIGHTGRAPHRAG_CONFIG_PATH")
+    if custom:
+        return Path(custom).expanduser().resolve()
+    return Path(
+        os.environ.get("LIGHTGRAPHRAG_CONFIG_LOCAL_PATH", _LOCAL_CONFIG_PATH)
+    ).expanduser().resolve()
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     """Deep merge override dict into base dict."""
     result = base.copy()

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { CheckCircle2, FileUp, Loader2 } from 'lucide-react'
 import { useConfirm } from '../components/ConfirmDialog'
 import EntityPicker from '../components/EntityPicker'
@@ -108,6 +108,8 @@ function changeTitle(change: GraphChange) {
 }
 
 export default function GraphPage({ workspace }: Props) {
+  const loadRequestRef = useRef(0)
+  const loadAbortRef = useRef<AbortController | null>(null)
   const confirm = useConfirm()
   const [tab, setTab] = useState<Tab>('overview')
   const [data, setData] = useState<GraphData | null>(null)
@@ -164,13 +166,19 @@ export default function GraphPage({ workspace }: Props) {
   const [selectedSuggestions, setSelectedSuggestions] = useState<Set<number>>(new Set())
   const [suggesting, setSuggesting] = useState(false)
 
-  const loadGraph = async (nextLimit = limit) => {
-    const graph = await getGraph(nextLimit, workspace)
+  const loadGraph = async (
+    nextLimit = limit,
+    requestId = loadRequestRef.current,
+    signal?: AbortSignal,
+  ) => {
+    const graph = await getGraph(nextLimit, workspace, signal)
+    if (requestId !== loadRequestRef.current) return
     setData(graph)
   }
 
-  const loadConfig = async () => {
-    const cfg = await getGraphGovernanceConfig(workspace)
+  const loadConfig = async (requestId = loadRequestRef.current, signal?: AbortSignal) => {
+    const cfg = await getGraphGovernanceConfig(workspace, signal)
+    if (requestId !== loadRequestRef.current) return
     setConfig(cfg)
     setSelectedTemplateId(cfg.rule_template_id || '')
     setEntityTypesText(joinLines(cfg.entity_types || []))
@@ -181,33 +189,50 @@ export default function GraphPage({ workspace }: Props) {
     setAllowOtherEntityType(cfg.allow_other_entity_type !== false)
   }
 
-  const loadTemplates = async () => {
-    const templates = await listGraphRuleTemplates(workspace)
+  const loadTemplates = async (requestId = loadRequestRef.current, signal?: AbortSignal) => {
+    const templates = await listGraphRuleTemplates(workspace, signal)
+    if (requestId !== loadRequestRef.current) return
     setRuleTemplates(templates)
   }
 
-  const loadImportHistory = async () => {
-    setGraphImportHistory(await listGraphImports(workspace))
+  const loadImportHistory = async (requestId = loadRequestRef.current, signal?: AbortSignal) => {
+    const history = await listGraphImports(workspace, signal)
+    if (requestId !== loadRequestRef.current) return
+    setGraphImportHistory(history)
   }
 
   const loadAll = async (nextLimit = limit) => {
+    loadAbortRef.current?.abort()
+    const controller = new AbortController()
+    loadAbortRef.current = controller
+    const requestId = ++loadRequestRef.current
     setLoading(true)
     setError('')
     try {
-      await Promise.all([loadGraph(nextLimit), loadConfig(), loadTemplates(), loadImportHistory()])
+      await Promise.all([
+        loadGraph(nextLimit, requestId, controller.signal),
+        loadConfig(requestId, controller.signal),
+        loadTemplates(requestId, controller.signal),
+        loadImportHistory(requestId, controller.signal),
+      ])
+      if (requestId !== loadRequestRef.current) return
     } catch (e) {
+      if (requestId !== loadRequestRef.current) return
+      if (controller.signal.aborted) return
       setError((e as Error).message || '加载失败')
     } finally {
-      setLoading(false)
+      if (requestId === loadRequestRef.current) setLoading(false)
     }
   }
 
   useEffect(() => {
+    loadRequestRef.current += 1
     setGraphImportFile(null)
     setGraphImportPreview(null)
     setSelectedImportEntities(new Set())
     setSelectedImportRelationships(new Set())
     loadAll(limit)
+    return () => loadAbortRef.current?.abort()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspace])
 

@@ -27,7 +27,7 @@ def test_normal_business_numbers_are_not_flagged_as_noise():
     assert server._generated_answer_quality_issues(answer) == []
 
 
-def test_bare_numeric_line_is_rejected_and_salvaged():
+def test_bare_numeric_line_is_preserved():
     answer = (
         "### 原因\n"
         "C医院存在断供风险，原因是A药厂的核心原料供应商停产。[1]\n\n"
@@ -37,10 +37,10 @@ def test_bare_numeric_line_is_rejected_and_salvaged():
         "1. 联系供应商确认复产时间。[1]"
     )
 
-    assert "bare_numeric_line" in server._generated_answer_quality_issues(answer)
+    assert server._generated_answer_quality_issues(answer) == []
     cleaned, remaining = server._salvage_generated_answer(answer)
     assert remaining == []
-    assert "\n1\n" not in f"\n{cleaned}\n"
+    assert "\n1\n" in f"\n{cleaned}\n"
     assert "联系供应商确认复产时间" in cleaned
 
 

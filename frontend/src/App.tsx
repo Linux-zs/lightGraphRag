@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { FormEvent, useEffect, useRef, useState } from 'react'
 import Layout from './components/Layout'
 import QAChat from './pages/QAChat'
 import KBManagement from './pages/KBManagement'
@@ -14,6 +14,9 @@ import {
   deleteWorkspace,
   listChatSessions,
   listWorkspaces,
+  clearAppToken,
+  getAppToken,
+  setAppToken,
   WorkspaceInfo,
 } from './api'
 import { useConfirm } from './components/ConfirmDialog'
@@ -60,10 +63,17 @@ export default function App() {
       chatStorageKey(localStorage.getItem(WORKSPACE_STORAGE_KEY) || DEFAULT_WORKSPACE),
     ),
   )
+  const [authOpen, setAuthOpen] = useState(false)
+  const [authToken, setAuthToken] = useState(() => getAppToken())
+  const [rememberToken, setRememberToken] = useState(true)
+  const workspaceRequestRef = useRef(0)
+  const sessionRequestRef = useRef(0)
 
-  const loadWorkspaces = async (current = workspace) => {
+  const loadWorkspaces = async (current = workspace, signal?: AbortSignal) => {
+    const requestId = ++workspaceRequestRef.current
     try {
-      const data = await listWorkspaces()
+      const data = await listWorkspaces(signal)
+      if (requestId !== workspaceRequestRef.current) return []
       setWorkspaces(data)
       if (!data.some((item) => item.workspace === current) && data[0]) {
         setWorkspace(data[0].workspace)
@@ -74,9 +84,11 @@ export default function App() {
     return []
   }
 
-  const loadChatSessions = async (targetWorkspace = workspace) => {
+  const loadChatSessions = async (targetWorkspace = workspace, signal?: AbortSignal) => {
+    const requestId = ++sessionRequestRef.current
     try {
-      const data = await listChatSessions(targetWorkspace)
+      const data = await listChatSessions(targetWorkspace, signal)
+      if (requestId !== sessionRequestRef.current) return []
       setChatSessions(data)
       return data
     } catch {/* ignore */}
@@ -88,7 +100,8 @@ export default function App() {
   }
 
   useEffect(() => {
-    loadWorkspaces()
+    const controller = new AbortController()
+    void loadWorkspaces(workspace, controller.signal)
     if (!pageFromHash()) {
       window.history.replaceState(null, '', pageHash(page))
     }
@@ -99,20 +112,28 @@ export default function App() {
       localStorage.setItem(PAGE_STORAGE_KEY, next)
     }
     window.addEventListener('hashchange', handleHashChange)
-    return () => window.removeEventListener('hashchange', handleHashChange)
+    const showAuth = () => setAuthOpen(true)
+    window.addEventListener('lightgraphrag-auth-required', showAuth)
+    return () => {
+      controller.abort()
+      window.removeEventListener('hashchange', handleHashChange)
+      window.removeEventListener('lightgraphrag-auth-required', showAuth)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
+    const controller = new AbortController()
     const storedActive = localStorage.getItem(chatStorageKey(workspace))
     setActiveChatId(storedActive)
     setChatSessions([])
-    void loadChatSessions(workspace).then((sessions) => {
+    void loadChatSessions(workspace, controller.signal).then((sessions) => {
       if (storedActive && !sessions.some((session) => session.id === storedActive)) {
         setActiveChatId(null)
         localStorage.removeItem(chatStorageKey(workspace))
       }
     })
+    return () => controller.abort()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspace])
 
@@ -198,7 +219,16 @@ export default function App() {
     } catch {/* ignore */}
   }
 
+  const submitToken = (event: FormEvent) => {
+    event.preventDefault()
+    setAppToken(authToken, rememberToken)
+    setAuthOpen(false)
+    void loadWorkspaces(workspace)
+    void loadChatSessions(workspace)
+  }
+
   return (
+    <>
     <Layout
       currentPage={page}
       onNavigate={handleNavigate}
@@ -237,5 +267,55 @@ export default function App() {
       {page === 'models' && <ModelSettings workspace={workspace} />}
       {page === 'dashboard' && <Dashboard workspace={workspace} onWorkspaceChanged={loadWorkspaces} />}
     </Layout>
+    {authOpen && (
+      <div className="fixed inset-0 z-[200] grid place-items-center bg-gray-950/35 p-4">
+        <form
+          onSubmit={submitToken}
+          className="w-full max-w-sm rounded-lg border border-gray-200 bg-white p-5 shadow-2xl"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="app-token-title"
+        >
+          <h2 id="app-token-title" className="text-base font-semibold text-gray-900">
+            输入访问令牌
+          </h2>
+          <p className="mt-1 text-xs text-gray-500">
+            后端已启用 API 访问保护。
+          </p>
+          <input
+            autoFocus
+            type="password"
+            value={authToken}
+            onChange={(event) => setAuthToken(event.target.value)}
+            className="ui-control mt-4 w-full"
+            placeholder="X-App-Token"
+          />
+          <label className="mt-3 flex items-center gap-2 text-sm text-gray-600">
+            <input
+              type="checkbox"
+              checked={rememberToken}
+              onChange={(event) => setRememberToken(event.target.checked)}
+            />
+            在此浏览器中长期记住
+          </label>
+          <div className="mt-5 flex items-center justify-between">
+            <button
+              type="button"
+              className="text-sm text-gray-500 hover:text-red-600"
+              onClick={() => {
+                clearAppToken()
+                setAuthToken('')
+              }}
+            >
+              清除已保存令牌
+            </button>
+            <button type="submit" className="ui-button-primary" disabled={!authToken.trim()}>
+              连接
+            </button>
+          </div>
+        </form>
+      </div>
+    )}
+    </>
   )
 }

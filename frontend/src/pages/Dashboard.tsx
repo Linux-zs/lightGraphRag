@@ -45,9 +45,11 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
   const pollingTaskIdRef = useRef<string | null>(null)
   const logViewportRef = useRef<HTMLDivElement | null>(null)
   const mountedRef = useRef(true)
+  const workspaceRunRef = useRef(0)
 
   useEffect(() => {
     mountedRef.current = true
+    workspaceRunRef.current += 1
     loadStats()
     restoreRebuildTask()
     loadObservability()
@@ -59,17 +61,18 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
   }, [workspace])
 
   const loadStats = useCallback(async () => {
+    const runId = workspaceRunRef.current
     setLoading(true)
     setError('')
     try {
       const data = await getSystemStats(workspace)
-      if (!mountedRef.current) return
+      if (!mountedRef.current || runId !== workspaceRunRef.current) return
       setStats(data)
     } catch (e: unknown) {
-      if (!mountedRef.current) return
+      if (!mountedRef.current || runId !== workspaceRunRef.current) return
       setError((e as Error).message || '加载失败')
     } finally {
-      if (mountedRef.current) setLoading(false)
+      if (mountedRef.current && runId === workspaceRunRef.current) setLoading(false)
     }
   }, [workspace])
 
@@ -132,6 +135,7 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
   }
 
   const loadObservability = useCallback(async () => {
+    const runId = workspaceRunRef.current
     setLogsLoading(true)
     setLogMsg('')
     try {
@@ -143,7 +147,7 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
           contains: logContains.trim(),
         }),
       ])
-      if (!mountedRef.current) return
+      if (!mountedRef.current || runId !== workspaceRunRef.current) return
       setRecentTasks(tasks.filter((task) => task.workspace === workspace).slice(0, 8))
       setLogs(logData.items)
       setLogMsg(
@@ -152,10 +156,10 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
           : '日志文件尚未生成',
       )
     } catch (e: unknown) {
-      if (!mountedRef.current) return
+      if (!mountedRef.current || runId !== workspaceRunRef.current) return
       setLogMsg(`加载日志失败: ${(e as Error).message}`)
     } finally {
-      if (mountedRef.current) setLogsLoading(false)
+      if (mountedRef.current && runId === workspaceRunRef.current) setLogsLoading(false)
     }
   }, [logContains, logLevel, workspace])
 
@@ -180,21 +184,39 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
   const pollTask = useCallback(async (taskId: string) => {
     if (pollingTaskIdRef.current === taskId) return
     pollingTaskIdRef.current = taskId
-    let task = await getIndexTask(taskId)
-    if (!mountedRef.current || pollingTaskIdRef.current !== taskId) return
-    setRebuildTask(task)
-    setOperating(!isTaskTerminal(task))
-    while (!isTaskTerminal(task)) {
-      await new Promise((resolve) => setTimeout(resolve, 1500))
-      task = await getIndexTask(taskId)
-      if (!mountedRef.current || pollingTaskIdRef.current !== taskId) return
+    const runId = workspaceRunRef.current
+    try {
+      let task = await getIndexTask(taskId)
+      if (!mountedRef.current || pollingTaskIdRef.current !== taskId || runId !== workspaceRunRef.current) return
       setRebuildTask(task)
+      setOperating(!isTaskTerminal(task))
+      let failures = 0
+      while (!isTaskTerminal(task)) {
+        await new Promise((resolve) => setTimeout(resolve, 1500))
+        try {
+          task = await getIndexTask(taskId)
+          failures = 0
+        } catch (error) {
+          failures += 1
+          if (failures >= 3) throw error
+          continue
+        }
+        if (!mountedRef.current || pollingTaskIdRef.current !== taskId || runId !== workspaceRunRef.current) return
+        setRebuildTask(task)
+      }
+      if (!mountedRef.current || pollingTaskIdRef.current !== taskId || runId !== workspaceRunRef.current) return
+      setOperating(false)
+      setOpMsg(task.message)
+      await loadStats()
+      await loadObservability()
+    } catch (error) {
+      if (runId === workspaceRunRef.current) {
+        setOperating(false)
+        setOpMsg(`任务状态获取失败: ${(error as Error).message}`)
+      }
+    } finally {
+      if (pollingTaskIdRef.current === taskId) pollingTaskIdRef.current = null
     }
-    if (!mountedRef.current || pollingTaskIdRef.current !== taskId) return
-    setOperating(false)
-    setOpMsg(task.message)
-    await loadStats()
-    await loadObservability()
   }, [loadObservability, loadStats])
 
   const restoreRebuildTask = useCallback(async () => {
@@ -249,7 +271,7 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
   const handleRebuild = async () => {
     const confirmed = await confirm({
       title: '重建当前知识库索引',
-      message: `将先清空知识库“${workspace}”的现有索引，再从该知识库的上传目录重新索引全部文档。`,
+      message: `将在隔离的临时版本中重新索引知识库“${workspace}”的全部文档；全部成功后才切换，失败时保留当前索引。`,
       confirmLabel: '开始重建',
       tone: 'danger',
     })
@@ -346,6 +368,12 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
           <div className="bg-gray-50 rounded-lg p-4">
             <dt className="text-xs text-gray-400 mb-1">嵌入维度</dt>
             <dd className="text-sm font-mono text-gray-800">{stats.embed_dim || 1024}</dd>
+          </div>
+          <div className="bg-gray-50 rounded-lg p-4 md:col-span-2">
+            <dt className="text-xs text-gray-400 mb-1">生效配置文件</dt>
+            <dd className="break-all text-sm font-mono text-gray-800">
+              {stats.effective_config_path || '默认配置'}
+            </dd>
           </div>
         </dl>
       </div>

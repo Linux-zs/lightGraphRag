@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import tempfile
+import uuid
 from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from loguru import logger
 
 from src.config_loader import get_config
 from src.doc_processor.parsers.base_parser import Document
+from src.exceptions import ManifestCorruptedError
 from src.lightrag_stage_timing import install_stage_timing
 from src.model_profiles import get_runtime_model_config
 
@@ -40,6 +42,7 @@ EMBEDDING_STRUCTURAL_CHARS_RE = re.compile(r"[|()\[\]{}<>`/\\]+")
 EMBEDDING_WHITESPACE_RE = re.compile(r"\s+")
 EMBEDDING_STRICT_SAFE_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff，。？！；：、,.!?;: _-]+")
 WORKSPACE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+MANIFEST_SCHEMA_VERSION = 2
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -229,9 +232,15 @@ class LightRAGService:
         data_dir = Path(paths.get("data_dir", "./data"))
         self.data_dir = data_dir
         self.working_dir = Path(paths.get("lightrag_dir", data_dir / "lightrag"))
+        self.embedding_meta_dir = Path(
+            paths.get("lightrag_embedding_meta_dir", data_dir / "lightrag_embedding_meta")
+        )
         default_workspace = self.config.get("lightrag", {}).get("workspace", DEFAULT_WORKSPACE)
         self.workspace = sanitize_workspace(workspace or default_workspace)
-        if self.workspace == default_workspace:
+        manifest_override = paths.get("lightrag_manifest_override")
+        if manifest_override:
+            self.manifest_path = Path(manifest_override)
+        elif self.workspace == default_workspace:
             self.manifest_path = Path(paths.get("lightrag_manifest", data_dir / "lightrag_manifest.json"))
         else:
             self.manifest_path = data_dir / "lightrag_manifests" / f"{self.workspace}.json"
@@ -239,6 +248,7 @@ class LightRAGService:
         self._init_lock = asyncio.Lock()
         self._last_stage_timings: dict[str, float] = {}
         self._last_kg_filter_stats: dict[str, Any] = {}
+        self._runtime_snapshot = deepcopy(get_runtime_model_config(self.config))
 
     @property
     def rag(self) -> LightRAG:
@@ -272,7 +282,7 @@ class LightRAGService:
 
     @property
     def embedding_meta_path(self) -> Path:
-        return self.data_dir / "lightrag_embedding_meta" / f"{self.workspace}.json"
+        return self.embedding_meta_dir / f"{self.workspace}.json"
 
     def current_embedding_signature(
         self,
@@ -391,18 +401,57 @@ class LightRAGService:
                 except Exception as exc:
                     logger.warning("Failed to remove stale LightRAG doc {}: {}", doc_id, exc)
                     continue
-                item = manifest.get("documents", {}).get(doc_id)
+                logical_doc_id = next(
+                    (
+                        candidate_id
+                        for candidate_id, candidate in manifest.get("documents", {}).items()
+                        if candidate_id == doc_id
+                        or (
+                            isinstance(candidate, dict)
+                            and str(
+                                (candidate.get("last_index_attempt") or {}).get("index_doc_id")
+                                or ""
+                            )
+                            == doc_id
+                        )
+                        or doc_id.startswith(f"{candidate_id}-v")
+                    ),
+                    None,
+                )
+                item = (
+                    manifest.get("documents", {}).get(logical_doc_id)
+                    if logical_doc_id
+                    else None
+                )
                 doc_name = item.get("doc_name", doc_id) if isinstance(item, dict) else doc_id
                 if isinstance(item, dict):
+                    has_active = bool(
+                        item.get("indexed") and item.get("active_index_doc_id")
+                    )
+                    interrupted_error = "上一次索引中断，已清理临时版本，请重新索引。"
                     item.update(
                         {
-                            "indexed": False,
-                            "status": "failed",
-                            "error_msg": "上一次索引中断，已从 LightRAG 待处理队列清理，请重新索引。",
+                            "indexed": has_active,
+                            "status": (
+                                item.get("active_index_status") or "processed"
+                                if has_active
+                                else "failed"
+                            ),
+                            "index_stale": has_active,
+                            "last_index_attempt_status": "failed",
+                            "last_index_error": interrupted_error,
+                            "last_index_attempt": {
+                                **dict(item.get("last_index_attempt") or {}),
+                                "status": "failed",
+                                "finished_at": _now_iso(),
+                                "error": interrupted_error,
+                            },
                             "updated_at": _now_iso(),
                         }
                     )
-                    manifest["documents"][doc_id] = item
+                    if not has_active:
+                        item["error_msg"] = interrupted_error
+                    manifest["documents"][logical_doc_id] = item
                 cleaned.append({"doc_id": doc_id, "doc_name": doc_name, "status": status.value})
         if cleaned:
             self._save_manifest(manifest)
@@ -541,7 +590,7 @@ class LightRAGService:
 
         try:
             return await embed_batch(texts)
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             if not self._is_invalid_embedding_payload_error(exc):
                 raise
             if len(texts) > 1:
@@ -622,18 +671,31 @@ class LightRAGService:
         return safe
 
     @staticmethod
-    def _thinking_extra_body(model: str) -> dict[str, Any]:
+    def _thinking_extra_body(model: str, base_url: str = "") -> dict[str, Any]:
         """Disable hidden chain-of-thought for hybrid thinking models.
 
         Models like Qwen3-8B / GLM-4.5 / DeepSeek-V3.1 default to thinking mode
-        on SiliconFlow, which makes each entity-extraction call take 60-300s and
-        often yields empty JSON. `enable_thinking: false` turns it off.
-        Pure instruct/coder variants do not accept this parameter, so skip them.
+        on compatible providers, which makes each entity-extraction call take
+        60-300s and often yields empty JSON. DeepSeek's official endpoint uses
+        the OpenAI-format `thinking.type` switch; SiliconFlow-style providers
+        use `enable_thinking`.
         """
         m = (model or "").lower()
+        api = (base_url or "").lower()
+        if "api.deepseek.com" in api and "deepseek" in m:
+            return {"thinking": {"type": "disabled"}}
         if "instruct" in m or "coder" in m:
             return {}
-        hybrid_markers = ("qwen3", "glm-4.5", "glm-4.6", "glm-5", "deepseek-v3.1", "deepseek-v3.2", "hunyuan-a13b")
+        hybrid_markers = (
+            "qwen3",
+            "glm-4.5",
+            "glm-4.6",
+            "glm-5",
+            "deepseek-v3.1",
+            "deepseek-v3.2",
+            "deepseek-v4",
+            "hunyuan-a13b",
+        )
         if any(marker in m for marker in hybrid_markers):
             return {"enable_thinking": False}
         return {}
@@ -650,7 +712,10 @@ class LightRAGService:
         }
         disable_thinking = bool(self.config.get("lightrag", {}).get("disable_thinking", True))
         if disable_thinking:
-            extra_body = self._thinking_extra_body(chat.get("model", ""))
+            extra_body = self._thinking_extra_body(
+                chat.get("model", ""),
+                chat.get("base_url", ""),
+            )
             if extra_body:
                 kwargs["extra_body"] = extra_body
         return kwargs
@@ -683,6 +748,42 @@ class LightRAGService:
                     **kwargs,
                 )
             except Exception as exc:
+                can_fallback_json_mode = (
+                    purpose == "kg"
+                    and kwargs.get("response_format") is not None
+                    and self._kg_failure_kind(exc) == "invalid_response"
+                )
+                if can_fallback_json_mode:
+                    fallback_kwargs = dict(kwargs)
+                    fallback_kwargs.pop("response_format", None)
+                    logger.warning(
+                        "KG model returned empty content in forced JSON mode; "
+                        "retrying once without response_format. model={}, api={}, root={}",
+                        model,
+                        base_url,
+                        self._kg_failure_detail(exc),
+                    )
+                    try:
+                        return await openai_complete_if_cache(
+                            model=model,
+                            prompt=prompt,
+                            system_prompt=system_prompt,
+                            history_messages=history_messages or [],
+                            base_url=base_url,
+                            api_key=api_key,
+                            timeout=timeout,
+                            keyword_extraction=keyword_extraction,
+                            **fallback_kwargs,
+                        )
+                    except Exception as fallback_exc:
+                        logger.error(
+                            "{} model fallback call failed: model={}, api={}, root={}",
+                            purpose,
+                            model,
+                            base_url,
+                            self._kg_failure_detail(fallback_exc),
+                        )
+                        raise
                 logger.error(
                     "{} model call failed: model={}, api={}, root={}",
                     purpose,
@@ -744,7 +845,7 @@ class LightRAGService:
         return siliconflow_rerank
 
     def _runtime_models(self) -> dict[str, Any]:
-        return get_runtime_model_config(self.config)
+        return self._runtime_snapshot
 
     def _kg_filter_settings(self) -> dict[str, Any]:
         cfg = self.config.get("lightrag", {})
@@ -1131,19 +1232,98 @@ class LightRAGService:
             return "filtered_empty"
         return "complete"
 
+    @property
+    def manifest_backup_path(self) -> Path:
+        return self.manifest_path.with_suffix(f"{self.manifest_path.suffix}.bak")
+
+    @staticmethod
+    def _validate_manifest(data: Any, *, source: Path) -> dict[str, Any]:
+        if not isinstance(data, dict) or not isinstance(data.get("documents"), dict):
+            raise ManifestCorruptedError(f"Invalid manifest structure: {source}")
+        version = data.get("schema_version", 1)
+        if not isinstance(version, int) or version < 1 or version > MANIFEST_SCHEMA_VERSION:
+            raise ManifestCorruptedError(
+                f"Unsupported manifest schema version {version!r}: {source}"
+            )
+        migrated = deepcopy(data)
+        migrated["schema_version"] = MANIFEST_SCHEMA_VERSION
+        for doc_id, item in list(migrated["documents"].items()):
+            if not isinstance(item, dict):
+                raise ManifestCorruptedError(
+                    f"Invalid document entry {doc_id!r}: {source}"
+                )
+            item.setdefault("doc_id", doc_id)
+            if item.get("indexed"):
+                item.setdefault("active_index_doc_id", doc_id)
+            else:
+                item.setdefault("active_index_doc_id", "")
+            item.setdefault(
+                "active_index_status",
+                item.get("status", "processed") if item.get("indexed") else "",
+            )
+            item.setdefault("retired_index_doc_ids", [])
+            item.setdefault("index_stale", False)
+            item.setdefault("last_index_attempt_status", item.get("status", "uploaded"))
+            item.setdefault("last_index_error", item.get("error_msg", ""))
+            item.setdefault("last_index_attempt", {})
+        return migrated
+
+    def _read_manifest_file(self, path: Path) -> dict[str, Any]:
+        try:
+            return self._validate_manifest(
+                json.loads(path.read_text(encoding="utf-8")),
+                source=path,
+            )
+        except ManifestCorruptedError:
+            raise
+        except Exception as exc:
+            raise ManifestCorruptedError(f"Failed to read manifest {path}: {exc}") from exc
+
     def _load_manifest(self) -> dict[str, Any]:
         if not self.manifest_path.exists():
-            return {"documents": {}}
+            if self.manifest_backup_path.exists():
+                backup = self._read_manifest_file(self.manifest_backup_path)
+                _atomic_write_json(self.manifest_path, backup)
+                logger.warning(
+                    "Restored missing LightRAG manifest from backup: {}",
+                    self.manifest_path,
+                )
+                return backup
+            return {"schema_version": MANIFEST_SCHEMA_VERSION, "documents": {}}
         try:
-            data = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("documents"), dict):
-                return data
-        except Exception:
-            logger.exception("Failed to read LightRAG manifest")
-        return {"documents": {}}
+            return self._read_manifest_file(self.manifest_path)
+        except ManifestCorruptedError as primary_exc:
+            logger.error("Primary LightRAG manifest is corrupt: {}", primary_exc)
+            if self.manifest_backup_path.exists():
+                try:
+                    backup = self._read_manifest_file(self.manifest_backup_path)
+                    _atomic_write_json(self.manifest_path, backup)
+                    logger.warning(
+                        "Restored corrupt LightRAG manifest from backup: {}",
+                        self.manifest_path,
+                    )
+                    return backup
+                except ManifestCorruptedError as backup_exc:
+                    raise ManifestCorruptedError(
+                        f"Manifest and backup are corrupted: {self.manifest_path}; "
+                        f"backup error: {backup_exc}"
+                    ) from primary_exc
+            raise ManifestCorruptedError(
+                f"Manifest is corrupted and no valid backup exists: {self.manifest_path}"
+            ) from primary_exc
 
     def _save_manifest(self, manifest: dict[str, Any]) -> None:
-        _atomic_write_json(self.manifest_path, manifest)
+        validated = self._validate_manifest(
+            {
+                **manifest,
+                "schema_version": MANIFEST_SCHEMA_VERSION,
+            },
+            source=self.manifest_path,
+        )
+        if self.manifest_path.exists():
+            current = self._read_manifest_file(self.manifest_path)
+            _atomic_write_json(self.manifest_backup_path, current)
+        _atomic_write_json(self.manifest_path, validated)
 
     def _manifest_doc_id(self, doc: Document, manifest: dict[str, Any]) -> str:
         explicit = str(doc.metadata.get("lightrag_doc_id") or "").strip()
@@ -1741,6 +1921,11 @@ class LightRAGService:
         doc_id = self._manifest_doc_id(doc, manifest)
         doc.metadata["lightrag_doc_id"] = doc_id
         existing = manifest["documents"].get(doc_id, {})
+        content_sha256 = hashlib.sha256(doc.raw_text.encode("utf-8")).hexdigest()
+        content_changed = bool(
+            existing.get("content_sha256")
+            and existing.get("content_sha256") != content_sha256
+        )
         item = {
             **existing,
             "doc_id": doc_id,
@@ -1752,6 +1937,24 @@ class LightRAGService:
             "indexed": existing.get("indexed", False),
             "status": existing.get("status", "uploaded"),
             "chunk_count": existing.get("chunk_count", 0),
+            "content_sha256": content_sha256,
+            "active_index_doc_id": existing.get("active_index_doc_id")
+            or (doc_id if existing.get("indexed") else ""),
+            "active_index_status": existing.get("active_index_status")
+            or (existing.get("status", "processed") if existing.get("indexed") else ""),
+            "retired_index_doc_ids": list(existing.get("retired_index_doc_ids") or []),
+            "index_stale": bool(existing.get("index_stale")) or (
+                bool(existing.get("indexed")) and content_changed
+            ),
+            "last_index_attempt_status": existing.get(
+                "last_index_attempt_status",
+                existing.get("status", "uploaded"),
+            ),
+            "last_index_error": existing.get(
+                "last_index_error",
+                existing.get("error_msg", ""),
+            ),
+            "last_index_attempt": dict(existing.get("last_index_attempt") or {}),
             "graph_rule": existing.get("graph_rule") or self.graph_governance_summary(),
             "updated_at": _now_iso(),
         }
@@ -1773,6 +1976,10 @@ class LightRAGService:
         doc_id = self._manifest_doc_id(doc, manifest)
         doc.metadata["lightrag_doc_id"] = doc_id
         existing = manifest["documents"].get(doc_id, {})
+        has_active_index = bool(existing.get("active_index_doc_id") and existing.get("indexed"))
+        visible_status = status
+        if has_active_index and status in {"processing", "failed"}:
+            visible_status = str(existing.get("active_index_status") or "processed")
         item = {
             **existing,
             "doc_id": doc_id,
@@ -1781,14 +1988,16 @@ class LightRAGService:
             "file_path": doc.file_path,
             "raw_text_path": doc.metadata.get("raw_text_path", existing.get("raw_text_path", "")),
             "char_count": len(doc.raw_text),
-            "status": status,
+            "status": visible_status,
             "updated_at": _now_iso(),
         }
-        if indexed is not None:
+        if indexed is not None and not (has_active_index and status in {"processing", "failed"}):
             item["indexed"] = indexed
+        item["last_index_attempt_status"] = status
+        item["last_index_error"] = error_msg
         if error_msg:
             item["error_msg"] = error_msg
-        elif status not in {"failed"}:
+        elif status not in {"failed"} and not has_active_index:
             item["error_msg"] = ""
         if chunk_count is not None:
             item["chunk_count"] = chunk_count
@@ -1831,17 +2040,36 @@ class LightRAGService:
         doc.metadata["lightrag_doc_id"] = doc_id
         manifest = self._load_manifest()
         item = manifest["documents"].get(doc_id, {})
+        previous_item = deepcopy(item)
+        previous_active_id = str(
+            item.get("active_index_doc_id")
+            or (doc_id if item.get("indexed") else "")
+        )
+        index_doc_id = (
+            f"{doc_id}-v{uuid.uuid4().hex[:8]}"
+            if previous_active_id
+            else doc_id
+        )
+        embedding_snapshot = deepcopy(self._runtime_models().get("embedding", {}))
+        attempt_started_at = _now_iso()
+        item["last_index_attempt"] = {
+            "index_doc_id": index_doc_id,
+            "status": "processing",
+            "started_at": attempt_started_at,
+            "embedding": {
+                key: embedding_snapshot.get(key)
+                for key in ("base_url", "model", "embed_dim")
+            },
+            "kg_model": (
+                ""
+                if skip_kg
+                else self._runtime_models().get("kg", {}).get("model", "")
+            ),
+        }
+        item["last_index_attempt_status"] = "processing"
+        manifest["documents"][doc_id] = item
+        self._save_manifest(manifest)
         try:
-            existing_status = await self.get_doc_status(doc_id)
-            if existing_status is not None:
-                deletion = await rag.adelete_by_doc_id(doc_id)
-                deletion_status = str(getattr(deletion, "status", "") or "").lower()
-                if deletion_status not in {"success", "not_found"}:
-                    message = getattr(deletion, "message", "") or str(deletion)
-                    raise RuntimeError(
-                        f"Existing LightRAG document could not be removed before re-index: {message}"
-                    )
-                logger.info("Removed existing LightRAG doc before re-index: {}", doc_id)
             collector = install_stage_timing(rag)
             collector.on_update = stage_update_callback
             try:
@@ -1855,42 +2083,19 @@ class LightRAGService:
                         result = await self._insert_document_text(
                             rag,
                             doc,
-                            doc_id,
+                            index_doc_id,
                             skip_kg=skip_kg,
                         )
                 self._last_stage_timings = collector.to_stages()
             finally:
                 collector.on_update = None
-            status = await self.get_doc_status(doc_id)
+            status = await self.get_doc_status(index_doc_id)
             if status and status.status == "failed":
-                item.update(
-                    {
-                        "indexed": False,
-                        "status": "failed",
-                        "chunk_count": status.chunk_count,
-                    "chunks_list": status.chunks_list or [],
-                    "error_msg": status.error_msg,
-                    "chunking": {
-                        "chunk_size": chunk_size,
-                        "chunk_overlap": chunk_overlap,
-                        "separators": separators,
-                    },
-                    "index_mode": index_mode,
-                    "kg_status": "skipped" if skip_kg else "failed",
-                    "kg_filter": self._last_kg_filter_stats,
-                    "kg_model": self._runtime_models().get("kg", {}).get("model", ""),
-                    "kg_extraction_limits": {
-                        "max_entities_per_chunk": kg_max_entities,
-                        "max_records_per_chunk": kg_max_records,
-                    },
-                    "graph_rule": self.graph_governance_summary(),
-                    "updated_at": _now_iso(),
-                }
-                )
-                manifest["documents"][doc_id] = item
-                self._save_manifest(manifest)
                 raise RuntimeError(status.error_msg or "LightRAG document processing failed")
 
+            retired_ids = list(item.get("retired_index_doc_ids") or [])
+            if previous_active_id and previous_active_id != index_doc_id:
+                retired_ids.append(previous_active_id)
             item.update(
                 {
                     "doc_id": doc_id,
@@ -1901,6 +2106,18 @@ class LightRAGService:
                     "char_count": len(doc.raw_text),
                     "indexed": True,
                     "status": status.status if status else "indexed",
+                    "active_index_doc_id": index_doc_id,
+                    "active_index_status": status.status if status else "processed",
+                    "retired_index_doc_ids": list(dict.fromkeys(retired_ids)),
+                    "index_stale": False,
+                    "last_index_attempt_status": "succeeded",
+                    "last_index_error": "",
+                    "last_index_attempt": {
+                        **dict(item.get("last_index_attempt") or {}),
+                        "status": "succeeded",
+                        "finished_at": _now_iso(),
+                        "error": "",
+                    },
                     "chunk_count": status.chunk_count if status else item.get("chunk_count", 0),
                     "chunks_list": status.chunks_list if status else item.get("chunks_list", []),
                     "error_msg": status.error_msg if status else "",
@@ -1924,18 +2141,87 @@ class LightRAGService:
             )
             manifest["documents"][doc_id] = item
             self._save_manifest(manifest)
-            self.record_embedding_signature(overwrite=True)
+            self.record_embedding_signature(embedding_snapshot, overwrite=True)
+            if previous_active_id and previous_active_id != index_doc_id:
+                try:
+                    deletion = await rag.adelete_by_doc_id(previous_active_id)
+                    deletion_status = str(
+                        getattr(deletion, "status", "") or ""
+                    ).lower()
+                    if deletion_status in {"success", "not_found"}:
+                        latest = self._load_manifest()
+                        latest_item = latest["documents"].get(doc_id, {})
+                        latest_item["retired_index_doc_ids"] = [
+                            value
+                            for value in latest_item.get("retired_index_doc_ids", [])
+                            if value != previous_active_id
+                        ]
+                        latest["documents"][doc_id] = latest_item
+                        self._save_manifest(latest)
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "Retaining old index version {} after cleanup failure: {}",
+                        previous_active_id,
+                        cleanup_exc,
+                    )
             return item
-        except Exception:
-            item.update({"indexed": False, "status": "failed", "updated_at": _now_iso()})
-            manifest["documents"][doc_id] = item
-            self._save_manifest(manifest)
+        except (Exception, asyncio.CancelledError) as exc:
+            latest = self._load_manifest()
+            failed_item = {
+                **previous_item,
+                "doc_id": doc_id,
+                "doc_name": doc.file_name,
+                "file_type": doc.file_type,
+                "file_path": doc.file_path,
+                "raw_text_path": doc.metadata.get(
+                    "raw_text_path",
+                    previous_item.get("raw_text_path", ""),
+                ),
+                "char_count": len(doc.raw_text),
+                "content_sha256": hashlib.sha256(
+                    doc.raw_text.encode("utf-8")
+                ).hexdigest(),
+                "index_stale": bool(previous_active_id),
+                "last_index_attempt_status": "failed",
+                "last_index_error": str(exc),
+                "last_index_attempt": {
+                    **dict(item.get("last_index_attempt") or {}),
+                    "status": "failed",
+                    "finished_at": _now_iso(),
+                    "error": str(exc),
+                },
+                "updated_at": _now_iso(),
+            }
+            if previous_active_id:
+                failed_item.update(
+                    {
+                        "indexed": True,
+                        "status": str(
+                            previous_item.get("active_index_status") or "processed"
+                        ),
+                        "active_index_doc_id": previous_active_id,
+                        "active_index_status": str(
+                            previous_item.get("active_index_status") or "processed"
+                        ),
+                    }
+                )
+            else:
+                failed_item.update(
+                    {
+                        "indexed": False,
+                        "status": "failed",
+                        "active_index_doc_id": "",
+                        "error_msg": str(exc),
+                    }
+                )
+            latest["documents"][doc_id] = failed_item
+            self._save_manifest(latest)
             try:
-                await self.discard_lightrag_doc(doc_id)
+                await self.discard_lightrag_doc(index_doc_id)
             except Exception as cleanup_exc:
                 logger.warning(
                     "Failed to cleanup LightRAG doc after index error {}: {}",
-                    doc_id,
+                    index_doc_id,
                     cleanup_exc,
                 )
             raise
@@ -2392,13 +2678,27 @@ class LightRAGService:
 
         item = docs[match_id]
         existing_status = await self.get_doc_status(match_id)
-        deletion = None
-        if item.get("indexed") or existing_status is not None:
-            deletion = await self.rag.adelete_by_doc_id(match_id)
+        index_ids = list(
+            dict.fromkeys(
+                [
+                    str(item.get("active_index_doc_id") or ""),
+                    *[
+                        str(value)
+                        for value in item.get("retired_index_doc_ids", [])
+                    ],
+                    match_id if item.get("indexed") and not item.get("active_index_doc_id") else "",
+                    match_id if existing_status is not None else "",
+                ]
+            )
+        )
+        deletions: list[str] = []
+        for index_id in [value for value in index_ids if value]:
+            deletion = await self.rag.adelete_by_doc_id(index_id)
             deletion_status = str(getattr(deletion, "status", "") or "").lower()
             if deletion_status not in {"success", "not_found"}:
                 message = getattr(deletion, "message", "") or str(deletion)
                 raise RuntimeError(f"LightRAG document deletion was not completed: {message}")
+            deletions.append(str(deletion))
         removed = docs.pop(match_id)
         self._save_manifest(manifest)
         return {
@@ -2406,7 +2706,7 @@ class LightRAGService:
             "doc_name": removed.get("doc_name", doc_name_or_id),
             "file_path": removed.get("file_path", ""),
             "raw_text_path": removed.get("raw_text_path", ""),
-            "deletion": str(deletion),
+            "deletion": "; ".join(deletions),
         }
 
     async def invalidate_document(self, doc_name_or_id: str) -> dict[str, Any]:
@@ -2426,19 +2726,35 @@ class LightRAGService:
             raise KeyError(doc_name_or_id)
 
         item = docs[match_id]
-        existing_status = await self.get_doc_status(match_id)
-        deletion = None
-        if item.get("indexed") or existing_status is not None:
-            deletion = await self.rag.adelete_by_doc_id(match_id)
+        index_ids = list(
+            dict.fromkeys(
+                [
+                    str(item.get("active_index_doc_id") or ""),
+                    *[
+                        str(value)
+                        for value in item.get("retired_index_doc_ids", [])
+                    ],
+                    match_id if item.get("indexed") and not item.get("active_index_doc_id") else "",
+                ]
+            )
+        )
+        deletions: list[str] = []
+        for index_id in [value for value in index_ids if value]:
+            deletion = await self.rag.adelete_by_doc_id(index_id)
             deletion_status = str(getattr(deletion, "status", "") or "").lower()
             if deletion_status not in {"success", "not_found"}:
                 message = getattr(deletion, "message", "") or str(deletion)
                 raise RuntimeError(f"LightRAG document invalidation was not completed: {message}")
+            deletions.append(str(deletion))
 
         item.update(
             {
                 "indexed": False,
                 "status": "uploaded",
+                "active_index_doc_id": "",
+                "active_index_status": "",
+                "retired_index_doc_ids": [],
+                "index_stale": False,
                 "chunk_count": 0,
                 "chunks_list": [],
                 "error_msg": "",
@@ -2447,7 +2763,11 @@ class LightRAGService:
         )
         docs[match_id] = item
         self._save_manifest(manifest)
-        return {"doc_id": match_id, "doc_name": item.get("doc_name", doc_name_or_id), "deletion": str(deletion)}
+        return {
+            "doc_id": match_id,
+            "doc_name": item.get("doc_name", doc_name_or_id),
+            "deletion": "; ".join(deletions),
+        }
 
     def _query_param(
         self,
@@ -2796,19 +3116,12 @@ class LightRAGService:
 
     async def clear_workspace(self, *, preserve_manifest: bool = False) -> dict[str, Any]:
         """Clear current LightRAG workspace and manifest without deleting uploads."""
-        preserved_manifest = self._load_manifest() if preserve_manifest else {"documents": {}}
-        if self._rag is not None:
-            for method_name in ("finalize_storages", "afinalize_storages", "close"):
-                method = getattr(self._rag, method_name, None)
-                if method is None:
-                    continue
-                try:
-                    result = method()
-                    if hasattr(result, "__await__"):
-                        await result
-                except Exception as exc:
-                    logger.debug("Ignoring LightRAG storage finalization error: {}", exc)
-            self._rag = None
+        preserved_manifest = (
+            self._load_manifest()
+            if preserve_manifest
+            else {"schema_version": MANIFEST_SCHEMA_VERSION, "documents": {}}
+        )
+        await self.finalize()
 
         workspace_path = self.graphml_path.parent.resolve()
         expected_parent = self.working_dir.resolve()
@@ -2837,6 +3150,29 @@ class LightRAGService:
             "preserved_manifest": preserve_manifest,
         }
 
+    async def finalize(self) -> None:
+        """Finalize initialized LightRAG storage handles exactly once."""
+        rag = self._rag
+        self._rag = None
+        if rag is None:
+            return
+        for method_name in ("finalize_storages", "afinalize_storages", "close"):
+            method = getattr(rag, method_name, None)
+            if method is None:
+                continue
+            try:
+                result = method()
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception as exc:
+                logger.warning(
+                    "LightRAG storage finalization failed for {} via {}: {}",
+                    self.workspace,
+                    method_name,
+                    exc,
+                )
+            break
+
     async def list_documents(self) -> list[dict[str, Any]]:
         manifest = self._load_manifest()
         doc_status: dict[str, Any] = {}
@@ -2851,7 +3187,11 @@ class LightRAGService:
 
         docs = []
         for doc_id, item in manifest.get("documents", {}).items():
-            status_obj = doc_status.get(doc_id)
+            active_index_doc_id = str(
+                item.get("active_index_doc_id")
+                or (doc_id if item.get("indexed") else "")
+            )
+            status_obj = doc_status.get(active_index_doc_id)
             chunk_count = item.get("chunk_count", 0)
             lightrag_status = item.get("status", "uploaded")
             if status_obj is not None:
@@ -2869,6 +3209,7 @@ class LightRAGService:
                 {
                     **item,
                     "doc_id": doc_id,
+                    "active_index_doc_id": active_index_doc_id,
                     "doc_name": item.get("doc_name", doc_id),
                     "file_type": item.get("file_type", ""),
                     "chunk_count": chunk_count,
@@ -2876,6 +3217,15 @@ class LightRAGService:
                     "status": lightrag_status,
                     "indexed": indexed,
                     "error_msg": error_msg,
+                    "index_stale": bool(item.get("index_stale", False)),
+                    "last_index_attempt_status": item.get(
+                        "last_index_attempt_status",
+                        item.get("status", "uploaded"),
+                    ),
+                    "last_index_error": item.get(
+                        "last_index_error",
+                        item.get("error_msg", ""),
+                    ),
                 }
             )
         docs.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
@@ -2913,3 +3263,17 @@ def reset_lightrag_service(workspace: str | None = None) -> None:
         _SERVICES.clear()
         return
     _SERVICES.pop(sanitize_workspace(workspace), None)
+
+
+async def reset_lightrag_service_async(workspace: str | None = None) -> None:
+    """Finalize old services before removing them from the process cache."""
+    if workspace is None:
+        services = list(_SERVICES.values())
+        _SERVICES.clear()
+    else:
+        service = _SERVICES.pop(sanitize_workspace(workspace), None)
+        services = [service] if service is not None else []
+    await asyncio.gather(
+        *(service.finalize() for service in services),
+        return_exceptions=True,
+    )

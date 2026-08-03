@@ -10,7 +10,7 @@ from src import model_profiles
 from src.llm_backend.siliconflow import SiliconFlowBackend
 
 
-def _request(host: str, token: str = "") -> Request:
+def _request(host: str, token: str = "", path: str = "/api/kb/workspaces") -> Request:
     headers = []
     if token:
         headers.append((b"x-app-token", token.encode("utf-8")))
@@ -18,7 +18,7 @@ def _request(host: str, token: str = "") -> Request:
         {
             "type": "http",
             "method": "GET",
-            "path": "/api/health",
+            "path": path,
             "headers": headers,
             "client": (host, 12345),
             "server": ("127.0.0.1", 8101),
@@ -44,7 +44,7 @@ def test_remote_request_requires_configured_token(monkeypatch):
         )
     )
 
-    assert denied.status_code == 403
+    assert denied.status_code == 401
     assert allowed.status_code == 200
 
 
@@ -59,6 +59,27 @@ def test_loopback_request_does_not_require_token(monkeypatch):
     )
 
     assert response.status_code == 200
+
+
+def test_loopback_request_requires_token_when_configured(monkeypatch):
+    monkeypatch.setattr(server, "APP_API_TOKEN", "expected-token")
+
+    async def call_next(_request):
+        return JSONResponse({"ok": True})
+
+    missing = asyncio.run(
+        server.require_remote_api_token(_request("127.0.0.1"), call_next)
+    )
+    wrong = asyncio.run(
+        server.require_remote_api_token(
+            _request("127.0.0.1", "wrong-token"),
+            call_next,
+        )
+    )
+
+    assert missing.status_code == 401
+    assert missing.body
+    assert wrong.status_code == 403
 
 
 def test_model_keys_are_encrypted_at_rest(tmp_path):
@@ -161,7 +182,7 @@ def test_kg_model_test_uses_structured_output_and_rejects_empty_content(monkeypa
         model_profiles,
         "get_profile_with_key",
         lambda *_args, **_kwargs: {
-            "api_base": "https://example.com/v1",
+            "api_base": "https://api.deepseek.com",
             "api_key": "secret",
         },
     )
@@ -174,10 +195,11 @@ def test_kg_model_test_uses_structured_output_and_rejects_empty_content(monkeypa
         "siliconflow": {"kg_max_tokens": 1536},
     }
 
-    result = asyncio.run(model_profiles.test_kg("profile", "example-model", config))
+    result = asyncio.run(model_profiles.test_kg("profile", "deepseek-v4-flash", config))
     assert result["ok"] is True
     assert payloads[0]["response_format"] == {"type": "json_object"}
     assert payloads[0]["max_tokens"] == 512
+    assert payloads[0]["thinking"] == {"type": "disabled"}
 
     with pytest.raises(ValueError, match="content 为空"):
-        asyncio.run(model_profiles.test_kg("profile", "example-model", config))
+        asyncio.run(model_profiles.test_kg("profile", "deepseek-v4-flash", config))

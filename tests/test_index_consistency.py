@@ -119,7 +119,9 @@ def test_delete_failure_keeps_manifest_and_source_identity(tmp_path):
     with pytest.raises(RuntimeError, match="busy"):
         asyncio.run(service.delete_document("example.txt"))
 
-    assert service._load_manifest() == original
+    assert service._load_manifest()["documents"] == service._validate_manifest(
+        original, source=service.manifest_path
+    )["documents"]
 
 
 def test_clear_workspace_can_preserve_manifest_for_rebuild(tmp_path):
@@ -132,7 +134,9 @@ def test_clear_workspace_can_preserve_manifest_for_rebuild(tmp_path):
     result = asyncio.run(service.clear_workspace(preserve_manifest=True))
 
     assert result["preserved_manifest"] is True
-    assert service._load_manifest() == manifest
+    assert service._load_manifest()["documents"] == service._validate_manifest(
+        manifest, source=service.manifest_path
+    )["documents"]
     assert not (service.workspace_dir / "index.json").exists()
 
 
@@ -560,7 +564,7 @@ def test_delete_endpoint_starts_workspace_cleanup_when_graph_residuals_remain(
     assert cleanup_calls[0][1]["allow_empty"] is True
 
 
-def test_raw_text_update_invalidates_index_and_persists_sidecar(tmp_path, monkeypatch):
+def test_raw_text_update_marks_index_stale_and_persists_sidecar(tmp_path, monkeypatch):
     source = tmp_path / "uploads" / "workspace_a" / "example.txt"
     source.parent.mkdir(parents=True)
     source.write_text("old text", encoding="utf-8")
@@ -572,12 +576,9 @@ def test_raw_text_update_invalidates_index_and_persists_sidecar(tmp_path, monkey
     )
 
     class FakeService:
-        async def invalidate_document(self, _doc_name):
-            return {"doc_id": "doc_123", "doc_name": "example.txt"}
-
         def register_upload(self, doc):
-            assert doc.metadata["lightrag_doc_id"] == "doc_123"
-            return {"doc_id": "doc_123"}
+            doc.metadata["lightrag_doc_id"] = "doc_123"
+            return {"doc_id": "doc_123", "index_stale": True}
 
     monkeypatch.setattr(server, "UPLOAD_DIR", tmp_path / "uploads")
     monkeypatch.setattr(server, "RAW_TEXT_DIR", tmp_path / "raw")
@@ -598,10 +599,11 @@ def test_raw_text_update_invalidates_index_and_persists_sidecar(tmp_path, monkey
 
     raw_path = server._resolve_raw_text_path("workspace_a", "doc_123")
     assert raw_path.read_text(encoding="utf-8") == "new managed text"
-    assert result["index_invalidated"] is True
+    assert result["index_invalidated"] is False
+    assert result["index_stale"] is True
 
 
-def test_reupload_changed_file_invalidates_old_index_before_replacement(
+def test_reupload_changed_file_keeps_old_index_until_replacement(
     tmp_path,
     monkeypatch,
 ):
@@ -609,8 +611,6 @@ def test_reupload_changed_file_invalidates_old_index_before_replacement(
     destination = upload_root / "workspace_a" / "example.txt"
     destination.parent.mkdir(parents=True)
     destination.write_text("old indexed text", encoding="utf-8")
-    invalidated = []
-
     class FakeService:
         def _load_manifest(self):
             return {
@@ -623,13 +623,9 @@ def test_reupload_changed_file_invalidates_old_index_before_replacement(
                 }
             }
 
-        async def invalidate_document(self, doc_name):
-            invalidated.append(doc_name)
-            return {"doc_id": "doc_123", "doc_name": doc_name}
-
         def register_upload(self, doc):
             doc.metadata["lightrag_doc_id"] = "doc_123"
-            return {"doc_id": "doc_123"}
+            return {"doc_id": "doc_123", "index_stale": True}
 
     monkeypatch.setattr(server, "UPLOAD_DIR", upload_root)
     monkeypatch.setattr(server, "RAW_TEXT_DIR", tmp_path / "raw")
@@ -645,9 +641,9 @@ def test_reupload_changed_file_invalidates_old_index_before_replacement(
 
     result = asyncio.run(server.upload_document(upload, "workspace_a"))
 
-    assert invalidated == ["example.txt"]
     assert destination.read_text(encoding="utf-8") == "new indexed text replacement"
-    assert result["index_invalidated"] is True
+    assert result["index_invalidated"] is False
+    assert result["index_stale"] is True
 
 
 def test_empty_cleanup_rebuild_can_run_while_caller_holds_workspace_lock(
@@ -655,19 +651,27 @@ def test_empty_cleanup_rebuild_can_run_while_caller_holds_workspace_lock(
     monkeypatch,
 ):
     class FakeService:
-        async def clear_workspace(self, **_kwargs):
-            return {"removed_workspace": True}
-
         async def replay_graph_audit(self):
             return {"applied": 0, "skipped": 0, "errors": []}
+
+        async def finalize(self):
+            return None
+
+        workspace_dir = tmp_path / "shadow"
+        working_dir = tmp_path / "shadow" / "lightrag"
 
     monkeypatch.setattr(server, "INDEX_TASKS_DIR", tmp_path / "tasks")
     monkeypatch.setattr(server, "_index_tasks", {})
     monkeypatch.setattr(server, "_workspace_rag_locks", {})
     monkeypatch.setattr(server, "_workspace_doc_names_for_rebuild", lambda _workspace: [])
     monkeypatch.setattr(server, "get_lightrag_service", lambda _workspace: FakeService())
-    monkeypatch.setattr(server, "reset_lightrag_service", lambda _workspace: None)
     monkeypatch.setattr(server, "_clear_workspace_cache", lambda _workspace: None)
+    async def prepare(task, _source):
+        return FakeService()
+    async def commit(_task, _shadow):
+        return None
+    monkeypatch.setattr(server, "_prepare_shadow_rebuild", prepare)
+    monkeypatch.setattr(server, "_commit_shadow_rebuild", commit)
 
     async def run():
         lock = server._get_workspace_rag_lock("workspace_a")

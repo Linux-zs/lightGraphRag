@@ -1,5 +1,57 @@
 const BASE = '/api'
 const DEFAULT_WORKSPACE = 'default'
+export const APP_TOKEN_STORAGE_KEY = 'lightgraphrag_app_token'
+
+export class ApiError extends Error {
+  status: number
+  code: string
+  requestId: string
+
+  constructor(message: string, status: number, code = 'HTTP_ERROR', requestId = '') {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.code = code
+    this.requestId = requestId
+  }
+}
+
+export function getAppToken(): string {
+  return localStorage.getItem(APP_TOKEN_STORAGE_KEY) || ''
+}
+
+export function setAppToken(token: string, remember = true): void {
+  const value = token.trim()
+  if (remember && value) localStorage.setItem(APP_TOKEN_STORAGE_KEY, value)
+  else localStorage.removeItem(APP_TOKEN_STORAGE_KEY)
+  if (!remember && value) sessionStorage.setItem(APP_TOKEN_STORAGE_KEY, value)
+  else sessionStorage.removeItem(APP_TOKEN_STORAGE_KEY)
+}
+
+export function clearAppToken(): void {
+  localStorage.removeItem(APP_TOKEN_STORAGE_KEY)
+  sessionStorage.removeItem(APP_TOKEN_STORAGE_KEY)
+}
+
+export async function apiFetch(
+  path: string,
+  options: RequestInit = {},
+): Promise<Response> {
+  const headers = new Headers(options.headers)
+  const token = sessionStorage.getItem(APP_TOKEN_STORAGE_KEY) || getAppToken()
+  if (token) headers.set('X-App-Token', token)
+  if (options.body && !(options.body instanceof FormData) && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+  const response = await fetch(path.startsWith('/api') ? path : `${BASE}${path}`, {
+    ...options,
+    headers,
+  })
+  if (response.status === 401 || response.status === 403) {
+    window.dispatchEvent(new CustomEvent('lightgraphrag-auth-required'))
+  }
+  return response
+}
 
 function formatApiError(payload: unknown, fallback: string): string {
   if (!payload) return fallback
@@ -44,13 +96,16 @@ async function request<T>(
   path: string,
   options: RequestInit = {},
 ): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
-    ...options,
-  })
+  const res = await apiFetch(path, options)
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
-    throw new Error(formatApiError(err, `HTTP ${res.status}`))
+    const record = err as Record<string, unknown>
+    throw new ApiError(
+      formatApiError(err, `HTTP ${res.status}`),
+      res.status,
+      typeof record.code === 'string' ? record.code : 'HTTP_ERROR',
+      typeof record.request_id === 'string' ? record.request_id : '',
+    )
   }
   return res.json()
 }
@@ -116,6 +171,7 @@ export interface ModelConfig {
   presence_penalty: number
   answer_prompt_template_id: string
   answer_system_prompt: string
+  effective_config_path?: string
 }
 
 export interface PromptTemplate {
@@ -137,6 +193,9 @@ export interface DocInfo {
   indexed?: boolean
   status?: string
   error_msg?: string
+  index_stale?: boolean
+  last_index_attempt_status?: string
+  last_index_error?: string
   graph_rule?: GraphRuleSummary
   index_mode?: 'complete' | 'fast'
   kg_status?: 'complete' | 'skipped' | 'filtered_empty' | 'failed' | string
@@ -159,8 +218,8 @@ export interface WorkspaceInfo {
   exists: boolean
 }
 
-export function listWorkspaces() {
-  return request<WorkspaceInfo[]>('/kb/workspaces')
+export function listWorkspaces(signal?: AbortSignal) {
+  return request<WorkspaceInfo[]>('/kb/workspaces', { signal })
 }
 
 export function createWorkspace(
@@ -196,21 +255,38 @@ export interface UploadedDocument {
   char_count: number
   preview: string
   index_invalidated: boolean
+  index_stale?: boolean
 }
 
-export function uploadDocument(file: File, workspace = DEFAULT_WORKSPACE): Promise<UploadedDocument> {
+async function parseApiResponse<T>(response: Response): Promise<T> {
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({ detail: response.statusText }))
+    const record = err as Record<string, unknown>
+    throw new ApiError(
+      formatApiError(err, `HTTP ${response.status}`),
+      response.status,
+      typeof record.code === 'string' ? record.code : 'HTTP_ERROR',
+      typeof record.request_id === 'string' ? record.request_id : '',
+    )
+  }
+  return response.json() as Promise<T>
+}
+
+export function uploadDocument(
+  file: File,
+  workspace = DEFAULT_WORKSPACE,
+  signal?: AbortSignal,
+): Promise<UploadedDocument> {
+  if (file.size > 50 * 1024 * 1024) {
+    return Promise.reject(new Error('文档不能超过 50 MiB'))
+  }
   const form = new FormData()
   form.append('file', file)
-  return fetch(`${BASE}/kb/upload?workspace=${encodeURIComponent(workspace)}`, {
+  return apiFetch(`/kb/upload?workspace=${encodeURIComponent(workspace)}`, {
     method: 'POST',
     body: form,
-  }).then(async (r) => {
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({ detail: r.statusText }))
-      throw new Error(formatApiError(err, `HTTP ${r.status}`))
-    }
-    return r.json() as Promise<UploadedDocument>
-  })
+    signal,
+  }).then(parseApiResponse<UploadedDocument>)
 }
 
 export function previewChunks(params: {
@@ -242,8 +318,8 @@ export function indexDocument(params: {
   )
 }
 
-export function listDocuments(workspace = DEFAULT_WORKSPACE) {
-  return request<DocInfo[]>(`/kb/documents?workspace=${encodeURIComponent(workspace)}`)
+export function listDocuments(workspace = DEFAULT_WORKSPACE, signal?: AbortSignal) {
+  return request<DocInfo[]>(`/kb/documents?workspace=${encodeURIComponent(workspace)}`, { signal })
 }
 
 export interface GraphDeleteResiduals {
@@ -363,12 +439,12 @@ export interface IndexTask {
   updated_at: string
 }
 
-export function getIndexTask(taskId: string) {
-  return request<IndexTask>(`/kb/index-tasks/${taskId}`)
+export function getIndexTask(taskId: string, signal?: AbortSignal) {
+  return request<IndexTask>(`/kb/index-tasks/${taskId}`, { signal })
 }
 
-export function listIndexTasks() {
-  return request<IndexTask[]>('/kb/index-tasks')
+export function listIndexTasks(signal?: AbortSignal) {
+  return request<IndexTask[]>('/kb/index-tasks', { signal })
 }
 
 export function cancelIndexTask(taskId: string) {
@@ -428,10 +504,11 @@ export function recallTest(params: {
   top_k: number
   chunk_top_k: number
   enable_rerank: boolean
-}) {
+}, signal?: AbortSignal) {
   return request<RecallTestResponse>('/recall/test', {
     method: 'POST',
     body: JSON.stringify(params),
+    signal,
   })
 }
 
@@ -440,10 +517,11 @@ export function textRecallTest(params: {
   query: string
   top_k: number
   enable_rerank: boolean
-}) {
+}, signal?: AbortSignal) {
   return request<TextRecallResponse>('/recall/text', {
     method: 'POST',
     body: JSON.stringify(params),
+    signal,
   })
 }
 
@@ -468,8 +546,8 @@ export function search(params: {
 
 // --- Models ---
 
-export function getModelConfig(workspace = DEFAULT_WORKSPACE) {
-  return request<ModelConfig>(`/models/config?workspace=${encodeURIComponent(workspace)}`)
+export function getModelConfig(workspace = DEFAULT_WORKSPACE, signal?: AbortSignal) {
+  return request<ModelConfig>(`/models/config?workspace=${encodeURIComponent(workspace)}`, { signal })
 }
 
 export function updateModelConfig(config: ModelConfig, workspace = DEFAULT_WORKSPACE) {
@@ -482,8 +560,8 @@ export function updateModelConfig(config: ModelConfig, workspace = DEFAULT_WORKS
   )
 }
 
-export function listPromptTemplates() {
-  return request<PromptTemplate[]>('/prompt-templates')
+export function listPromptTemplates(signal?: AbortSignal) {
+  return request<PromptTemplate[]>('/prompt-templates', { signal })
 }
 
 export function createPromptTemplate(template: Pick<PromptTemplate, 'name' | 'description' | 'content'>) {
@@ -562,8 +640,8 @@ export function backfillDocumentGraph(params: {
   })
 }
 
-export function listModelProfiles() {
-  return request<ModelProfile[]>('/model-profiles')
+export function listModelProfiles(signal?: AbortSignal) {
+  return request<ModelProfile[]>('/model-profiles', { signal })
 }
 
 export function saveModelProfile(profile: {
@@ -599,8 +677,8 @@ export function discoverProfileModels(profileId: string) {
   })
 }
 
-export function getModelBindings() {
-  return request<ModelBindings>('/model-bindings')
+export function getModelBindings(signal?: AbortSignal) {
+  return request<ModelBindings>('/model-bindings', { signal })
 }
 
 export function updateModelBindings(bindings: ModelBindings) {
@@ -659,10 +737,11 @@ export interface SystemStats {
   workspace?: string
   lightrag_dir?: string
   lightrag_dir_size?: string
+  effective_config_path?: string
 }
 
-export function getSystemStats(workspace = DEFAULT_WORKSPACE) {
-  return request<SystemStats>(`/system/stats?workspace=${encodeURIComponent(workspace)}`)
+export function getSystemStats(workspace = DEFAULT_WORKSPACE, signal?: AbortSignal) {
+  return request<SystemStats>(`/system/stats?workspace=${encodeURIComponent(workspace)}`, { signal })
 }
 
 export interface SystemLogItem {
@@ -761,8 +840,8 @@ export interface GraphData {
   }
 }
 
-export function getGraph(limit = 200, workspace = DEFAULT_WORKSPACE) {
-  return request<GraphData>(`/graph?limit=${limit}&workspace=${encodeURIComponent(workspace)}`)
+export function getGraph(limit = 200, workspace = DEFAULT_WORKSPACE, signal?: AbortSignal) {
+  return request<GraphData>(`/graph?limit=${limit}&workspace=${encodeURIComponent(workspace)}`, { signal })
 }
 
 export interface GraphGovernanceConfig {
@@ -835,15 +914,17 @@ export interface GraphChange {
   target_entity_data?: Record<string, unknown>
 }
 
-export function getGraphGovernanceConfig(workspace = DEFAULT_WORKSPACE) {
+export function getGraphGovernanceConfig(workspace = DEFAULT_WORKSPACE, signal?: AbortSignal) {
   return request<GraphGovernanceConfig>(
     `/graph/governance/config?workspace=${encodeURIComponent(workspace)}`,
+    { signal },
   )
 }
 
-export function listGraphRuleTemplates(workspace = DEFAULT_WORKSPACE) {
+export function listGraphRuleTemplates(workspace = DEFAULT_WORKSPACE, signal?: AbortSignal) {
   return request<GraphRuleTemplate[]>(
     `/graph/rule-templates?workspace=${encodeURIComponent(workspace)}`,
+    { signal },
   )
 }
 
@@ -885,18 +966,15 @@ export function updateGraphGovernanceConfig(config: {
 }
 
 export function uploadGraphReference(file: File, workspace = DEFAULT_WORKSPACE) {
+  if (file.size > 2 * 1024 * 1024) {
+    return Promise.reject(new Error('图谱参考文件不能超过 2 MiB'))
+  }
   const form = new FormData()
   form.append('file', file)
-  return fetch(`${BASE}/graph/governance/references?workspace=${encodeURIComponent(workspace)}`, {
+  return apiFetch(`/graph/governance/references?workspace=${encodeURIComponent(workspace)}`, {
     method: 'POST',
     body: form,
-  }).then(async (r) => {
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({ detail: r.statusText }))
-      throw new Error(formatApiError(err, `HTTP ${r.status}`))
-    }
-    return r.json() as Promise<GraphReferenceFile>
-  })
+  }).then(parseApiResponse<GraphReferenceFile>)
 }
 
 export function deleteGraphReference(refId: string, workspace = DEFAULT_WORKSPACE) {
@@ -941,18 +1019,15 @@ export interface GraphImportHistoryItem {
 }
 
 export function previewGraphImport(file: File, workspace = DEFAULT_WORKSPACE) {
+  if (file.size > 2 * 1024 * 1024) {
+    return Promise.reject(new Error('图谱导入文件不能超过 2 MiB'))
+  }
   const form = new FormData()
   form.append('file', file)
-  return fetch(`${BASE}/graph/imports/preview?workspace=${encodeURIComponent(workspace)}`, {
+  return apiFetch(`/graph/imports/preview?workspace=${encodeURIComponent(workspace)}`, {
     method: 'POST',
     body: form,
-  }).then(async (r) => {
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({ detail: r.statusText }))
-      throw new Error(formatApiError(err, `HTTP ${r.status}`))
-    }
-    return r.json() as Promise<GraphImportPreview>
-  })
+  }).then(parseApiResponse<GraphImportPreview>)
 }
 
 export function confirmGraphImport(params: {
@@ -974,9 +1049,10 @@ export function confirmGraphImport(params: {
   })
 }
 
-export function listGraphImports(workspace = DEFAULT_WORKSPACE) {
+export function listGraphImports(workspace = DEFAULT_WORKSPACE, signal?: AbortSignal) {
   return request<GraphImportHistoryItem[]>(
     `/graph/imports?workspace=${encodeURIComponent(workspace)}`,
+    { signal },
   )
 }
 
@@ -1174,21 +1250,23 @@ export function chatSendStream(params: {
   chunk_top_k?: number
   enable_rerank?: boolean
   settings?: ChatSettings
-}): Promise<Response> {
-  return fetch(`${BASE}/chat/send/stream`, {
+}, signal?: AbortSignal): Promise<Response> {
+  return apiFetch('/chat/send/stream', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params),
+    signal,
   })
 }
 
-export function listChatSessions(workspace = DEFAULT_WORKSPACE) {
-  return request<ChatSessionListItem[]>(`/chat/sessions?workspace=${encodeURIComponent(workspace)}`)
+export function listChatSessions(workspace = DEFAULT_WORKSPACE, signal?: AbortSignal) {
+  return request<ChatSessionListItem[]>(`/chat/sessions?workspace=${encodeURIComponent(workspace)}`, { signal })
 }
 
-export function getChatSession(sessionId: string, workspace = DEFAULT_WORKSPACE) {
+export function getChatSession(sessionId: string, workspace = DEFAULT_WORKSPACE, signal?: AbortSignal) {
   return request<ChatSession>(
     `/chat/sessions/${encodeURIComponent(sessionId)}?workspace=${encodeURIComponent(workspace)}`,
+    { signal },
   )
 }
 

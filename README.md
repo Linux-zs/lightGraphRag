@@ -101,7 +101,10 @@ uv run lightgraphrag search --workspace my_kb "问题"
 uv run lightgraphrag rebuild --workspace my_kb --docs-dir D:\docs
 ```
 
-`rebuild` 只清理目标知识库，不会重建其他 workspace。
+`rebuild` 只处理目标知识库，不会重建其他 workspace。它会在 shadow workspace
+中完成全部索引和人工图谱回放，成功后再切换；失败时保留当前可用索引。
+指定 `--docs-dir` 时，目录中的文件集合和内容必须与该知识库已管理的上传文件一致，
+否则命令会拒绝执行并提示先运行 `ingest`。
 
 ## 七、配置
 
@@ -143,22 +146,32 @@ $env:LIGHTGRAPHRAG_UPLOAD_DIR="data/uploads"
 $env:LIGHTGRAPHRAG_RAW_TEXT_DIR="data/upload_text"
 $env:LIGHTGRAPHRAG_LOG_DIR="data/logs"
 $env:LIGHTGRAPHRAG_INDEX_DOC_TIMEOUT_SECONDS="180"
+$env:LIGHTGRAPHRAG_DOCUMENT_UPLOAD_MAX_BYTES="52428800"
+$env:LIGHTGRAPHRAG_GRAPH_UPLOAD_MAX_BYTES="2097152"
+$env:LIGHTGRAPHRAG_PARSED_TEXT_MAX_CHARS="5000000"
+$env:LIGHTGRAPHRAG_CORS_ORIGINS="http://localhost:5173,http://127.0.0.1:5173"
 ```
 
-远程访问 API 时必须设置访问令牌：
+部署或通过反向代理访问时必须设置访问令牌：
 
 ```powershell
 $env:LIGHTGRAPHRAG_APP_API_TOKEN="replace-with-a-random-token"
 uv run python -m src.app.cli server --host 0.0.0.0 --no-reload
 ```
 
-远程请求需要带请求头：
+一旦配置令牌，所有受保护 API（包括本机回环请求）都必须带请求头：
 
 ```text
 X-App-Token: replace-with-a-random-token
 ```
 
 模型连接建议通过前端“模型设置”维护。API Key 保存后不会回显，密钥文件位于 `data/secrets/`。
+网页首次收到 401/403 时会要求输入令牌，可选择保存在浏览器 `localStorage` 或仅保存在当前会话。
+反向代理必须保留 `X-App-Token` 请求头，并将浏览器来源加入
+`LIGHTGRAPHRAG_CORS_ORIGINS` 白名单。
+
+后端和 CLI 对同一 `data_dir` 使用独占运行锁，只允许一个后端进程或一个 CLI
+数据操作进程。不要使用多个 Uvicorn worker。
 
 ## 八、数据目录
 

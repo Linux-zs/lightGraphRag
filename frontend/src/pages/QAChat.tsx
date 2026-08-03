@@ -218,6 +218,10 @@ export default function QAChat({
   const inputRef = useRef<HTMLInputElement>(null)
   const streamingRef = useRef(false)
   const settingsSaveTimerRef = useRef<number | null>(null)
+  const streamAbortRef = useRef<AbortController | null>(null)
+  const sessionAbortRef = useRef<AbortController | null>(null)
+  const sessionRequestRef = useRef(0)
+  const sendRequestRef = useRef(0)
   const [copiedMsgIndex, setCopiedMsgIndex] = useState<number | null>(null)
 
   /** Tracks which citation is currently highlighted (after clicking a superscript). */
@@ -261,9 +265,14 @@ export default function QAChat({
   }, [])
 
   const loadActiveSession = useCallback(async (id: string) => {
+    sessionAbortRef.current?.abort()
+    const controller = new AbortController()
+    sessionAbortRef.current = controller
+    const requestId = ++sessionRequestRef.current
     setLoadingSession(true)
     try {
-      const data = await getChatSession(id, workspace)
+      const data = await getChatSession(id, workspace, controller.signal)
+      if (requestId !== sessionRequestRef.current || controller.signal.aborted) return
       setMessages(data.messages)
       setChatSettings(data.settings || DEFAULT_CHAT_SETTINGS)
       const restoredCitations: CitationMap = new Map()
@@ -282,18 +291,20 @@ export default function QAChat({
       setExpandedCitations(new Set())
       setExpandedEvidence(new Set())
     } catch {
+      if (controller.signal.aborted) return
       setMessages([])
     } finally {
-      setLoadingSession(false)
+      if (requestId === sessionRequestRef.current) setLoadingSession(false)
     }
   }, [workspace])
 
   useEffect(() => {
     let cancelled = false
+    const controller = new AbortController()
     Promise.all([
-      listModelProfiles(),
-      getModelBindings(),
-      getModelConfig(workspace),
+      listModelProfiles(controller.signal),
+      getModelBindings(controller.signal),
+      getModelConfig(workspace, controller.signal),
     ]).then(([profiles, bindings, config]) => {
       if (cancelled) return
       setModelProfiles(profiles)
@@ -317,15 +328,21 @@ export default function QAChat({
     })
     return () => {
       cancelled = true
+      controller.abort()
     }
   }, [workspace, activeId])
 
   useEffect(() => {
+    streamAbortRef.current?.abort()
     if (activeId) {
       loadActiveSession(activeId)
     } else {
       resetConversationState()
       setLoadingSession(false)
+    }
+    return () => {
+      sessionAbortRef.current?.abort()
+      streamAbortRef.current?.abort()
     }
   }, [activeId, loadActiveSession, resetConversationState])
 
@@ -455,6 +472,10 @@ export default function QAChat({
     setSending(true)
     setGenerationStatus('')
     streamingRef.current = true
+    streamAbortRef.current?.abort()
+    const controller = new AbortController()
+    streamAbortRef.current = controller
+    const sendRequestId = ++sendRequestRef.current
 
     const now = new Date().toISOString()
     const userMsg: ChatMessage = { role: 'user', content: text, timestamp: now }
@@ -471,7 +492,7 @@ export default function QAChat({
         workspace,
         message: text,
         settings: chatSettings,
-      })
+      }, controller.signal)
 
       if (!response.ok) {
         const err = await response.json().catch(() => ({ detail: '流式请求失败' }))
@@ -578,7 +599,7 @@ export default function QAChat({
               })
             } else if (eventType === 'error') {
               setGenerationStatus('')
-              fullContent = `[回答生成失败: ${data.error}]`
+              fullContent = data.content || fullContent || `[回答生成失败: ${data.detail || data.error}]`
               setMessages((prev) => {
                 const updated = [...prev]
                 if (updated[asstIdx]) {
@@ -593,6 +614,7 @@ export default function QAChat({
         }
       }
     } catch (e: unknown) {
+      if (controller.signal.aborted || sendRequestId !== sendRequestRef.current) return
       setGenerationStatus('')
       const errContent = `发送失败: ${(e as Error).message}`
       setMessages((prev) => {
@@ -603,9 +625,11 @@ export default function QAChat({
         return updated
       })
     } finally {
+      if (sendRequestId !== sendRequestRef.current) return
       streamingRef.current = false
       setSending(false)
       setGenerationStatus('')
+      if (controller.signal.aborted) return
 
       // Refresh sessions after streaming completes
       const finalSessionId = sessionIdFromStream || activeId

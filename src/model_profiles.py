@@ -392,17 +392,25 @@ def upsert_profile(payload: dict[str, Any], config: dict[str, Any] | None = None
     return _public_profile(profile, keys)
 
 
-def delete_profile(profile_id: str, config: dict[str, Any] | None = None) -> dict[str, str]:
+def delete_profile(profile_id: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    if profile_id == DEFAULT_PROFILE_ID:
+        raise ValueError("默认模型连接不能删除")
     store = _load_store(config)
+    if not any(item.get("id") == profile_id for item in store["profiles"]):
+        raise KeyError(profile_id)
     store["profiles"] = [item for item in store["profiles"] if item.get("id") != profile_id]
-    for binding in store["bindings"].values():
+    defaults = _default_store(config)["bindings"]
+    fallbacks: dict[str, dict[str, Any]] = {}
+    for purpose, binding in store["bindings"].items():
         if isinstance(binding, dict) and binding.get("profile_id") == profile_id:
-            binding["profile_id"] = DEFAULT_PROFILE_ID
+            fallback = dict(defaults[purpose])
+            store["bindings"][purpose] = fallback
+            fallbacks[purpose] = fallback
     keys = _load_keys(config)
     keys.pop(profile_id, None)
     _save_store(store, config)
     _save_keys(keys, config)
-    return {"deleted": profile_id}
+    return {"deleted": profile_id, "binding_fallbacks": fallbacks}
 
 
 def get_profile_with_key(profile_id: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -438,6 +446,7 @@ def get_runtime_model_config(config: dict[str, Any] | None = None) -> dict[str, 
     rerank = resolve("rerank")
     return {
         "chat": {
+            "profile_id": chat.get("profile_id") or chat.get("id", DEFAULT_PROFILE_ID),
             "base_url": chat.get("api_base", DEFAULT_BASE_URL),
             "api_key": chat.get("api_key", ""),
             "model": chat.get("model") or sf.get("chat_model", "Qwen/Qwen2.5-7B-Instruct"),
@@ -449,6 +458,7 @@ def get_runtime_model_config(config: dict[str, Any] | None = None) -> dict[str, 
             "timeout": sf.get("timeout", 90),
         },
         "kg": {
+            "profile_id": kg.get("profile_id") or kg.get("id", DEFAULT_PROFILE_ID),
             "base_url": kg.get("api_base", chat.get("api_base", DEFAULT_BASE_URL)),
             "api_key": kg.get("api_key", chat.get("api_key", "")),
             "model": kg.get("model") or chat.get("model") or sf.get("chat_model", "Qwen/Qwen2.5-7B-Instruct"),
@@ -460,6 +470,7 @@ def get_runtime_model_config(config: dict[str, Any] | None = None) -> dict[str, 
             "timeout": sf.get("kg_timeout", sf.get("timeout", 90)),
         },
         "embedding": {
+            "profile_id": embedding.get("profile_id") or embedding.get("id", DEFAULT_PROFILE_ID),
             "base_url": embedding.get("api_base", DEFAULT_BASE_URL),
             "api_key": embedding.get("api_key", ""),
             "model": embedding.get("model") or sf.get("embed_model", "BAAI/bge-large-zh-v1.5"),
@@ -468,6 +479,7 @@ def get_runtime_model_config(config: dict[str, Any] | None = None) -> dict[str, 
             "embed_max_tokens": int(embedding.get("embed_max_tokens") or sf.get("embed_max_tokens", 480)),
         },
         "rerank": {
+            "profile_id": rerank.get("profile_id") or rerank.get("id", DEFAULT_PROFILE_ID),
             "base_url": rerank.get("api_base", DEFAULT_BASE_URL),
             "api_key": rerank.get("api_key", ""),
             "model": rerank.get("model") or sf.get("rerank_model", "BAAI/bge-reranker-v2-m3"),
@@ -547,6 +559,7 @@ async def test_kg(profile_id: str, model: str, config: dict[str, Any] | None = N
         payload["response_format"] = {"type": "json_object"}
 
     model_name = (model or "").lower()
+    api_base = str(profile.get("api_base") or "").lower()
     hybrid_markers = (
         "qwen3",
         "glm-4.5",
@@ -558,11 +571,15 @@ async def test_kg(profile_id: str, model: str, config: dict[str, Any] | None = N
     )
     if (
         bool(cfg.get("lightrag", {}).get("disable_thinking", True))
-        and "instruct" not in model_name
-        and "coder" not in model_name
-        and any(marker in model_name for marker in hybrid_markers)
     ):
-        payload["enable_thinking"] = False
+        if "api.deepseek.com" in api_base and "deepseek" in model_name:
+            payload["thinking"] = {"type": "disabled"}
+        elif (
+            "instruct" not in model_name
+            and "coder" not in model_name
+            and any(marker in model_name for marker in hybrid_markers)
+        ):
+            payload["enable_thinking"] = False
 
     async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(

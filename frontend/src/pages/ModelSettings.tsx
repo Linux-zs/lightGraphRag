@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   discoverModels,
   discoverProfileModels,
@@ -97,6 +97,8 @@ interface Props {
 }
 
 export default function ModelSettings({ workspace }: Props) {
+  const loadRequestRef = useRef(0)
+  const loadAbortRef = useRef<AbortController | null>(null)
   const confirm = useConfirm()
   const [profiles, setProfiles] = useState<ModelProfile[]>([])
   const [promptTemplates, setPromptTemplates] = useState<PromptTemplate[]>([])
@@ -125,28 +127,37 @@ export default function ModelSettings({ workspace }: Props) {
   }, [profiles])
 
   const loadAll = async () => {
+    loadAbortRef.current?.abort()
+    const controller = new AbortController()
+    loadAbortRef.current = controller
+    const requestId = ++loadRequestRef.current
     setLoading(true)
     setMessage('')
     try {
       const [profileData, bindingData, modelConfig, templates] = await Promise.all([
-        listModelProfiles(),
-        getModelBindings(),
-        getModelConfig(workspace),
-        listPromptTemplates(),
+        listModelProfiles(controller.signal),
+        getModelBindings(controller.signal),
+        getModelConfig(workspace, controller.signal),
+        listPromptTemplates(controller.signal),
       ])
+      if (requestId !== loadRequestRef.current) return
       setProfiles(profileData)
       setBindings(bindingData)
       setConfig(modelConfig)
       setPromptTemplates(templates)
     } catch (e) {
+      if (requestId !== loadRequestRef.current) return
+      if (controller.signal.aborted) return
       setMessage(`加载失败: ${(e as Error).message}`)
     } finally {
-      setLoading(false)
+      if (requestId === loadRequestRef.current) setLoading(false)
     }
   }
 
   useEffect(() => {
+    loadRequestRef.current += 1
     loadAll()
+    return () => loadAbortRef.current?.abort()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspace])
 

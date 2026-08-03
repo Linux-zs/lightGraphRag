@@ -81,7 +81,7 @@ def test_missing_inline_citation_does_not_replace_good_answer(monkeypatch):
     assert answer == "这是模型组织后的正常回答，没有行内引用编号。"
 
 
-def test_incomplete_answer_is_retried_with_conservative_parameters(monkeypatch):
+def test_numeric_tail_is_not_retried_without_explicit_length_finish_reason(monkeypatch):
     calls = []
 
     class FakeBackend:
@@ -123,10 +123,8 @@ def test_incomplete_answer_is_retried_with_conservative_parameters(monkeypatch):
         )
     )
 
-    assert len(calls) == 2
-    assert calls[1]["temperature"] == 0.3
-    assert calls[1]["frequency_penalty"] == 0.0
-    assert answer.endswith("检查供应商状态。[1]")
+    assert len(calls) == 1
+    assert answer.endswith("### 排查步骤\n1")
 
 
 def test_role_marker_tail_is_removed_and_marked_incomplete():

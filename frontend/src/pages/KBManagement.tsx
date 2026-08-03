@@ -46,6 +46,26 @@ interface Props {
   onDeleteWorkspace: () => Promise<void>
 }
 
+export async function getIndexTaskWithRetry(
+  taskId: string,
+  signal?: AbortSignal,
+  attempts = 3,
+  wait: (milliseconds: number) => Promise<unknown> = (milliseconds) =>
+    new Promise((resolve) => setTimeout(resolve, milliseconds)),
+): Promise<IndexTask> {
+  let lastError: unknown
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await getIndexTask(taskId, signal)
+    } catch (error) {
+      lastError = error
+      if (signal?.aborted || attempt >= attempts) throw error
+      await wait(attempt * 500)
+    }
+  }
+  throw lastError
+}
+
 export default function KBManagement({
   workspace,
   isDefaultWorkspace,
@@ -103,6 +123,7 @@ export default function KBManagement({
   const mountedRef = useRef(true)
   const pollingTaskIdsRef = useRef<Set<string>>(new Set())
   const taskRunIdRef = useRef(0)
+  const requestAbortRef = useRef<AbortController | null>(null)
 
   const isTaskTerminal = (task: IndexTask) =>
     ['succeeded', 'failed', 'partial', 'cancelled'].includes(task.status)
@@ -117,20 +138,26 @@ export default function KBManagement({
       return getIndexTask(taskId)
     }
     pollingTaskIdsRef.current.add(taskId)
-    let finalTask = await getIndexTask(taskId)
     try {
+      let finalTask = await getIndexTaskWithRetry(
+        taskId,
+        requestAbortRef.current?.signal,
+      )
       if (!mountedRef.current || taskRunIdRef.current !== runId) return finalTask
       onUpdate(finalTask)
       while (!isTaskTerminal(finalTask)) {
         await new Promise((resolve) => setTimeout(resolve, 1500))
-        finalTask = await getIndexTask(taskId)
+        finalTask = await getIndexTaskWithRetry(
+          taskId,
+          requestAbortRef.current?.signal,
+        )
         if (!mountedRef.current || taskRunIdRef.current !== runId) return finalTask
         onUpdate(finalTask)
-        loadDocs()
+        await loadDocs(runId, requestAbortRef.current?.signal)
       }
       if (mountedRef.current && taskRunIdRef.current === runId) {
         onDone?.(finalTask)
-        loadDocs()
+        await loadDocs(runId, requestAbortRef.current?.signal)
       }
       return finalTask
     } finally {
@@ -321,7 +348,7 @@ export default function KBManagement({
       const data = await uploadDocument(file, workspace)
       setUploaded(data)
       if (data.index_invalidated) {
-        setIndexMsg('同名文档内容已更新，旧索引已移除，请重新预览并确认索引。')
+        setIndexMsg('同名文档内容已更新，旧索引仍可查询；请重新预览并确认索引以切换到新内容。')
       }
     } finally {
       setUploading(false)
@@ -360,7 +387,7 @@ export default function KBManagement({
     } else {
       setBatchMsg(
         `批量上传完成：成功 ${total}/${total}` +
-        (invalidatedCount > 0 ? `，其中 ${invalidatedCount} 个同名文档的旧索引已移除，需重新索引` : ''),
+        (invalidatedCount > 0 ? `，其中 ${invalidatedCount} 个同名文档已标记待重索引，旧索引仍可查询` : ''),
       )
     }
     setUploading(false)
@@ -427,18 +454,27 @@ export default function KBManagement({
     }
   }
 
-  const loadDocs = async () => {
+  const loadDocs = async (
+    runId = taskRunIdRef.current,
+    signal = requestAbortRef.current?.signal,
+  ) => {
     try {
-      const data = await listDocuments(workspace)
+      const data = await listDocuments(workspace, signal)
+      if (!mountedRef.current || taskRunIdRef.current !== runId) return
       setDocs(data)
     } catch {/* ignore */}
   }
 
-  const loadGraphRule = async () => {
+  const loadGraphRule = async (
+    runId = taskRunIdRef.current,
+    signal = requestAbortRef.current?.signal,
+  ) => {
     try {
-      const data = await getGraphGovernanceConfig(workspace)
+      const data = await getGraphGovernanceConfig(workspace, signal)
+      if (!mountedRef.current || taskRunIdRef.current !== runId) return
       setGraphRule(data)
     } catch {
+      if (!mountedRef.current || taskRunIdRef.current !== runId || signal?.aborted) return
       setGraphRule(null)
     }
   }
@@ -757,7 +793,7 @@ export default function KBManagement({
     setRawTextMsg('')
     try {
       const data = await updateDocumentRawText(rawTextDocName, rawTextContent, workspace)
-      setRawTextMsg(`已保存 (${data.char_count} 字符)，旧索引已移除，请重新预览并索引`)
+      setRawTextMsg(`已保存 (${data.char_count} 字符)，旧索引仍可查询；请重新预览并索引以切换到新内容`)
       await loadDocs()
     } catch (e: unknown) {
       setRawTextMsg(`保存失败: ${(e as Error).message}`)
@@ -785,6 +821,9 @@ export default function KBManagement({
 
   useEffect(() => {
     mountedRef.current = true
+    requestAbortRef.current?.abort()
+    const controller = new AbortController()
+    requestAbortRef.current = controller
     const runId = taskRunIdRef.current + 1
     taskRunIdRef.current = runId
     pollingTaskIdsRef.current.clear()
@@ -795,10 +834,22 @@ export default function KBManagement({
     setIndexMsg('')
     setBatchMsg('')
     setWorkspaceDeleteError('')
-    loadDocs()
-    loadGraphRule()
-    restoreIndexTasks(runId)
+    setUploaded(null)
+    setChunks([])
+    setCheckedDocs(new Set())
+    setPreviewError('')
+    setRawTextModalOpen(false)
+    setRawTextContent('')
+    setRawTextDocName('')
+    setRawTextMsg('')
+    setChunkModalOpen(false)
+    setChunkModalDocName('')
+    setChunkList([])
+    void loadDocs(runId, controller.signal)
+    void loadGraphRule()
+    void restoreIndexTasks(runId)
     return () => {
+      controller.abort()
       mountedRef.current = false
       taskRunIdRef.current += 1
       pollingTaskIdsRef.current.clear()
@@ -1101,7 +1152,7 @@ export default function KBManagement({
           <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide">
             文档清单
           </h3>
-          <button onClick={loadDocs} className="text-xs text-primary-500 hover:text-primary-700">
+          <button onClick={() => void loadDocs()} className="text-xs text-primary-500 hover:text-primary-700">
             刷新
           </button>
         </div>
@@ -1230,16 +1281,22 @@ export default function KBManagement({
                     </td>
                     <td className="py-2.5">
                       <span
-                        title={(doc as DocInfo & { error_msg?: string }).error_msg || ''}
+                        title={doc.last_index_error || doc.error_msg || (
+                          doc.index_stale ? '当前展示的索引仍可查询，但原文已有更新，需重新索引。' : ''
+                        )}
                         className={`text-xs px-2 py-0.5 rounded ${
-                          doc.status === 'failed'
+                          doc.index_stale
+                            ? 'bg-amber-50 text-amber-700'
+                            : doc.status === 'failed'
                             ? 'bg-red-50 text-red-700'
                             : doc.indexed
                               ? 'bg-green-50 text-green-700'
                               : 'bg-gray-100 text-gray-600'
                         }`}
                       >
-                        {doc.status || (doc.indexed ? 'indexed' : 'uploaded')}
+                        {doc.index_stale
+                          ? '待重索引'
+                          : (doc.status || (doc.indexed ? 'indexed' : 'uploaded'))}
                       </span>
                     </td>
                     <td className="py-2.5">

@@ -14,29 +14,38 @@ import tempfile
 import time
 import uuid
 from collections import deque
+from copy import deepcopy
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 import uvicorn
 import yaml
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
+from starlette.background import BackgroundTask
 
-from src.config_loader import get_config, reset_config
+from src.config_loader import (
+    get_config,
+    get_effective_write_config_path,
+    reset_config,
+)
 from src.doc_processor.chunker import TextChunker
 from src.doc_processor.loader import DocumentLoader
 from src.doc_processor.parsers.base_parser import Document
+from src.exceptions import ManifestCorruptedError
 from src.llm_backend.siliconflow import SiliconFlowBackend
 from src.lightrag_service import (
     DEFAULT_WORKSPACE,
     GRAPH_CATEGORY_MAP,
+    LightRAGService,
     get_lightrag_service,
-    reset_lightrag_service,
+    reset_lightrag_service_async,
     sanitize_workspace,
 )
 from src.model_profiles import (
@@ -53,12 +62,15 @@ from src.model_profiles import (
     test_rerank,
     upsert_profile,
 )
+from src.runtime_lock import RuntimeLock
 
 # --- App Setup ---
 
 
 @asynccontextmanager
 async def _app_lifespan(_: FastAPI):
+    data_dir = Path(get_config().get("paths", {}).get("data_dir", "./data"))
+    runtime_lock = RuntimeLock(data_dir / ".runtime.lock").acquire()
     workspace_migration = _migrate_legacy_default_workspace()
     if workspace_migration.get("migrated"):
         logger.info(
@@ -75,24 +87,54 @@ async def _app_lifespan(_: FastAPI):
     renamed_sessions = _backfill_legacy_session_titles()
     if renamed_sessions:
         logger.info("Backfilled {} legacy chat session titles", renamed_sessions)
-    repaired_answers = _repair_degenerate_session_answers()
-    if repaired_answers:
-        logger.info("Repaired {} degenerate assistant answers", repaired_answers)
-    await _resume_persisted_index_tasks()
-    yield
+    try:
+        await _resume_persisted_index_tasks()
+        yield
+    finally:
+        tasks = list(_background_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await reset_lightrag_service_async()
+        runtime_lock.release()
 
 
 app = FastAPI(title="Knowledge Base Workbench", version="2.0.0", lifespan=_app_lifespan)
 
+_cors_origins = [
+    value.strip()
+    for value in os.environ.get(
+        "LIGHTGRAPHRAG_CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if value.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 APP_API_TOKEN = os.environ.get("LIGHTGRAPHRAG_APP_API_TOKEN", "").strip()
+_background_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _spawn_background(coro: Any) -> asyncio.Task[Any]:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+def _error_payload(request: Request, code: str, detail: Any) -> dict[str, Any]:
+    return {
+        "code": code,
+        "detail": detail,
+        "request_id": getattr(request.state, "request_id", ""),
+    }
 
 
 def _is_loopback_client(host: str | None) -> bool:
@@ -108,18 +150,93 @@ def _is_loopback_client(host: str | None) -> bool:
 
 @app.middleware("http")
 async def require_remote_api_token(request: Request, call_next):
-    """Keep local desktop use frictionless and protect explicitly remote binds."""
-    client_host = request.client.host if request.client else None
-    if not _is_loopback_client(client_host):
+    """Require the configured application token regardless of proxy topology."""
+    request.state.request_id = request.headers.get("X-Request-ID", "").strip() or uuid.uuid4().hex[:12]
+    if APP_API_TOKEN and request.url.path.startswith("/api") and request.url.path != "/api/health":
         provided = request.headers.get("X-App-Token", "").strip()
-        if not APP_API_TOKEN or not hmac.compare_digest(provided, APP_API_TOKEN):
+        if not provided:
+            return JSONResponse(
+                status_code=401,
+                content=_error_payload(
+                    request,
+                    "AUTH_REQUIRED",
+                    "API access requires X-App-Token",
+                ),
+                headers={"X-Request-ID": request.state.request_id},
+            )
+        if not hmac.compare_digest(provided, APP_API_TOKEN):
             return JSONResponse(
                 status_code=403,
-                content={"detail": "Remote API access requires a valid X-App-Token"},
+                content=_error_payload(request, "AUTH_FORBIDDEN", "Invalid X-App-Token"),
+                headers={"X-Request-ID": request.state.request_id},
             )
-    return await call_next(request)
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request.state.request_id
+    return response
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "default.yaml"
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    code = "HTTP_ERROR"
+    if isinstance(detail, dict):
+        code = str(detail.get("code") or code)
+        detail = detail.get("detail", detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_error_payload(request, code, detail),
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content=_error_payload(request, "VALIDATION_ERROR", exc.errors()),
+    )
+
+
+@app.exception_handler(ValueError)
+async def _value_exception_handler(request: Request, exc: ValueError):
+    return JSONResponse(
+        status_code=422,
+        content=_error_payload(request, "VALIDATION_ERROR", str(exc)),
+    )
+
+
+@app.exception_handler(ManifestCorruptedError)
+async def _manifest_exception_handler(request: Request, exc: ManifestCorruptedError):
+    logger.error(
+        "Manifest access failed request_id={} path={} error={}",
+        request.state.request_id,
+        request.url.path,
+        exc,
+    )
+    return JSONResponse(
+        status_code=500,
+        content=_error_payload(request, "MANIFEST_CORRUPTED", str(exc)),
+    )
+
+
+@app.exception_handler(Exception)
+async def _unexpected_exception_handler(request: Request, exc: Exception):
+    logger.exception(
+        "Unhandled API error request_id={} path={}",
+        request.state.request_id,
+        request.url.path,
+    )
+    return JSONResponse(
+        status_code=500,
+        content=_error_payload(
+            request,
+            "INTERNAL_ERROR",
+            "服务器内部错误，请使用 request_id 查询日志",
+        ),
+    )
+
+
+CONFIG_PATH = get_effective_write_config_path()
 UPLOAD_DIR = Path(os.environ.get("LIGHTGRAPHRAG_UPLOAD_DIR", "data/uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 RAW_TEXT_DIR = Path(os.environ.get("LIGHTGRAPHRAG_RAW_TEXT_DIR", "data/upload_text"))
@@ -135,6 +252,15 @@ INDEX_TASKS_DIR = Path(os.environ.get("LIGHTGRAPHRAG_INDEX_TASKS_DIR", "data/ind
 LOG_DIR = Path(os.environ.get("LIGHTGRAPHRAG_LOG_DIR", "data/logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 APP_LOG_PATH = LOG_DIR / "app.log"
+DOCUMENT_UPLOAD_MAX_BYTES = int(
+    os.environ.get("LIGHTGRAPHRAG_DOCUMENT_UPLOAD_MAX_BYTES", str(50 * 1024 * 1024))
+)
+GRAPH_UPLOAD_MAX_BYTES = int(
+    os.environ.get("LIGHTGRAPHRAG_GRAPH_UPLOAD_MAX_BYTES", str(2 * 1024 * 1024))
+)
+PARSED_TEXT_MAX_CHARS = int(
+    os.environ.get("LIGHTGRAPHRAG_PARSED_TEXT_MAX_CHARS", "5000000")
+)
 logger.add(
     APP_LOG_PATH,
     level="INFO",
@@ -183,6 +309,54 @@ def _atomic_write_text(path: Path, content: str) -> None:
         except OSError:
             pass
         raise
+
+
+async def _stream_upload_to_file(
+    upload: UploadFile,
+    destination: Path,
+    *,
+    max_bytes: int,
+) -> int:
+    total = 0
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as stream:
+        while True:
+            chunk = await upload.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise HTTPException(
+                    413,
+                    {
+                        "code": "UPLOAD_TOO_LARGE",
+                        "detail": f"Upload exceeds the {max_bytes} byte limit",
+                    },
+                )
+            stream.write(chunk)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return total
+
+
+async def _read_upload_bytes(upload: UploadFile, *, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(256 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                413,
+                {
+                    "code": "UPLOAD_TOO_LARGE",
+                    "detail": f"Upload exceeds the {max_bytes} byte limit",
+                },
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _migrate_legacy_default_workspace() -> dict[str, Any]:
@@ -661,8 +835,11 @@ def _default_chunk_overlap() -> int:
 
 # --- Pydantic Models ---
 
+WorkspaceName = Annotated[str, BeforeValidator(sanitize_workspace)]
+
+
 class ChunkPreviewRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     file_name: str
     separators: list[str] = Field(default_factory=_default_index_separators)
     chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
@@ -674,7 +851,7 @@ class ChunkPreviewItem(BaseModel):
     char_count: int
 
 class IndexRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     file_name: str
     separators: list[str] = Field(default_factory=_default_index_separators)
     chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
@@ -684,7 +861,7 @@ class IndexRequest(BaseModel):
     kg_max_records: int = Field(default=48, ge=1, le=400)
 
 class RecallTestRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     query: str = Field(min_length=1, max_length=20000)
     mode: str = Field(default="mix", pattern=r"^(mix|hybrid|local|global|naive)$")
     top_k: int = Field(default=40, ge=1, le=100)
@@ -709,7 +886,7 @@ class RecallTestResponse(BaseModel):
 
 
 class TextRecallRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     query: str = Field(min_length=1, max_length=20000)
     top_k: int = Field(default=20, ge=1, le=100)
     enable_rerank: bool = True
@@ -738,7 +915,7 @@ class TextRecallResponse(BaseModel):
 
 
 class ModelConfig(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     embed_model: str = "BAAI/bge-large-zh-v1.5"
     embed_base_url: str = "https://api.siliconflow.cn/v1"
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
@@ -750,6 +927,7 @@ class ModelConfig(BaseModel):
     presence_penalty: float = Field(default=0.2, ge=-2, le=2)
     answer_prompt_template_id: str = DEFAULT_PROMPT_TEMPLATE_ID
     answer_system_prompt: str = DEFAULT_ANSWER_SYSTEM_PROMPT
+    effective_config_path: str = ""
 
 
 class PromptTemplateRequest(BaseModel):
@@ -779,11 +957,29 @@ class ModelCapabilityTestRequest(BaseModel):
     profile_id: str
     model: str
 
+class ModelBindingBase(BaseModel):
+    profile_id: str = Field(min_length=1, max_length=120)
+    model: str = Field(min_length=1, max_length=300)
+
+class EmbeddingBinding(ModelBindingBase):
+    embed_dim: int = Field(ge=1, le=65536)
+    embed_max_chars: int = Field(default=480, ge=32, le=100000)
+    embed_max_tokens: int = Field(default=480, ge=32, le=100000)
+
+class RerankBinding(ModelBindingBase):
+    enabled: bool = True
+
+class ModelBindingsPayload(BaseModel):
+    chat: ModelBindingBase
+    kg: ModelBindingBase
+    embedding: EmbeddingBinding
+    rerank: RerankBinding
+
 class ModelBindingsUpdate(BaseModel):
-    bindings: dict[str, Any]
+    bindings: ModelBindingsPayload
 
 class SearchRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     query: str = Field(min_length=1, max_length=20000)
     mode: str = Field(default="mix", pattern=r"^(mix|hybrid|local|global|naive)$")
     top_k: int = Field(default=40, ge=1, le=100)
@@ -816,7 +1012,7 @@ class ChatSettings(BaseModel):
 
 class ChatSendRequest(BaseModel):
     session_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{12}$")
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     message: str = Field(min_length=1, max_length=20000)
     mode: str = Field(default="mix", pattern=r"^(mix|hybrid|local|global|naive)$")
     top_k: int = Field(default=40, ge=1, le=100)
@@ -871,7 +1067,7 @@ class GraphGovernanceConfig(BaseModel):
     audit_log: list[dict[str, Any]] = []
 
 class GraphGovernanceUpdate(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     rule_template_id: str = ""
     rule_template_name: str = ""
     extraction_mode: str = "assist"
@@ -894,11 +1090,11 @@ class GraphRuleTemplate(BaseModel):
     updated_at: str = ""
 
 class GraphRuleTemplateApplyRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     template_id: str
 
 class GraphEntityCreateRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     entity_name: str
     entity_type: str = "entity"
     description: str = ""
@@ -906,14 +1102,14 @@ class GraphEntityCreateRequest(BaseModel):
     file_path: str = ""
 
 class GraphEntityUpdateRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     entity_name: str
     updated_data: dict[str, Any]
     allow_rename: bool = True
     allow_merge: bool = False
 
 class GraphRelationCreateRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     source_entity: str
     target_entity: str
     description: str = ""
@@ -923,18 +1119,18 @@ class GraphRelationCreateRequest(BaseModel):
     file_path: str = ""
 
 class GraphRelationUpdateRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     source_entity: str
     target_entity: str
     updated_data: dict[str, Any]
 
 class GraphRelationDeleteRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     source_entity: str
     target_entity: str
 
 class GraphEntityMergeRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     source_entities: list[str]
     target_entity: str
     target_entity_data: dict[str, Any] = {}
@@ -952,7 +1148,7 @@ class GraphChange(BaseModel):
     target_entity_data: dict[str, Any] = {}
 
 class GraphSuggestRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     instruction: str
     limit: int = Field(default=120, ge=10, le=500)
 
@@ -961,7 +1157,7 @@ class GraphSuggestResponse(BaseModel):
     raw_text: str = ""
 
 class GraphApplyChangesRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     changes: list[GraphChange]
 
 class GraphImportEntity(BaseModel):
@@ -988,7 +1184,7 @@ class GraphImportPreviewResponse(BaseModel):
     used_model: bool = False
 
 class GraphImportConfirmRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     file_name: str
     source_text: str = Field(min_length=1, max_length=200000)
     entities: list[GraphImportEntity] = []
@@ -1082,41 +1278,6 @@ def _backfill_legacy_session_titles() -> int:
     return renamed
 
 
-def _repair_degenerate_session_answers() -> int:
-    """Replace previously persisted model-noise answers with citation-backed text."""
-    repaired = 0
-    for path in SESSIONS_DIR.glob("*.json"):
-        if not _SESSION_ID_RE.fullmatch(path.stem.lower()):
-            continue
-        session = _load_session(path.stem)
-        if not session:
-            continue
-        changed = False
-        last_question = ""
-        for message in session.get("messages", []):
-            if message.get("role") == "user":
-                last_question = str(message.get("content") or "")
-                continue
-            if message.get("role") != "assistant":
-                continue
-            content = str(message.get("content") or "")
-            if _is_bad_generated_answer(content):
-                salvaged, remaining = _salvage_generated_answer(content)
-                message["content"] = (
-                    salvaged
-                    if salvaged and not remaining
-                    else _fallback_answer_from_citations(
-                        last_question,
-                        message.get("citations") or [],
-                    )
-                )
-                repaired += 1
-                changed = True
-        if changed:
-            _save_session(path.stem, session)
-    return repaired
-
-
 def _default_chat_settings() -> ChatSettings:
     runtime = get_runtime_model_config(get_config())["chat"]
     binding = get_bindings(get_config()).get("chat", {})
@@ -1192,6 +1353,8 @@ def _answer_runtime(settings: ChatSettings) -> dict[str, Any]:
 # Per-session locks serializing read-modify-write of a session's JSON file so
 # that concurrent requests on the same session cannot overwrite each other.
 _session_locks: dict[str, asyncio.Lock] = {}
+_session_turn_locks: dict[str, asyncio.Lock] = {}
+_session_turn_lock_refs: dict[str, int] = {}
 _workspace_rag_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -1202,6 +1365,51 @@ def _get_session_lock(session_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _session_locks[session_id] = lock
     return lock
+
+
+def _get_session_turn_lock(session_id: str) -> asyncio.Lock:
+    lock = _session_turn_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _session_turn_locks[session_id] = lock
+    return lock
+
+
+async def _acquire_session_turn_lock(session_id: str) -> asyncio.Lock:
+    lock = _get_session_turn_lock(session_id)
+    _session_turn_lock_refs[session_id] = _session_turn_lock_refs.get(session_id, 0) + 1
+    try:
+        await lock.acquire()
+    except BaseException:
+        _release_session_turn_lock(session_id, lock, acquired=False)
+        raise
+    return lock
+
+
+def _release_session_turn_lock(
+    session_id: str,
+    lock: asyncio.Lock,
+    *,
+    acquired: bool = True,
+) -> None:
+    if acquired and lock.locked():
+        lock.release()
+    remaining = max(0, _session_turn_lock_refs.get(session_id, 1) - 1)
+    if remaining:
+        _session_turn_lock_refs[session_id] = remaining
+    else:
+        _session_turn_lock_refs.pop(session_id, None)
+        if not lock.locked():
+            _session_turn_locks.pop(session_id, None)
+
+
+@asynccontextmanager
+async def _session_turn(session_id: str):
+    lock = await _acquire_session_turn_lock(session_id)
+    try:
+        yield
+    finally:
+        _release_session_turn_lock(session_id, lock)
 
 
 def _get_workspace_rag_lock(workspace: str) -> asyncio.Lock:
@@ -1533,17 +1741,19 @@ def _generated_answer_quality_issues(text: str) -> list[str]:
     if re.search(r"(?:^|\s)(?:[1DzZ])(?:\s+(?:[1DzZ])){12,}(?:\s|$)", compact):
         issues.append("repeated_noise_tokens")
 
-    numeric_noise_lines = [
+    numeric_like_lines = [
         line.strip()
         for line in text.splitlines()
         if line.strip() and re.fullmatch(r"[0-9iIlL| ]+", line.strip())
     ]
-    if any(len(re.sub(r"\s+", "", line)) >= 4 for line in numeric_noise_lines):
-        issues.append("numeric_noise_line")
-    elif len(numeric_noise_lines) >= 3:
-        issues.append("multiple_numeric_noise_lines")
-    elif any(re.fullmatch(r"\d{1,3}", line) for line in numeric_noise_lines):
-        issues.append("bare_numeric_line")
+    suspicious_numeric_lines = [
+        line
+        for line in numeric_like_lines
+        if re.search(r"[iIlL|]", line)
+        or re.fullmatch(r"(\d)\1{4,}", re.sub(r"\s+", "", line))
+    ]
+    if len(numeric_like_lines) >= 3 and suspicious_numeric_lines:
+        issues.append("numeric_noise_loop")
 
     tokens = re.findall(r"\S+", text)
     isolated_noise = re.findall(r"(?<![\w])(?:D|z|Z|1)(?![\w])", text)
@@ -1558,12 +1768,6 @@ def _generated_answer_quality_issues(text: str) -> list[str]:
     ]
     if any(headings.count(heading) >= 3 for heading in set(headings)):
         issues.append("repeated_heading")
-    if text.count("```") % 2 == 1:
-        issues.append("unclosed_code_fence")
-    tail = text.rstrip()
-    if re.search(r"(?:^|\n)\s*(?:#{1,6}\s+[^\n]+|\d+[.、)]?|[-*+])\s*$", tail):
-        issues.append("incomplete_tail")
-
     return list(dict.fromkeys(issues))
 
 
@@ -1578,22 +1782,16 @@ def _salvage_generated_answer(text: str) -> tuple[str, list[str]]:
     if not issues:
         return text, []
 
-    has_numeric_noise = any(
-        "numeric_noise" in issue or issue == "bare_numeric_line"
-        for issue in issues
-    )
     cleaned_lines: list[str] = []
+    remove_numeric_loop = "numeric_noise_loop" in issues
     for line in text.splitlines():
-        stripped = line.strip()
-        if has_numeric_noise and stripped and re.fullmatch(r"[0-9iIlL| ]+", stripped):
+        if remove_numeric_loop and line.strip() and re.fullmatch(r"[0-9iIlL| ]+", line.strip()):
             continue
         if re.fullmatch(r"\s*#{1,6}\s*", line):
             continue
         cleaned_lines.append(line)
 
     cleaned = "\n".join(cleaned_lines).strip()
-    if cleaned.count("```") % 2 == 1:
-        cleaned = f"{cleaned}\n```"
     cleaned = _strip_lightrag_noise(_strip_citation_section(cleaned))
     return cleaned, _generated_answer_quality_issues(cleaned)
 
@@ -2173,7 +2371,7 @@ _index_tasks: dict[str, dict[str, Any]] = _load_persisted_index_tasks()
 
 
 class WorkspaceCreateRequest(BaseModel):
-    workspace: str
+    workspace: WorkspaceName
     rule_template_id: str = "general_knowledge"
     extraction_mode: Literal["assist", "enhanced", "strict"] = "enhanced"
     allow_other_entity_type: bool = False
@@ -2263,6 +2461,53 @@ def _normalize_stage_timings(value: Any) -> dict[str, float]:
     return timings
 
 
+def _index_model_snapshot(runtime_models: dict[str, Any]) -> dict[str, Any]:
+    return {
+        purpose: {
+            key: value
+            for key, value in runtime_models.get(purpose, {}).items()
+            if key in {
+                "profile_id",
+                "base_url",
+                "model",
+                "embed_dim",
+                "embed_max_chars",
+                "embed_max_tokens",
+                "enabled",
+            }
+        }
+        for purpose in ("embedding", "kg", "rerank")
+    }
+
+
+def _assert_task_model_snapshot(
+    task: dict[str, Any],
+    service: LightRAGService,
+) -> None:
+    expected = task.get("model_snapshot") or {}
+    if not expected:
+        return
+    actual = _index_model_snapshot(service._runtime_models())
+    comparable_actual = {
+        purpose: {
+            key: actual.get(purpose, {}).get(key)
+            for key in values
+        }
+        for purpose, values in expected.items()
+        if isinstance(values, dict)
+    }
+    normalized_expected = deepcopy(expected)
+    for snapshot in (comparable_actual, normalized_expected):
+        for values in snapshot.values():
+            if isinstance(values, dict) and "base_url" in values:
+                values["base_url"] = str(values.get("base_url") or "").rstrip("/")
+    if comparable_actual != normalized_expected:
+        raise RuntimeError(
+            "索引任务创建后模型配置已发生变化；为避免混用嵌入维度或 KG 模型，"
+            "该任务已停止，请重新创建索引任务。"
+        )
+
+
 async def _create_index_task(
     kind: str,
     doc_names: list[str],
@@ -2270,6 +2515,8 @@ async def _create_index_task(
     request_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     workspace = sanitize_workspace(workspace)
+    runtime_models = get_runtime_model_config(get_config())
+    model_snapshot = _index_model_snapshot(runtime_models)
     task_id = uuid.uuid4().hex[:12]
     now = _task_now()
     task = {
@@ -2293,6 +2540,7 @@ async def _create_index_task(
         "cancel_requested": False,
         "phase": "created",
         "request": request_config or {},
+        "model_snapshot": model_snapshot,
         "created_at": now,
         "updated_at": now,
     }
@@ -2428,6 +2676,27 @@ def _active_workspace_rebuild(workspace: str) -> dict[str, Any] | None:
     )
 
 
+def _active_model_tasks() -> list[dict[str, Any]]:
+    return [
+        task
+        for task in _index_tasks.values()
+        if task.get("status") in {"queued", "running"}
+    ]
+
+
+def _ensure_model_config_mutable() -> None:
+    active = _active_model_tasks()
+    if active:
+        task_ids = ", ".join(str(item.get("task_id")) for item in active[:5])
+        raise HTTPException(
+            409,
+            {
+                "code": "MODEL_CONFIG_BUSY",
+                "detail": f"索引任务运行期间不能修改模型连接或绑定。当前任务: {task_ids}",
+            },
+        )
+
+
 def _ensure_workspace_available(workspace: str) -> None:
     task = _active_workspace_rebuild(workspace)
     if task:
@@ -2442,6 +2711,133 @@ def _ensure_embedding_compatible(workspace: str) -> None:
         get_lightrag_service(workspace).assert_embedding_compatible()
     except RuntimeError as exc:
         raise HTTPException(409, str(exc))
+
+
+def _shadow_service_for_task(task: dict[str, Any]) -> LightRAGService:
+    request_config = task.get("request") or {}
+    shadow_root = request_config.get("shadow_root")
+    shadow_manifest = request_config.get("shadow_manifest")
+    shadow_embedding_meta_dir = request_config.get("shadow_embedding_meta_dir")
+    if not shadow_root or not shadow_manifest or not shadow_embedding_meta_dir:
+        return get_lightrag_service(task["workspace"])
+    config = deepcopy(get_config())
+    paths = config.setdefault("paths", {})
+    paths["lightrag_dir"] = shadow_root
+    paths["lightrag_manifest_override"] = shadow_manifest
+    paths["lightrag_embedding_meta_dir"] = shadow_embedding_meta_dir
+    return LightRAGService(config, workspace=task["workspace"])
+
+
+async def _prepare_shadow_rebuild(
+    task: dict[str, Any],
+    source_service: LightRAGService,
+) -> LightRAGService:
+    data_dir = Path(get_config().get("paths", {}).get("data_dir", "./data")).resolve()
+    shadow_base = data_dir / "rebuild_shadow" / task["task_id"]
+    if shadow_base.exists():
+        shutil.rmtree(shadow_base)
+    request_config = dict(task.get("request") or {})
+    request_config.update(
+        {
+            "shadow_root": str(shadow_base / "lightrag"),
+            "shadow_manifest": str(shadow_base / "manifest.json"),
+            "shadow_embedding_meta_dir": str(shadow_base / "embedding_meta"),
+        }
+    )
+    await _update_index_task(
+        task["task_id"],
+        request=request_config,
+        phase="shadow_prepared",
+    )
+    latest_task = _index_tasks[task["task_id"]]
+    shadow = _shadow_service_for_task(latest_task)
+    source_manifest = source_service._load_manifest()
+    shadow_manifest = deepcopy(source_manifest)
+    for item in shadow_manifest.get("documents", {}).values():
+        item.update(
+            {
+                "indexed": False,
+                "status": "uploaded",
+                "active_index_doc_id": "",
+                "active_index_status": "",
+                "retired_index_doc_ids": [],
+                "index_stale": False,
+                "last_index_attempt": {},
+                "chunk_count": 0,
+                "chunks_list": [],
+                "error_msg": "",
+            }
+        )
+    shadow._save_manifest(shadow_manifest)
+    shadow.ensure_workspace()
+    return shadow
+
+
+async def _commit_shadow_rebuild(
+    task: dict[str, Any],
+    shadow_service: LightRAGService,
+) -> None:
+    workspace = sanitize_workspace(task["workspace"])
+    active_service = get_lightrag_service(workspace)
+    await shadow_service.finalize()
+    await reset_lightrag_service_async(workspace)
+
+    active_dir = active_service.workspace_dir.resolve()
+    shadow_dir = shadow_service.workspace_dir.resolve()
+    active_manifest = active_service.manifest_path.resolve()
+    shadow_manifest = shadow_service.manifest_path.resolve()
+    backup_root = shadow_dir.parent.parent / "previous"
+    backup_dir = backup_root / "workspace"
+    backup_manifest = backup_root / "manifest.json"
+    backup_embedding_meta = backup_root / "embedding_meta.json"
+    backup_root.mkdir(parents=True, exist_ok=True)
+
+    moved_active_dir = False
+    moved_active_manifest = False
+    moved_active_embedding_meta = False
+    moved_shadow_embedding_meta = False
+    try:
+        if active_dir.exists():
+            if backup_dir.exists():
+                shutil.rmtree(backup_dir)
+            os.replace(active_dir, backup_dir)
+            moved_active_dir = True
+        active_dir.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(shadow_dir, active_dir)
+
+        if active_manifest.exists():
+            backup_manifest.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(active_manifest, backup_manifest)
+            moved_active_manifest = True
+        active_manifest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(shadow_manifest, active_manifest)
+
+        if shadow_service.embedding_meta_path.exists():
+            target_meta = active_service.embedding_meta_path
+            target_meta.parent.mkdir(parents=True, exist_ok=True)
+            if target_meta.exists():
+                os.replace(target_meta, backup_embedding_meta)
+                moved_active_embedding_meta = True
+            os.replace(shadow_service.embedding_meta_path, target_meta)
+            moved_shadow_embedding_meta = True
+    except Exception:
+        if active_dir.exists() and moved_active_dir:
+            shutil.rmtree(active_dir, ignore_errors=True)
+        if moved_active_dir and backup_dir.exists():
+            os.replace(backup_dir, active_dir)
+        if active_manifest.exists() and moved_active_manifest:
+            active_manifest.unlink(missing_ok=True)
+        if moved_active_manifest and backup_manifest.exists():
+            os.replace(backup_manifest, active_manifest)
+        target_meta = active_service.embedding_meta_path
+        if target_meta.exists() and moved_shadow_embedding_meta:
+            target_meta.unlink(missing_ok=True)
+        if moved_active_embedding_meta and backup_embedding_meta.exists():
+            target_meta.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(backup_embedding_meta, target_meta)
+        raise
+    finally:
+        shutil.rmtree(backup_root, ignore_errors=True)
 
 
 async def _start_workspace_rebuild(
@@ -2460,15 +2856,19 @@ async def _start_workspace_rebuild(
     if not doc_names and not allow_empty:
         raise HTTPException(400, "No uploaded documents registered in this workspace to rebuild")
 
-    batch_req = BatchIndexRequest(
-        workspace=req.workspace,
-        doc_names=doc_names,
-        separators=req.separators,
-        chunk_size=req.chunk_size,
-        chunk_overlap=req.chunk_overlap,
-        index_mode=req.index_mode,
-        kg_max_entities=req.kg_max_entities,
-        kg_max_records=req.kg_max_records,
+    batch_req = (
+        BatchIndexRequest(
+            workspace=req.workspace,
+            doc_names=doc_names,
+            separators=req.separators,
+            chunk_size=req.chunk_size,
+            chunk_overlap=req.chunk_overlap,
+            index_mode=req.index_mode,
+            kg_max_entities=req.kg_max_entities,
+            kg_max_records=req.kg_max_records,
+        )
+        if doc_names
+        else None
     )
     task = await _create_index_task(
         "rebuild",
@@ -2481,25 +2881,14 @@ async def _start_workspace_rebuild(
         phase="preparing",
         message=f"准备重建：{reason}",
     )
-    async def clear_workspace_for_rebuild() -> dict[str, Any]:
-        service = get_lightrag_service(req.workspace)
-        result = await service.clear_workspace(preserve_manifest=True)
-        reset_lightrag_service(req.workspace)
-        _clear_workspace_cache(req.workspace)
-        logger.info(
-            "Cleared LightRAG workspace before rebuild ({}): {}",
-            reason,
-            result,
-        )
-        await _update_index_task(task["task_id"], phase="cleared")
-        return result
-
     try:
-        if workspace_lock_held:
-            clear_result = await clear_workspace_for_rebuild()
-        else:
-            async with _get_workspace_rag_lock(req.workspace):
-                clear_result = await clear_workspace_for_rebuild()
+        source_service = get_lightrag_service(req.workspace)
+        shadow_service = await _prepare_shadow_rebuild(task, source_service)
+        clear_result = {
+            "workspace": req.workspace,
+            "shadow_workspace_path": str(shadow_service.workspace_dir),
+            "preserved_active_workspace": True,
+        }
     except Exception as exc:
         await _update_index_task(
             task["task_id"],
@@ -2510,11 +2899,11 @@ async def _start_workspace_rebuild(
         raise
 
     if doc_names:
-        asyncio.create_task(_run_index_task(task["task_id"], batch_req))
+        assert batch_req is not None
+        _spawn_background(_run_index_task(task["task_id"], batch_req))
     else:
         async def replay_graph_changes() -> dict[str, Any]:
-            service = get_lightrag_service(req.workspace)
-            return await service.replay_graph_audit()
+            return await shadow_service.replay_graph_audit()
 
         if workspace_lock_held:
             graph_replay = await replay_graph_changes()
@@ -2522,6 +2911,14 @@ async def _start_workspace_rebuild(
             async with _get_workspace_rag_lock(req.workspace):
                 graph_replay = await replay_graph_changes()
         replay_errors = graph_replay.get("errors") or []
+        if replay_errors:
+            await shadow_service.finalize()
+            shutil.rmtree(shadow_service.working_dir.parent, ignore_errors=True)
+        else:
+            await _commit_shadow_rebuild(
+                _index_tasks[task["task_id"]],
+                shadow_service,
+            )
         await _update_index_task(
             task["task_id"],
             status="failed" if replay_errors else "succeeded",
@@ -2539,6 +2936,7 @@ async def _start_workspace_rebuild(
                 }
             ] if replay_errors else [],
             graph_replay=graph_replay,
+            phase="done",
         )
     return _index_tasks[task["task_id"]], clear_result
 
@@ -2546,13 +2944,19 @@ async def _start_workspace_rebuild(
 async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -> None:
     doc_names = [req.file_name] if isinstance(req, IndexRequest) else list(req.doc_names)
     workspace = sanitize_workspace(req.workspace)
-    service = get_lightrag_service(workspace)
+    initial_task = _index_tasks.get(task_id, {})
+    service = (
+        _shadow_service_for_task(initial_task)
+        if initial_task.get("kind") == "rebuild"
+        else get_lightrag_service(workspace)
+    )
     index_mode = getattr(req, "index_mode", "complete")
     mode_label = "快速索引（跳过KG）" if index_mode == "fast" else "完整索引（向量+KG）"
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
     try:
+        _assert_task_model_snapshot(initial_task, service)
         await _update_index_task(task_id, phase="queued", message="等待索引写入锁")
         async with _get_workspace_rag_lock(workspace):
             await _update_index_task(
@@ -2688,12 +3092,6 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                             service.mark_document_status(doc, status="failed", indexed=False, error_msg=error_msg)
                         except Exception:
                             logger.exception("Failed to mark timeout index status for {}", doc_name)
-                        try:
-                            await service.discard_lightrag_doc(
-                                str(doc.metadata.get("lightrag_doc_id") or "")
-                            )
-                        except Exception:
-                            logger.exception("Failed to cleanup timed-out LightRAG doc for {}", doc_name)
                     error = {"doc_name": doc_name, "status": "error", "error": error_msg}
                     errors.append(error)
                     results.append(error)
@@ -2738,6 +3136,22 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                 }
                 errors.append(replay_error)
                 results.append(replay_error)
+
+        if task_kind == "rebuild" and not errors:
+            await _update_index_task(
+                task_id,
+                phase="committing",
+                message="正在切换重建后的知识库版本",
+            )
+            await _commit_shadow_rebuild(_index_tasks[task_id], service)
+            _clear_workspace_cache(workspace)
+        elif task_kind == "rebuild":
+            await service.finalize()
+            shadow_root = (
+                (_index_tasks.get(task_id, {}).get("request") or {}).get("shadow_root")
+            )
+            if shadow_root:
+                shutil.rmtree(Path(shadow_root).resolve().parent, ignore_errors=True)
 
         if document_error_count and document_error_count == len(doc_names):
             status = "failed"
@@ -2794,6 +3208,7 @@ async def _run_graph_backfill_task(task_id: str, req: GraphBackfillRequest) -> N
     errors: list[dict[str, Any]] = []
 
     try:
+        _assert_task_model_snapshot(_index_tasks.get(task_id, {}), service)
         await _update_index_task(task_id, phase="queued", message="等待图谱补建写入锁")
         async with _get_workspace_rag_lock(workspace):
             await _update_index_task(
@@ -2944,6 +3359,17 @@ async def _run_graph_backfill_task(task_id: str, req: GraphBackfillRequest) -> N
             message=f"图谱补建任务异常退出: {exc}",
             phase="done",
         )
+        if _index_tasks.get(task_id, {}).get("kind") == "rebuild":
+            try:
+                await service.finalize()
+                shadow_root = (
+                    (_index_tasks.get(task_id, {}).get("request") or {}).get("shadow_root")
+                )
+                if shadow_root:
+                    shadow_base = Path(shadow_root).resolve().parent
+                    shutil.rmtree(shadow_base, ignore_errors=True)
+            except Exception:
+                logger.exception("Failed to cleanup rebuild shadow for {}", task_id)
 
 
 # --- KB Management Endpoints ---
@@ -2958,6 +3384,8 @@ async def list_workspaces():
 async def create_workspace(req: WorkspaceCreateRequest):
     """Create an empty LightRAG knowledge-base workspace."""
     workspace = sanitize_workspace(req.workspace)
+    if workspace in _discover_workspaces():
+        raise HTTPException(409, "Knowledge base already exists")
     service = get_lightrag_service(workspace)
     template_id = req.rule_template_id.strip() or "general_knowledge"
     if not any(item.get("id") == template_id for item in service.list_graph_rule_templates()):
@@ -2995,12 +3423,12 @@ async def delete_workspace(workspace: str):
         service.manifest_path.unlink()
     removed_uploads = _remove_workspace_sources(workspace)
     metadata = await _remove_workspace_metadata(workspace, service)
-    reset_lightrag_service(workspace)
+    await reset_lightrag_service_async(workspace)
     return {"deleted": workspace, "removed_uploads": removed_uploads, **metadata, **result}
 
 
 @app.post("/api/kb/upload")
-async def upload_document(file: UploadFile = File(...), workspace: str = Query(DEFAULT_WORKSPACE)):
+async def upload_document(file: UploadFile = File(...), workspace: WorkspaceName = Query(DEFAULT_WORKSPACE)):
     """Upload a document for preview before indexing."""
     workspace = sanitize_workspace(workspace)
     _ensure_workspace_available(workspace)
@@ -3017,22 +3445,36 @@ async def upload_document(file: UploadFile = File(...), workspace: str = Query(D
     if ext not in loader._ext_to_parser:
         raise HTTPException(400, f"Unsupported file type: {ext}")
 
-    content = await file.read()
     dest = _resolve_upload_path(safe_name, workspace, create_dir=True)
-    existing_content = dest.read_bytes() if dest.is_file() else None
-    content_changed = existing_content != content
     fd, temp_name = tempfile.mkstemp(
         prefix=".upload-",
         suffix=ext,
         dir=str(dest.parent),
     )
+    os.close(fd)
     try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
         temp_path = Path(temp_name)
-        doc = loader.load_document(temp_path)
+        await _stream_upload_to_file(
+            file,
+            temp_path,
+            max_bytes=DOCUMENT_UPLOAD_MAX_BYTES,
+        )
+        content_changed = not dest.is_file() or not filecmp.cmp(
+            temp_path,
+            dest,
+            shallow=False,
+        )
+        doc = await asyncio.to_thread(loader.load_document, temp_path)
+        if len(doc.raw_text) > PARSED_TEXT_MAX_CHARS:
+            raise HTTPException(
+                413,
+                {
+                    "code": "PARSED_TEXT_TOO_LARGE",
+                    "detail": (
+                        f"Parsed text exceeds the {PARSED_TEXT_MAX_CHARS} character limit"
+                    ),
+                },
+            )
         doc.file_name = safe_name
         doc.file_path = str(dest)
         key = _cache_key(workspace, safe_name)
@@ -3047,11 +3489,6 @@ async def upload_document(file: UploadFile = File(...), workspace: str = Query(D
                 ),
                 None,
             )
-            index_invalidated = False
-            if existing_item is not None and content_changed:
-                await service.invalidate_document(safe_name)
-                index_invalidated = True
-
             os.replace(temp_path, dest)
             item = service.register_upload(doc)
             raw_text_path = _resolve_raw_text_path(workspace, item["doc_id"], create_dir=True)
@@ -3060,7 +3497,7 @@ async def upload_document(file: UploadFile = File(...), workspace: str = Query(D
             doc.metadata["raw_text_path"] = str(raw_text_path)
             item = service.register_upload(doc)
             _uploaded_files[key] = doc
-            if index_invalidated:
+            if existing_item is not None and content_changed:
                 _chunk_cache.pop(key, None)
             return {
                 "file_name": safe_name,
@@ -3069,8 +3506,11 @@ async def upload_document(file: UploadFile = File(...), workspace: str = Query(D
                 "file_type": doc.file_type,
                 "char_count": len(doc.raw_text),
                 "preview": doc.raw_text[:500] + ("..." if len(doc.raw_text) > 500 else ""),
-                "index_invalidated": index_invalidated,
+                "index_invalidated": False,
+                "index_stale": bool(item.get("index_stale")),
             }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Upload failed for {} in {}", safe_name, workspace)
         raise HTTPException(500, f"Upload failed: {e}")
@@ -3146,18 +3586,18 @@ async def index_document(req: IndexRequest):
         req.workspace,
         _index_request_config(req),
     )
-    asyncio.create_task(_run_index_task(task["task_id"], req))
+    _spawn_background(_run_index_task(task["task_id"], req))
     return _public_index_task(task)
 
 
 @app.get("/api/kb/documents")
-async def list_documents(workspace: str = Query(DEFAULT_WORKSPACE)):
+async def list_documents(workspace: WorkspaceName = Query(DEFAULT_WORKSPACE)):
     """List uploaded/indexed documents from the LightRAG manifest and status store."""
     return await get_lightrag_service(workspace).list_documents()
 
 
 @app.delete("/api/kb/documents/{doc_name}")
-async def delete_document(doc_name: str, workspace: str = Query(DEFAULT_WORKSPACE)):
+async def delete_document(doc_name: str, workspace: WorkspaceName = Query(DEFAULT_WORKSPACE)):
     """Delete a document from LightRAG by doc_id or uploaded file name."""
     workspace = sanitize_workspace(workspace)
     _ensure_workspace_available(workspace)
@@ -3209,12 +3649,12 @@ async def delete_document(doc_name: str, workspace: str = Query(DEFAULT_WORKSPAC
 
 
 class BatchDeleteRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
-    doc_names: list[str]
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
+    doc_names: list[str] = Field(min_length=1, max_length=100)
 
 class BatchIndexRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
-    doc_names: list[str]
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
+    doc_names: list[str] = Field(min_length=1, max_length=100)
     separators: list[str] = Field(default_factory=_default_index_separators)
     chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
     chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
@@ -3223,7 +3663,7 @@ class BatchIndexRequest(BaseModel):
     kg_max_records: int = Field(default=48, ge=1, le=400)
 
 class RebuildIndexRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     separators: list[str] = Field(default_factory=_default_index_separators)
     chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
     chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
@@ -3232,13 +3672,13 @@ class RebuildIndexRequest(BaseModel):
     kg_max_records: int = Field(default=48, ge=1, le=400)
 
 class GraphBackfillRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
-    doc_names: list[str]
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
+    doc_names: list[str] = Field(min_length=1, max_length=100)
     kg_max_entities: int = Field(default=24, ge=1, le=200)
     kg_max_records: int = Field(default=48, ge=1, le=400)
 
 class ClearKnowledgeBaseRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     clear_uploads: bool = False
 
 class RawTextUpdateRequest(BaseModel):
@@ -3248,6 +3688,9 @@ class RawTextUpdateRequest(BaseModel):
 @app.post("/api/kb/batch-delete")
 async def batch_delete(req: BatchDeleteRequest):
     """Delete multiple documents at once."""
+    req.doc_names = list(
+        dict.fromkeys(_safe_leaf_name(name) for name in req.doc_names)
+    )
     req.workspace = sanitize_workspace(req.workspace)
     _ensure_workspace_available(req.workspace)
     deleted = 0
@@ -3320,7 +3763,7 @@ async def batch_index(req: BatchIndexRequest):
     if not req.doc_names:
         raise HTTPException(400, "No documents selected")
     try:
-        req.doc_names = [_safe_leaf_name(name) for name in req.doc_names]
+        req.doc_names = list(dict.fromkeys(_safe_leaf_name(name) for name in req.doc_names))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     req.workspace = sanitize_workspace(req.workspace)
@@ -3332,7 +3775,7 @@ async def batch_index(req: BatchIndexRequest):
         req.workspace,
         _index_request_config(req),
     )
-    asyncio.create_task(_run_index_task(task["task_id"], req))
+    _spawn_background(_run_index_task(task["task_id"], req))
     return _public_index_task(task)
 
 
@@ -3342,7 +3785,7 @@ async def backfill_document_graph(req: GraphBackfillRequest):
     if not req.doc_names:
         raise HTTPException(400, "No documents selected")
     try:
-        req.doc_names = [_safe_leaf_name(name) for name in req.doc_names]
+        req.doc_names = list(dict.fromkeys(_safe_leaf_name(name) for name in req.doc_names))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     req.workspace = sanitize_workspace(req.workspace)
@@ -3372,7 +3815,7 @@ async def backfill_document_graph(req: GraphBackfillRequest):
         req.workspace,
         _index_request_config(req),
     )
-    asyncio.create_task(_run_graph_backfill_task(task["task_id"], req))
+    _spawn_background(_run_graph_backfill_task(task["task_id"], req))
     return _public_index_task(task)
 
 
@@ -3401,7 +3844,7 @@ async def clear_knowledge_base(req: ClearKnowledgeBaseRequest):
     async with _get_workspace_rag_lock(req.workspace):
         service = get_lightrag_service(req.workspace)
         result = await service.clear_workspace()
-        reset_lightrag_service(req.workspace)
+        await reset_lightrag_service_async(req.workspace)
         _clear_workspace_cache(req.workspace)
 
         removed_uploads = 0
@@ -3466,13 +3909,18 @@ async def _resume_persisted_index_tasks() -> None:
                 _safe_leaf_name(name)
                 for name in task.get("doc_names", [])
             ]
-            if task.get("kind") == "rebuild" and task.get("phase") in {"created", "preparing"}:
-                async with _get_workspace_rag_lock(workspace):
-                    service = get_lightrag_service(workspace)
-                    await service.clear_workspace(preserve_manifest=True)
-                    reset_lightrag_service(workspace)
-                    _clear_workspace_cache(workspace)
-                await _update_index_task(task_id, phase="cleared")
+            if task.get("kind") == "rebuild":
+                if task.get("phase") == "committing":
+                    raise RuntimeError(
+                        "Rebuild was interrupted during the commit phase; active data was preserved"
+                    )
+                request = task.get("request") or {}
+                shadow_manifest = Path(str(request.get("shadow_manifest") or ""))
+                if not request.get("shadow_root") or not shadow_manifest.exists():
+                    await _prepare_shadow_rebuild(
+                        task,
+                        get_lightrag_service(workspace),
+                    )
 
             await _update_index_task(
                 task_id,
@@ -3490,7 +3938,7 @@ async def _resume_persisted_index_tasks() -> None:
                     kg_max_entities=kg_max_entities,
                     kg_max_records=kg_max_records,
                 )
-                asyncio.create_task(_run_graph_backfill_task(task_id, backfill_req))
+                _spawn_background(_run_graph_backfill_task(task_id, backfill_req))
                 continue
             if task.get("kind") == "single" and len(doc_names) == 1:
                 req: IndexRequest | BatchIndexRequest = IndexRequest(
@@ -3514,7 +3962,7 @@ async def _resume_persisted_index_tasks() -> None:
                     kg_max_entities=kg_max_entities,
                     kg_max_records=kg_max_records,
                 )
-            asyncio.create_task(_run_index_task(task_id, req))
+            _spawn_background(_run_index_task(task_id, req))
         except Exception as exc:
             logger.warning("Failed to resume persisted index task {}: {}", task_id, exc)
             await _update_index_task(
@@ -3529,7 +3977,7 @@ async def _resume_persisted_index_tasks() -> None:
 @app.get("/api/kb/documents/{doc_name}/raw-text")
 async def get_document_raw_text(
     doc_name: str,
-    workspace: str = Query(DEFAULT_WORKSPACE),
+    workspace: WorkspaceName = Query(DEFAULT_WORKSPACE),
 ):
     """Get the raw parsed text of a document (for preview/editing before chunking)."""
     try:
@@ -3559,7 +4007,7 @@ async def get_document_raw_text(
 async def update_document_raw_text(
     doc_name: str,
     req: RawTextUpdateRequest,
-    workspace: str = Query(DEFAULT_WORKSPACE),
+    workspace: WorkspaceName = Query(DEFAULT_WORKSPACE),
 ):
     """Persist edited parsed text and invalidate derived LightRAG data."""
     try:
@@ -3569,20 +4017,25 @@ async def update_document_raw_text(
         raise HTTPException(400, str(exc))
     if not req.raw_text.strip():
         raise HTTPException(400, "Raw text cannot be empty")
+    if len(req.raw_text) > PARSED_TEXT_MAX_CHARS:
+        raise HTTPException(413, "Raw text exceeds the configured character limit")
     _ensure_workspace_available(workspace)
     try:
         async with _get_workspace_rag_lock(workspace):
             doc = _load_doc_for_index(doc_name, workspace)
             service = get_lightrag_service(workspace)
-            invalidated = await service.invalidate_document(doc_name)
+            doc_id = str(doc.metadata.get("lightrag_doc_id") or "")
+            if not doc_id:
+                registered = service.register_upload(doc)
+                doc_id = str(registered["doc_id"])
             raw_text_path = _resolve_raw_text_path(
                 workspace,
-                invalidated["doc_id"],
+                doc_id,
                 create_dir=True,
             )
-            raw_text_path.write_text(req.raw_text, encoding="utf-8")
+            _atomic_write_text(raw_text_path, req.raw_text)
             doc.raw_text = req.raw_text
-            doc.metadata["lightrag_doc_id"] = invalidated["doc_id"]
+            doc.metadata["lightrag_doc_id"] = doc_id
             doc.metadata["raw_text_path"] = str(raw_text_path)
             service.register_upload(doc)
             _uploaded_files[_cache_key(workspace, doc_name)] = doc
@@ -3599,13 +4052,14 @@ async def update_document_raw_text(
         "file_name": doc_name,
         "workspace": workspace,
         "char_count": len(req.raw_text),
-        "index_invalidated": True,
-        "message": "原始文本已保存，旧索引已移除，请重新预览并索引",
+        "index_invalidated": False,
+        "index_stale": True,
+        "message": "原始文本已保存，旧索引仍可用；请重新索引以应用新内容",
     }
 
 
 @app.get("/api/kb/documents/{doc_name}/chunks")
-async def get_document_chunks(doc_name: str, workspace: str = Query(DEFAULT_WORKSPACE)):
+async def get_document_chunks(doc_name: str, workspace: WorkspaceName = Query(DEFAULT_WORKSPACE)):
     """Return indexed LightRAG chunks, falling back to local raw-text chunks on failure."""
     try:
         doc_name = _safe_leaf_name(doc_name)
@@ -3658,7 +4112,7 @@ async def get_document_chunks(doc_name: str, workspace: str = Query(DEFAULT_WORK
 
 @app.post("/api/recall/test", response_model=RecallTestResponse)
 async def recall_test(req: RecallTestRequest):
-    """Preview LightRAG context with QueryParam(only_need_context=True)."""
+    """LightRAG context preview with QueryParam(only_need_context=True)."""
     req.workspace = sanitize_workspace(req.workspace)
     _ensure_workspace_available(req.workspace)
     _ensure_embedding_compatible(req.workspace)
@@ -3672,8 +4126,20 @@ async def recall_test(req: RecallTestRequest):
                 enable_rerank=req.enable_rerank,
             )
     except Exception as e:
-        logger.exception("LightRAG context preview failed")
-        raise HTTPException(500, f"LightRAG context preview failed: {e}")
+        query_id = uuid.uuid4().hex[:12]
+        logger.exception(
+            "RAG retrieval failed workspace={} query_id={} stage=context_preview root={}",
+            req.workspace,
+            query_id,
+            type(e).__name__,
+        )
+        raise HTTPException(
+            502,
+            {
+                "code": "RAG_RETRIEVAL_FAILED",
+                "detail": f"上下文检索失败（查询 {query_id}）",
+            },
+        )
 
     data = result.get("data") or {}
     return RecallTestResponse(
@@ -3702,8 +4168,20 @@ async def text_recall_test(req: TextRecallRequest):
                 enable_rerank=req.enable_rerank,
             )
     except Exception as exc:
-        logger.exception("LightRAG text recall test failed")
-        raise HTTPException(500, f"LightRAG text recall test failed: {exc}")
+        query_id = uuid.uuid4().hex[:12]
+        logger.exception(
+            "RAG retrieval failed workspace={} query_id={} stage=text_recall root={}",
+            req.workspace,
+            query_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            502,
+            {
+                "code": "RAG_RETRIEVAL_FAILED",
+                "detail": f"文本召回失败（查询 {query_id}）",
+            },
+        )
     return TextRecallResponse(**result)
 
 
@@ -3725,8 +4203,20 @@ async def search(req: SearchRequest):
                 enable_rerank=req.enable_rerank,
             )
     except Exception as e:
-        logger.exception("LightRAG search failed")
-        raise HTTPException(500, f"LightRAG search failed: {e}")
+        query_id = uuid.uuid4().hex[:12]
+        logger.exception(
+            "RAG retrieval failed workspace={} query_id={} stage=search root={}",
+            req.workspace,
+            query_id,
+            type(e).__name__,
+        )
+        raise HTTPException(
+            502,
+            {
+                "code": "RAG_RETRIEVAL_FAILED",
+                "detail": f"知识库检索失败（查询 {query_id}）",
+            },
+        )
     return {
         "question": req.query,
         "content": answer.content,
@@ -3738,7 +4228,7 @@ async def search(req: SearchRequest):
 # --- Model Config Endpoints ---
 
 @app.get("/api/models/config")
-async def get_model_config(workspace: str = Query(DEFAULT_WORKSPACE)):
+async def get_model_config(workspace: WorkspaceName = Query(DEFAULT_WORKSPACE)):
     """Get generation parameters and the selected workspace answer prompt."""
     workspace = sanitize_workspace(workspace)
     cfg = get_config()
@@ -3764,24 +4254,28 @@ async def get_model_config(workspace: str = Query(DEFAULT_WORKSPACE)):
             "answer_system_prompt",
             DEFAULT_ANSWER_SYSTEM_PROMPT,
         ),
+        effective_config_path=str(get_effective_write_config_path()),
     )
 
 
 @app.put("/api/models/config")
 async def update_model_config(
     config: ModelConfig,
-    workspace: str = Query(DEFAULT_WORKSPACE),
+    workspace: WorkspaceName = Query(DEFAULT_WORKSPACE),
 ):
     """Update global generation parameters and a workspace-specific answer prompt.
 
     Model endpoints/keys/models are managed by /api/model-profiles and
     /api/model-bindings. This endpoint is kept for compatibility.
     """
-    if not CONFIG_PATH.exists():
-        raise HTTPException(500, "Config file not found")
-
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        yaml_config = yaml.safe_load(f)
+    _ensure_model_config_mutable()
+    config_path = get_effective_write_config_path()
+    yaml_config: dict[str, Any] = {}
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            loaded = yaml.safe_load(f)
+            if isinstance(loaded, dict):
+                yaml_config = loaded
 
     sf = yaml_config.setdefault("siliconflow", {})
     sf["chat_temperature"] = config.chat_temperature
@@ -3791,7 +4285,7 @@ async def update_model_config(
     sf["presence_penalty"] = config.presence_penalty
 
     _atomic_write_text(
-        CONFIG_PATH,
+        config_path,
         yaml.safe_dump(yaml_config, allow_unicode=True, default_flow_style=False),
     )
 
@@ -3804,10 +4298,13 @@ async def update_model_config(
     )
     # Config changed: rebuild the LightRAG adapter on the next request.
     reset_config()
-    reset_lightrag_service()
+    await reset_lightrag_service_async()
+    effective = get_config().get("siliconflow", {})
+    if float(effective.get("chat_temperature", -1)) != config.chat_temperature:
+        raise HTTPException(500, "Saved model configuration did not become effective")
 
     logger.info("Model config updated and saved")
-    return {"status": "ok"}
+    return {"status": "ok", "effective_config_path": str(config_path)}
 
 
 @app.get("/api/prompt-templates")
@@ -3884,28 +4381,46 @@ def _record_existing_embedding_signatures() -> None:
 
 @app.post("/api/model-profiles")
 async def api_upsert_model_profile(req: ModelProfileRequest):
+    _ensure_model_config_mutable()
     _record_existing_embedding_signatures()
     profile = upsert_profile(req.model_dump(exclude_none=True), get_config())
-    reset_lightrag_service()
+    await reset_lightrag_service_async()
     return profile
 
 
 @app.put("/api/model-profiles/{profile_id}")
 async def api_update_model_profile(profile_id: str, req: ModelProfileRequest):
+    _ensure_model_config_mutable()
     _record_existing_embedding_signatures()
     payload = req.model_dump(exclude_none=True)
     payload["id"] = profile_id
     profile = upsert_profile(payload, get_config())
-    reset_lightrag_service()
+    await reset_lightrag_service_async()
     return profile
 
 
 @app.delete("/api/model-profiles/{profile_id}")
 async def api_delete_model_profile(profile_id: str):
+    _ensure_model_config_mutable()
     _record_existing_embedding_signatures()
-    result = delete_profile(profile_id, get_config())
-    reset_lightrag_service()
-    return result
+    old_runtime = get_runtime_model_config(get_config())
+    try:
+        result = delete_profile(profile_id, get_config())
+    except KeyError:
+        raise HTTPException(404, "Profile not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    await reset_lightrag_service_async()
+    new_runtime = get_runtime_model_config(get_config())
+    embedding_changed = any(
+        old_runtime["embedding"].get(key) != new_runtime["embedding"].get(key)
+        for key in ("base_url", "model", "embed_dim")
+    )
+    return {
+        **result,
+        "embedding_changed": embedding_changed,
+        "affected_workspaces": _discover_workspaces() if embedding_changed else [],
+    }
 
 
 @app.post("/api/model-profiles/discover")
@@ -3975,11 +4490,23 @@ async def api_get_model_bindings():
 
 @app.put("/api/model-bindings")
 async def api_update_model_bindings(req: ModelBindingsUpdate):
+    _ensure_model_config_mutable()
     old_runtime = get_runtime_model_config(get_config())
     _record_existing_embedding_signatures()
-    bindings = save_bindings(req.bindings, get_config())
+    payload = req.bindings.model_dump()
+    known_profiles = {item["id"] for item in list_profiles(get_config())}
+    missing = sorted(
+        {
+            binding["profile_id"]
+            for binding in payload.values()
+            if binding["profile_id"] not in known_profiles
+        }
+    )
+    if missing:
+        raise HTTPException(400, f"Unknown model profile: {', '.join(missing)}")
+    bindings = save_bindings(payload, get_config())
     new_runtime = get_runtime_model_config(get_config())
-    reset_lightrag_service()
+    await reset_lightrag_service_async()
     embedding_changed = (
         old_runtime["embedding"]["base_url"].rstrip("/")
         != new_runtime["embedding"]["base_url"].rstrip("/")
@@ -4030,10 +4557,11 @@ def _ensure_session(
     workspace = sanitize_workspace(workspace)
     if session_id:
         s = _load_session(session_id)
-        if s:
-            if s.get("workspace") != workspace:
-                raise ValueError("Chat session belongs to a different workspace")
-            return session_id, s
+        if not s:
+            raise KeyError(session_id)
+        if s.get("workspace") != workspace:
+            raise ValueError("Chat session belongs to a different workspace")
+        return session_id, s
 
     # Create new session
     sid = uuid.uuid4().hex[:12]
@@ -4051,8 +4579,7 @@ def _ensure_session(
     return sid, session
 
 
-@app.post("/api/chat/send")
-async def chat_send(req: ChatSendRequest):
+async def _chat_send_impl(req: ChatSendRequest):
     """Send a message in a chat session and get AI response with RAG context."""
     now = datetime.now(timezone.utc).isoformat()
     req.workspace = sanitize_workspace(req.workspace)
@@ -4067,6 +4594,8 @@ async def chat_send(req: ChatSendRequest):
         async with _get_session_lock(req.session_id):
             try:
                 sid, session = _ensure_session(req.session_id, req.message, req.workspace)
+            except KeyError:
+                raise HTTPException(404, "Session not found")
             except ValueError as exc:
                 raise HTTPException(409, str(exc))
             raw_history: list[dict] = [
@@ -4099,10 +4628,20 @@ async def chat_send(req: ChatSendRequest):
                 enable_rerank=chat_settings.enable_rerank,
             )
     except Exception as e:
-        context_result = {}
-        logger.exception("LightRAG context retrieval failed")
-        ai_text = f"[检索失败: {e}]"
-        citations_data = []
+        query_id = uuid.uuid4().hex[:12]
+        logger.exception(
+            "RAG retrieval failed workspace={} query_id={} stage=context root={}",
+            req.workspace,
+            query_id,
+            type(e).__name__,
+        )
+        raise HTTPException(
+            502,
+            {
+                "code": "RAG_RETRIEVAL_FAILED",
+                "detail": f"知识库检索服务异常，请稍后重试（查询 {query_id}）",
+            },
+        )
     else:
         raw_like = {"data": context_result.get("data") or {}}
         citations_data = service._citations_from_raw(raw_like)
@@ -4179,8 +4718,10 @@ async def chat_send(req: ChatSendRequest):
     )
 
 
-@app.post("/api/chat/send/stream")
-async def chat_send_stream(req: ChatSendRequest):
+async def _chat_send_stream_impl(
+    req: ChatSendRequest,
+    turn_lock: asyncio.Lock,
+):
     """Send a message and stream the AI response via SSE."""
     now = datetime.now(timezone.utc).isoformat()
     req.workspace = sanitize_workspace(req.workspace)
@@ -4193,6 +4734,8 @@ async def chat_send_stream(req: ChatSendRequest):
         async with _get_session_lock(req.session_id):
             try:
                 sid, session = _ensure_session(req.session_id, req.message, req.workspace)
+            except KeyError:
+                raise HTTPException(404, "Session not found")
             except ValueError as exc:
                 raise HTTPException(409, str(exc))
             raw_history: list[dict] = [
@@ -4225,8 +4768,20 @@ async def chat_send_stream(req: ChatSendRequest):
                 enable_rerank=chat_settings.enable_rerank,
             )
     except Exception as e:
-        logger.exception("LightRAG context retrieval failed")
-        context_result = {}
+        query_id = uuid.uuid4().hex[:12]
+        logger.exception(
+            "RAG retrieval failed workspace={} query_id={} stage=context root={}",
+            req.workspace,
+            query_id,
+            type(e).__name__,
+        )
+        raise HTTPException(
+            502,
+            {
+                "code": "RAG_RETRIEVAL_FAILED",
+                "detail": f"知识库检索服务异常，请稍后重试（查询 {query_id}）",
+            },
+        )
 
     raw_like = {"data": context_result.get("data") or {}}
     citations_data = service._citations_from_raw(raw_like)
@@ -4235,10 +4790,19 @@ async def chat_send_stream(req: ChatSendRequest):
         citations_data = []
     citations = _format_chat_citations(citations_data)
     evidence = _build_evidence_chain(context_result.get("data") or {}, citations) if citations_data else EvidenceChain()
+    turn_released = False
+
+    def release_turn() -> None:
+        nonlocal turn_released
+        if turn_released:
+            return
+        turn_released = True
+        _release_session_turn_lock(sid, turn_lock)
 
     async def event_generator():
         full_text = ""
         generated_title = str(session.get("title") or "新对话")
+        stream_failed = False
 
         # First: send citations + graph hit nodes as an event
         citations_payload = {
@@ -4315,8 +4879,23 @@ async def chat_send_stream(req: ChatSendRequest):
                 yield f"event: done\ndata: {json.dumps({'session_id': sid, 'content': full_text, 'title': generated_title}, ensure_ascii=False)}\n\n"
             except Exception as e:
                 logger.error(f"Stream error: {e}")
-                yield f"event: error\ndata: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+                stream_failed = True
+                request_id = uuid.uuid4().hex[:12]
                 full_text = full_text or f"[回答生成失败: {e}]"
+                yield (
+                    "event: error\ndata: "
+                    + json.dumps(
+                        {
+                            "code": "ANSWER_GENERATION_FAILED",
+                            "detail": str(e),
+                            "error": str(e),
+                            "request_id": request_id,
+                            "content": full_text,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
         finally:
             # Persist the session no matter how the stream ends: normal
             # completion, an exception, or a client disconnect (GeneratorExit —
@@ -4325,7 +4904,11 @@ async def chat_send_stream(req: ChatSendRequest):
             # Best-effort: never let cleanup mask the propagating
             # GeneratorExit/exception (swallow only Exception, not BaseException).
             try:
-                persist_issues = _generated_answer_quality_issues(full_text)
+                persist_issues = (
+                    []
+                    if stream_failed
+                    else _generated_answer_quality_issues(full_text)
+                )
                 if persist_issues:
                     salvaged, remaining = _salvage_generated_answer(full_text)
                     logger.warning(
@@ -4368,10 +4951,13 @@ async def chat_send_stream(req: ChatSendRequest):
                     _save_session(sid, persisted_session)
             except Exception:
                 logger.exception("Failed to persist streaming chat session")
+            finally:
+                release_turn()
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
+        background=BackgroundTask(release_turn),
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
@@ -4381,7 +4967,7 @@ async def chat_send_stream(req: ChatSendRequest):
 
 
 @app.get("/api/chat/sessions", response_model=list[ChatSessionListItem])
-async def list_chat_sessions(workspace: str = Query(DEFAULT_WORKSPACE)):
+async def list_chat_sessions(workspace: WorkspaceName = Query(DEFAULT_WORKSPACE)):
     """List chat sessions owned by one workspace."""
     workspace = sanitize_workspace(workspace)
     sessions = _list_sessions(workspace)
@@ -4401,7 +4987,7 @@ async def list_chat_sessions(workspace: str = Query(DEFAULT_WORKSPACE)):
 @app.get("/api/chat/sessions/{session_id}", response_model=ChatSession)
 async def get_chat_session(
     session_id: str,
-    workspace: str = Query(DEFAULT_WORKSPACE),
+    workspace: WorkspaceName = Query(DEFAULT_WORKSPACE),
 ):
     """Get a single chat session with full messages."""
     if not _SESSION_ID_RE.fullmatch(session_id.lower()):
@@ -4411,26 +4997,6 @@ async def get_chat_session(
         raise HTTPException(404, "Session not found")
     if s.get("workspace") != sanitize_workspace(workspace):
         raise HTTPException(404, "Session not found in current workspace")
-    repaired = False
-    last_question = ""
-    for message in s.get("messages", []):
-        if message.get("role") == "user":
-            last_question = str(message.get("content") or "")
-            continue
-        if message.get("role") != "assistant":
-            continue
-        content = str(message.get("content") or "")
-        citations_data = message.get("citations") or []
-        if _is_bad_generated_answer(content):
-            salvaged, remaining = _salvage_generated_answer(content)
-            message["content"] = (
-                salvaged
-                if salvaged and not remaining
-                else _fallback_answer_from_citations(last_question, citations_data)
-            )
-            repaired = True
-    if repaired:
-        _save_session(session_id, s)
     return ChatSession(
         id=s["id"],
         workspace=s.get("workspace", DEFAULT_WORKSPACE),
@@ -4446,7 +5012,7 @@ async def get_chat_session(
 async def update_chat_session_settings(
     session_id: str,
     settings: ChatSettings,
-    workspace: str = Query(DEFAULT_WORKSPACE),
+    workspace: WorkspaceName = Query(DEFAULT_WORKSPACE),
 ):
     """Persist answer and retrieval settings for one conversation."""
     workspace = sanitize_workspace(workspace)
@@ -4454,37 +5020,42 @@ async def update_chat_session_settings(
         get_profile_with_key(settings.answer_profile_id, get_config())
     except KeyError:
         raise HTTPException(400, "Selected answer model connection no longer exists")
-    async with _get_session_lock(session_id):
-        session = _load_session(session_id)
-        if not session or session.get("workspace") != workspace:
-            raise HTTPException(404, "Session not found in current workspace")
-        session["settings"] = settings.model_dump()
-        session["settings_updated_at"] = _task_now()
-        _save_session(session_id, session)
+    async with _session_turn(session_id):
+        async with _get_session_lock(session_id):
+            session = _load_session(session_id)
+            if not session or session.get("workspace") != workspace:
+                raise HTTPException(404, "Session not found in current workspace")
+            session["settings"] = settings.model_dump()
+            session["settings_updated_at"] = _task_now()
+            _save_session(session_id, session)
     return settings
 
 
 @app.delete("/api/chat/sessions/{session_id}")
 async def delete_chat_session(
     session_id: str,
-    workspace: str = Query(DEFAULT_WORKSPACE),
+    workspace: WorkspaceName = Query(DEFAULT_WORKSPACE),
 ):
     """Delete a chat session."""
     try:
         path = _session_path(session_id)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    session = _load_session(session_id)
-    if session and session.get("workspace") != sanitize_workspace(workspace):
-        raise HTTPException(404, "Session not found in current workspace")
-    if path.exists():
-        path.unlink()
-        logger.info(f"Deleted chat session: {session_id}")
+    async with _session_turn(session_id):
+        async with _get_session_lock(session_id):
+            session = _load_session(session_id)
+            if not session or session.get("workspace") != sanitize_workspace(workspace):
+                raise HTTPException(404, "Session not found in current workspace")
+            path.unlink(missing_ok=True)
+            logger.info(f"Deleted chat session: {session_id}")
+    _session_locks.pop(session_id, None)
+    _session_turn_locks.pop(session_id, None)
+    _session_turn_lock_refs.pop(session_id, None)
     return {"deleted": session_id}
 
 
 class ChatSessionCreateRequest(BaseModel):
-    workspace: str = DEFAULT_WORKSPACE
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
     settings: Optional[ChatSettings] = None
 
 
@@ -4548,7 +5119,7 @@ def _format_bytes(num: int) -> str:
 
 
 @app.get("/api/system/stats")
-async def system_stats(workspace: str = Query(DEFAULT_WORKSPACE)):
+async def system_stats(workspace: WorkspaceName = Query(DEFAULT_WORKSPACE)):
     """Return LightRAG knowledge base and system statistics."""
     cfg = get_config()
     service = get_lightrag_service(workspace)
@@ -4568,6 +5139,7 @@ async def system_stats(workspace: str = Query(DEFAULT_WORKSPACE)):
         "workspace": stats["workspace"],
         "lightrag_dir": stats["lightrag_dir"],
         "lightrag_dir_size": _format_bytes(stats["lightrag_dir_size"]),
+        "effective_config_path": str(get_effective_write_config_path()),
     }
 
 
@@ -4627,7 +5199,7 @@ async def system_logs(
 # --- Graph ---
 
 @app.get("/api/graph")
-async def get_graph(limit: int = Query(200, ge=1, le=1000), workspace: str = Query(DEFAULT_WORKSPACE)):
+async def get_graph(limit: int = Query(200, ge=1, le=1000), workspace: WorkspaceName = Query(DEFAULT_WORKSPACE)):
     """Return LightRAG entity-relation graph extracted from GraphML."""
     workspace = sanitize_workspace(workspace)
     _ensure_workspace_available(workspace)
@@ -4650,7 +5222,7 @@ async def _read_governance_reference_upload(file: UploadFile) -> str:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".txt", ".md", ".json", ".yaml", ".yml", ".csv"}:
         raise HTTPException(400, "Only .txt/.md/.json/.yaml/.yml/.csv reference files are supported")
-    raw = await file.read()
+    raw = await _read_upload_bytes(file, max_bytes=GRAPH_UPLOAD_MAX_BYTES)
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
         try:
             return raw.decode(encoding)
@@ -4856,6 +5428,61 @@ async def _preview_graph_import(
     )
 
 
+@app.post("/api/chat/send")
+async def chat_send(req: ChatSendRequest):
+    if req.session_id is None:
+        sid, _session = _ensure_session(None, req.message, req.workspace)
+        req.session_id = sid
+    async with _session_turn(req.session_id):
+        return await _chat_send_impl(req)
+
+
+@app.post("/api/chat/send/stream")
+async def chat_send_stream(req: ChatSendRequest):
+    if req.session_id is None:
+        sid, _session = _ensure_session(None, req.message, req.workspace)
+        req.session_id = sid
+    lock = await _acquire_session_turn_lock(req.session_id)
+    try:
+        return await _chat_send_stream_impl(req, lock)
+    except HTTPException as exc:
+        _release_session_turn_lock(req.session_id, lock)
+        detail = exc.detail
+        code = "HTTP_ERROR"
+        if isinstance(detail, dict):
+            code = str(detail.get("code") or code)
+            detail = detail.get("detail", detail)
+        request_id = uuid.uuid4().hex[:12]
+
+        async def error_event():
+            yield (
+                "event: error\ndata: "
+                + json.dumps(
+                    {
+                        "code": code,
+                        "detail": str(detail),
+                        "error": str(detail),
+                        "request_id": request_id,
+                        "content": "",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
+
+        return StreamingResponse(
+            error_event(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    except BaseException:
+        _release_session_turn_lock(req.session_id, lock)
+        raise
+
+
 async def _generate_graph_suggestions(req: GraphSuggestRequest) -> GraphSuggestResponse:
     service = get_lightrag_service(req.workspace)
     cfg = service.load_graph_governance()
@@ -4961,13 +5588,13 @@ async def _apply_graph_change(service, change: GraphChange) -> dict[str, Any]:
 
 
 @app.get("/api/graph/governance/config", response_model=GraphGovernanceConfig)
-async def get_graph_governance_config(workspace: str = Query(DEFAULT_WORKSPACE)):
+async def get_graph_governance_config(workspace: WorkspaceName = Query(DEFAULT_WORKSPACE)):
     workspace = sanitize_workspace(workspace)
     return get_lightrag_service(workspace).load_graph_governance()
 
 
 @app.get("/api/graph/rule-templates", response_model=list[GraphRuleTemplate])
-async def list_graph_rule_templates(workspace: str = Query(DEFAULT_WORKSPACE)):
+async def list_graph_rule_templates(workspace: WorkspaceName = Query(DEFAULT_WORKSPACE)):
     workspace = sanitize_workspace(workspace)
     return get_lightrag_service(workspace).list_graph_rule_templates()
 
@@ -5020,7 +5647,7 @@ async def update_graph_governance_config(req: GraphGovernanceUpdate):
 
 
 @app.post("/api/graph/governance/references")
-async def upload_graph_reference(file: UploadFile = File(...), workspace: str = Query(DEFAULT_WORKSPACE)):
+async def upload_graph_reference(file: UploadFile = File(...), workspace: WorkspaceName = Query(DEFAULT_WORKSPACE)):
     workspace = sanitize_workspace(workspace)
     _ensure_workspace_available(workspace)
     content = await _read_governance_reference_upload(file)
@@ -5031,7 +5658,7 @@ async def upload_graph_reference(file: UploadFile = File(...), workspace: str = 
 
 
 @app.delete("/api/graph/governance/references/{ref_id}")
-async def delete_graph_reference(ref_id: str, workspace: str = Query(DEFAULT_WORKSPACE)):
+async def delete_graph_reference(ref_id: str, workspace: WorkspaceName = Query(DEFAULT_WORKSPACE)):
     workspace = sanitize_workspace(workspace)
     _ensure_workspace_available(workspace)
     try:
@@ -5041,7 +5668,7 @@ async def delete_graph_reference(ref_id: str, workspace: str = Query(DEFAULT_WOR
 
 
 @app.get("/api/graph/imports")
-async def list_graph_imports(workspace: str = Query(DEFAULT_WORKSPACE)):
+async def list_graph_imports(workspace: WorkspaceName = Query(DEFAULT_WORKSPACE)):
     workspace = sanitize_workspace(workspace)
     return get_lightrag_service(workspace).list_graph_imports()
 
@@ -5049,7 +5676,7 @@ async def list_graph_imports(workspace: str = Query(DEFAULT_WORKSPACE)):
 @app.post("/api/graph/imports/preview", response_model=GraphImportPreviewResponse)
 async def preview_graph_import(
     file: UploadFile = File(...),
-    workspace: str = Query(DEFAULT_WORKSPACE),
+    workspace: WorkspaceName = Query(DEFAULT_WORKSPACE),
 ):
     workspace = sanitize_workspace(workspace)
     _ensure_workspace_available(workspace)
@@ -5150,7 +5777,7 @@ async def update_graph_entity(req: GraphEntityUpdateRequest):
 
 
 @app.delete("/api/graph/entities/{entity_name}")
-async def delete_graph_entity(entity_name: str, workspace: str = Query(DEFAULT_WORKSPACE)):
+async def delete_graph_entity(entity_name: str, workspace: WorkspaceName = Query(DEFAULT_WORKSPACE)):
     workspace = sanitize_workspace(workspace)
     _ensure_workspace_available(workspace)
     async with _get_workspace_rag_lock(workspace):

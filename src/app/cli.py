@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import os
 import shutil
+import sys
 from pathlib import Path
 
 from loguru import logger
@@ -12,6 +15,103 @@ from loguru import logger
 from src.config_loader import get_config
 from src.doc_processor.loader import DocumentLoader
 from src.lightrag_service import DEFAULT_WORKSPACE, LightRAGService, sanitize_workspace
+from src.runtime_lock import RuntimeLock
+
+DOCUMENT_MAX_BYTES = int(
+    os.environ.get("LIGHTGRAPHRAG_DOCUMENT_UPLOAD_MAX_BYTES", str(50 * 1024 * 1024))
+)
+PARSED_TEXT_MAX_CHARS = int(
+    os.environ.get("LIGHTGRAPHRAG_PARSED_TEXT_MAX_CHARS", "5000000")
+)
+
+
+def _preflight_documents(docs_dir: str | Path) -> list:
+    source_dir = Path(docs_dir)
+    if not source_dir.is_dir():
+        raise FileNotFoundError(f"Document directory does not exist: {source_dir}")
+    loader = DocumentLoader()
+    files = loader.scan_directory(source_dir)
+    if not files:
+        raise ValueError(f"No supported documents found in: {source_dir}")
+    by_name: dict[str, list[Path]] = {}
+    for path in files:
+        if path.stat().st_size > DOCUMENT_MAX_BYTES:
+            raise ValueError(
+                f"Document exceeds the {DOCUMENT_MAX_BYTES} byte limit: {path}"
+            )
+        by_name.setdefault(path.name.casefold(), []).append(path)
+    conflicts = [paths for paths in by_name.values() if len(paths) > 1]
+    if conflicts:
+        details = "; ".join(
+            ", ".join(str(path) for path in paths)
+            for paths in conflicts
+        )
+        raise ValueError(f"Duplicate document basenames are not supported: {details}")
+    documents = [loader.load_document(path) for path in files]
+    empty = [doc.file_path for doc in documents if not doc.raw_text.strip()]
+    if empty:
+        raise ValueError(f"Parsed document text is empty: {', '.join(empty)}")
+    oversized_text = [
+        doc.file_path
+        for doc in documents
+        if len(doc.raw_text) > PARSED_TEXT_MAX_CHARS
+    ]
+    if oversized_text:
+        raise ValueError(
+            "Parsed document text exceeds the configured character limit: "
+            + ", ".join(oversized_text)
+        )
+    return documents
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _preflight_rebuild_sources(
+    docs_dir: str | Path,
+    workspace: str,
+) -> list:
+    documents = _preflight_documents(docs_dir)
+    config = get_config()
+    data_dir = Path(config.get("paths", {}).get("data_dir", "./data"))
+    upload_dir = data_dir / "uploads" / workspace
+    service = LightRAGService(config, workspace=workspace)
+    manifest = service._load_manifest()
+    registered = {
+        str(item.get("doc_name") or ""): item
+        for item in manifest.get("documents", {}).values()
+        if isinstance(item, dict) and item.get("doc_name")
+    }
+    source_by_name = {doc.file_name: Path(doc.file_path) for doc in documents}
+    if set(source_by_name) != set(registered):
+        missing = sorted(set(registered) - set(source_by_name))
+        extra = sorted(set(source_by_name) - set(registered))
+        details = []
+        if missing:
+            details.append(f"source missing: {', '.join(missing)}")
+        if extra:
+            details.append(f"not ingested: {', '.join(extra)}")
+        raise ValueError(
+            "Rebuild source set differs from the current workspace; ingest changes first ("
+            + "; ".join(details)
+            + ")"
+        )
+    changed = []
+    for name, source_path in source_by_name.items():
+        managed_path = upload_dir / name
+        if not managed_path.is_file() or _sha256(source_path) != _sha256(managed_path):
+            changed.append(name)
+    if changed:
+        raise ValueError(
+            "Rebuild sources differ from the managed uploads; ingest changes first: "
+            + ", ".join(changed)
+        )
+    return documents
 
 
 async def _ingest_docs(
@@ -23,16 +123,13 @@ async def _ingest_docs(
     loader = DocumentLoader()
     workspace = sanitize_workspace(workspace)
     service = service or LightRAGService(config, workspace=workspace)
-    source_dir = Path(docs_dir)
-    if not source_dir.exists():
-        raise FileNotFoundError(f"Document directory does not exist: {source_dir}")
+    docs = _preflight_documents(docs_dir)
     data_dir = Path(config.get("paths", {}).get("data_dir", "./data"))
     upload_dir = data_dir / "uploads" / workspace
     raw_text_dir = data_dir / "upload_text" / workspace
     upload_dir.mkdir(parents=True, exist_ok=True)
     raw_text_dir.mkdir(parents=True, exist_ok=True)
 
-    docs = loader.load_all(docs_dir)
     indexed = 0
     failed = 0
     for doc in docs:
@@ -70,24 +167,39 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     logger.info("Starting LightRAG document ingestion...")
     stats = asyncio.run(_ingest_docs(docs_dir, args.workspace))
     print(f"导入完成: {stats['documents']} 文档, {stats['indexed']} 已索引, {stats['failed']} 失败")
+    if stats["failed"]:
+        raise RuntimeError(f"{stats['failed']} documents failed to index")
 
 
 def cmd_rebuild(args: argparse.Namespace) -> None:
     """Clear and rebuild the index."""
     config = get_config()
-    docs_dir = args.docs_dir or config.get("paths", {}).get("docs_dir")
     workspace = sanitize_workspace(args.workspace)
+    data_dir = Path(config.get("paths", {}).get("data_dir", "./data"))
+    docs_dir = args.docs_dir or (data_dir / "uploads" / workspace)
+    _preflight_rebuild_sources(docs_dir, workspace)
 
     async def rebuild() -> dict:
-        service = LightRAGService(config, workspace=workspace)
-        await service.clear_workspace()
-        stats = await _ingest_docs(docs_dir, workspace, service)
-        replay = await service.replay_graph_audit()
-        return {**stats, "graph_replay": replay}
+        from src.api.server import (
+            RebuildIndexRequest,
+            _index_tasks,
+            _start_workspace_rebuild,
+        )
+
+        task, _result = await _start_workspace_rebuild(
+            RebuildIndexRequest(workspace=workspace),
+            reason="CLI rebuild",
+        )
+        while task.get("status") not in {"succeeded", "failed", "partial", "cancelled"}:
+            await asyncio.sleep(0.2)
+            task = _index_tasks[task["task_id"]]
+        return task
 
     logger.info("Rebuilding LightRAG workspace {}...", workspace)
     stats = asyncio.run(rebuild())
-    print(f"重建完成: {stats['documents']} 文档, {stats['indexed']} 已索引, {stats['failed']} 失败")
+    print(stats.get("message", "重建完成"))
+    if stats.get("status") != "succeeded":
+        raise RuntimeError(stats.get("message") or "Rebuild failed")
 
 
 def cmd_search(args: argparse.Namespace) -> None:
@@ -100,7 +212,13 @@ def cmd_search(args: argparse.Namespace) -> None:
     top_k = args.top_k or 40
 
     logger.info("Searching workspace {}: '{}'", workspace, question)
-    answer = asyncio.run(service.query(question, top_k=top_k))
+    async def search():
+        try:
+            return await service.query(question, top_k=top_k)
+        finally:
+            await service.finalize()
+
+    answer = asyncio.run(search())
 
     print("\n" + "=" * 60)
     print(f"问题: {question}")
@@ -161,16 +279,25 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.command == "ingest":
-        cmd_ingest(args)
-    elif args.command == "rebuild":
-        cmd_rebuild(args)
-    elif args.command == "search":
-        cmd_search(args)
-    elif args.command == "server":
-        cmd_server(args)
-    else:
+    try:
+        if args.command == "server":
+            cmd_server(args)
+            return
+        if args.command:
+            data_dir = Path(get_config().get("paths", {}).get("data_dir", "./data"))
+            with RuntimeLock(data_dir / ".runtime.lock"):
+                if args.command == "ingest":
+                    cmd_ingest(args)
+                elif args.command == "rebuild":
+                    cmd_rebuild(args)
+                elif args.command == "search":
+                    cmd_search(args)
+            return
         parser.print_help()
+    except Exception as exc:
+        logger.error("Command failed: {}", exc)
+        print(f"错误: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

@@ -225,6 +225,82 @@ def test_kg_invalid_response_recovery_skips_only_the_failed_chunk(tmp_path: Path
     assert service._kg_status_for_success(skip_kg=False) == "partial"
 
 
+def test_deepseek_v4_uses_official_non_thinking_parameter(tmp_path: Path):
+    from src.lightrag_service import LightRAGService
+
+    service = LightRAGService(
+        {
+            "paths": {"data_dir": str(tmp_path), "lightrag_dir": str(tmp_path / "lightrag")},
+            "lightrag": {"workspace": "test"},
+            "siliconflow": {},
+        },
+        workspace="test",
+    )
+
+    assert service._thinking_extra_body(
+        "deepseek-v4-flash",
+        "https://api.deepseek.com",
+    ) == {"thinking": {"type": "disabled"}}
+    assert service._thinking_extra_body(
+        "deepseek-v4-flash",
+        "https://api.siliconflow.cn/v1",
+    ) == {"enable_thinking": False}
+
+
+def test_kg_empty_json_mode_response_falls_back_without_response_format(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from src import lightrag_service
+    from src.lightrag_service import LightRAGService
+
+    service = LightRAGService(
+        {
+            "paths": {"data_dir": str(tmp_path), "lightrag_dir": str(tmp_path / "lightrag")},
+            "lightrag": {"workspace": "test"},
+            "siliconflow": {},
+        },
+        workspace="test",
+    )
+    monkeypatch.setattr(
+        service,
+        "_runtime_models",
+        lambda: {
+            "kg": {
+                "model": "deepseek-v4-flash",
+                "base_url": "https://api.deepseek.com",
+                "api_key": "secret",
+                "timeout": 90,
+            }
+        },
+    )
+    calls = []
+
+    class InvalidResponseError(Exception):
+        pass
+
+    async def complete(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("response_format"):
+            raise InvalidResponseError("Received empty content from OpenAI API")
+        return '{"entities":[],"relationships":[]}'
+
+    monkeypatch.setattr(lightrag_service, "openai_complete_if_cache", complete)
+    kg_func = service._make_llm_func_for("kg")
+
+    result = asyncio.run(
+        kg_func(
+            "extract",
+            system_prompt="return JSON",
+            response_format={"type": "json_object"},
+        )
+    )
+
+    assert result == '{"entities":[],"relationships":[]}'
+    assert calls[0]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in calls[1]
+
+
 def test_document_loader_supports_current_upload_types(tmp_path: Path):
     from src.doc_processor.loader import DocumentLoader
 

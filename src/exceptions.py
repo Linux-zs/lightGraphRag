@@ -25,3 +25,15 @@ class GraphError(KnowledgeBaseError):
 
 class LLMError(KnowledgeBaseError):
     """LLM backend call error."""
+
+
+class ManifestCorruptedError(KnowledgeBaseError):
+    """The workspace manifest and its backup are both unreadable."""
+
+
+class RetrievalError(KnowledgeBaseError):
+    """A retrieval dependency failed before an answer could be generated."""
+
+
+class RuntimeLockError(KnowledgeBaseError):
+    """Another workbench process already owns the runtime data directory."""
