@@ -670,17 +670,27 @@ class LightRAGService:
             keyword_extraction: bool = False,
             **kwargs: Any,
         ):
-            return await openai_complete_if_cache(
-                model=model,
-                prompt=prompt,
-                system_prompt=system_prompt,
-                history_messages=history_messages or [],
-                base_url=base_url,
-                api_key=api_key,
-                timeout=timeout,
-                keyword_extraction=keyword_extraction,
-                **kwargs,
-            )
+            try:
+                return await openai_complete_if_cache(
+                    model=model,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    history_messages=history_messages or [],
+                    base_url=base_url,
+                    api_key=api_key,
+                    timeout=timeout,
+                    keyword_extraction=keyword_extraction,
+                    **kwargs,
+                )
+            except Exception as exc:
+                logger.error(
+                    "{} model call failed: model={}, api={}, root={}",
+                    purpose,
+                    model,
+                    base_url,
+                    self._kg_failure_detail(exc),
+                )
+                raise
 
         return siliconflow_complete
 
@@ -745,6 +755,13 @@ class LightRAGService:
             "structured_line_ratio": float(cfg.get("kg_structured_line_ratio", 0.72)),
             "skip_timed_out_chunks": bool(cfg.get("kg_skip_timed_out_chunks", True)),
             "max_timed_out_chunks": max(0, int(cfg.get("kg_max_timed_out_chunks", 3))),
+            "skip_invalid_response_chunks": bool(
+                cfg.get("kg_skip_invalid_response_chunks", True)
+            ),
+            "max_invalid_response_chunks": max(
+                0,
+                int(cfg.get("kg_max_invalid_response_chunks", 3)),
+            ),
         }
 
     @staticmethod
@@ -817,14 +834,92 @@ class LightRAGService:
         return kept, stats
 
     @staticmethod
-    def _timed_out_chunk_id(chunks: dict[str, Any], error: BaseException) -> str:
-        message = str(error)
-        if "timeout" not in message.lower():
+    def _exception_chain(error: BaseException) -> list[BaseException]:
+        """Return wrapper, Tenacity attempt, cause, and context exceptions."""
+        pending = [error]
+        chain: list[BaseException] = []
+        seen: set[int] = set()
+        while pending:
+            current = pending.pop(0)
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            chain.append(current)
+
+            last_attempt = getattr(current, "last_attempt", None)
+            if last_attempt is not None:
+                exception_getter = getattr(last_attempt, "exception", None)
+                if callable(exception_getter):
+                    try:
+                        attempt_error = exception_getter()
+                    except Exception:
+                        attempt_error = None
+                    if isinstance(attempt_error, BaseException):
+                        pending.append(attempt_error)
+
+            cause = getattr(current, "__cause__", None)
+            context = getattr(current, "__context__", None)
+            if isinstance(cause, BaseException):
+                pending.append(cause)
+            if isinstance(context, BaseException):
+                pending.append(context)
+        return chain
+
+    @classmethod
+    def _kg_failure_kind(cls, error: BaseException) -> str:
+        chain = cls._exception_chain(error)
+        details = " | ".join(
+            f"{type(item).__name__}: {item}" for item in chain
+        ).lower()
+        if "timeout" in details or "timed out" in details:
+            return "timeout"
+        if any(type(item).__name__ == "InvalidResponseError" for item in chain):
+            return "invalid_response"
+        if (
+            "received empty content from openai api" in details
+            or "invalid response from openai api" in details
+        ):
+            return "invalid_response"
+        return ""
+
+    @classmethod
+    def _kg_failure_detail(cls, error: BaseException) -> str:
+        chain = cls._exception_chain(error)
+        meaningful = [
+            item
+            for item in chain
+            if type(item).__name__ not in {"RetryError"}
+        ]
+        target = meaningful[-1] if meaningful else chain[-1]
+        return f"{type(target).__name__}: {target}"
+
+    @classmethod
+    def _failed_kg_chunk_id(
+        cls,
+        chunks: dict[str, Any],
+        error: BaseException,
+        *,
+        required_kind: str = "",
+    ) -> str:
+        if required_kind and cls._kg_failure_kind(error) != required_kind:
             return ""
+        message = " | ".join(str(item) for item in cls._exception_chain(error))
         matches = [str(chunk_id) for chunk_id in chunks if str(chunk_id) in message]
         return max(matches, key=len, default="")
 
-    async def _extract_entities_with_timeout_recovery(
+    @classmethod
+    def _timed_out_chunk_id(
+        cls,
+        chunks: dict[str, Any],
+        error: BaseException,
+    ) -> str:
+        return cls._failed_kg_chunk_id(
+            chunks,
+            error,
+            required_kind="timeout",
+        )
+
+    async def _extract_entities_with_recovery(
         self,
         original_extract: Callable[..., Awaitable[Any]],
         chunks: dict[str, Any],
@@ -835,35 +930,69 @@ class LightRAGService:
         settings = self._kg_filter_settings()
         remaining = dict(chunks)
         timed_out: list[str] = []
+        invalid_responses: list[str] = []
 
         while remaining:
             try:
                 return await original_extract(remaining, *args, **kwargs)
-            except TimeoutError as exc:
-                chunk_id = self._timed_out_chunk_id(remaining, exc)
-                can_skip = (
-                    settings["skip_timed_out_chunks"]
-                    and bool(chunk_id)
-                    and len(timed_out) < settings["max_timed_out_chunks"]
+            except Exception as exc:
+                failure_kind = self._kg_failure_kind(exc)
+                chunk_id = self._failed_kg_chunk_id(
+                    remaining,
+                    exc,
+                    required_kind=failure_kind,
                 )
-                if not can_skip:
+                if failure_kind == "timeout":
+                    skipped = timed_out
+                    skip_enabled = settings["skip_timed_out_chunks"]
+                    skip_limit = settings["max_timed_out_chunks"]
+                    stats_key = "timed_out"
+                    reason_key = "llm_timeout"
+                    label = "timed out"
+                elif failure_kind == "invalid_response":
+                    skipped = invalid_responses
+                    skip_enabled = settings["skip_invalid_response_chunks"]
+                    skip_limit = settings["max_invalid_response_chunks"]
+                    stats_key = "invalid_response_chunks"
+                    reason_key = "llm_invalid_response"
+                    label = "returned an empty or invalid response"
+                else:
                     raise
 
-                timed_out.append(chunk_id)
+                can_skip = skip_enabled and bool(chunk_id) and len(skipped) < skip_limit
+                if not can_skip:
+                    if failure_kind == "invalid_response":
+                        kg_runtime = self._runtime_models().get("kg", {})
+                        raise RuntimeError(
+                            "KG model returned an empty or invalid response "
+                            f"for chunk {chunk_id or 'unknown'} after retries. "
+                            f"Model={kg_runtime.get('model', '')}, "
+                            f"API={kg_runtime.get('base_url', '')}, "
+                            f"detail={self._kg_failure_detail(exc)}"
+                        ) from exc
+                    raise
+
+                skipped.append(chunk_id)
                 remaining.pop(chunk_id, None)
-                stats["timed_out"] = list(timed_out)
+                stats[stats_key] = list(skipped)
                 stats["kept"] = len(remaining)
                 stats["skipped"] = int(stats.get("skipped") or 0) + 1
                 reasons = stats.setdefault("reasons", {})
-                reasons["llm_timeout"] = int(reasons.get("llm_timeout") or 0) + 1
+                reasons[reason_key] = int(reasons.get(reason_key) or 0) + 1
                 self._last_kg_filter_stats = stats
+                kg_runtime = self._runtime_models().get("kg", {})
                 logger.warning(
-                    "KG extraction timed out for chunk {} in workspace {}; "
-                    "skipping this chunk and continuing ({}/{})",
+                    "KG extraction {} for chunk {} in workspace {}; "
+                    "skipping this chunk and continuing ({}/{}). "
+                    "model={}, api={}, detail={}",
+                    label,
                     chunk_id,
                     self.workspace,
-                    len(timed_out),
-                    settings["max_timed_out_chunks"],
+                    len(skipped),
+                    skip_limit,
+                    kg_runtime.get("model", ""),
+                    kg_runtime.get("base_url", ""),
+                    self._kg_failure_detail(exc),
                 )
 
         return []
@@ -933,7 +1062,7 @@ class LightRAGService:
                     if isinstance(filtered_chunks, dict) and not filtered_chunks:
                         return []
                     if isinstance(filtered_chunks, dict):
-                        return await self._extract_entities_with_timeout_recovery(
+                        return await self._extract_entities_with_recovery(
                             original_extract,
                             filtered_chunks,
                             args[1:],
@@ -996,7 +1125,7 @@ class LightRAGService:
         if skip_kg:
             return "skipped"
         stats = self._last_kg_filter_stats or {}
-        if stats.get("timed_out"):
+        if stats.get("timed_out") or stats.get("invalid_response_chunks"):
             return "partial"
         if stats.get("enabled") and stats.get("total") and not stats.get("kept"):
             return "filtered_empty"

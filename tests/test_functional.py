@@ -23,6 +23,7 @@ def test_config_loading_for_lightrag_stack():
     assert "不要把原文逐条搬运成答案" in config["answer_generation"]["system_prompt"]
     assert config["lightrag"]["kg_skip_low_value_chunks"] is True
     assert config["lightrag"]["kg_skip_timed_out_chunks"] is True
+    assert config["lightrag"]["kg_skip_invalid_response_chunks"] is True
     assert config["lightrag"]["entity_extract_max_entities"] == 24
     assert config["lightrag"]["entity_extract_max_records"] == 48
     assert config["siliconflow"]["kg_max_tokens"] == 1536
@@ -152,7 +153,7 @@ def test_kg_timeout_recovery_skips_only_the_failed_chunk(tmp_path: Path):
 
     stats = {"kept": 2, "skipped": 0, "reasons": {}}
     result = asyncio.run(
-        service._extract_entities_with_timeout_recovery(
+        service._extract_entities_with_recovery(
             extract,
             chunks,
             (),
@@ -167,6 +168,60 @@ def test_kg_timeout_recovery_skips_only_the_failed_chunk(tmp_path: Path):
         ["doc_abc-chunk-001"],
     ]
     assert stats["timed_out"] == ["doc_abc-chunk-002"]
+    assert service._kg_status_for_success(skip_kg=False) == "partial"
+
+
+def test_kg_invalid_response_recovery_skips_only_the_failed_chunk(tmp_path: Path):
+    from src.lightrag_service import LightRAGService
+
+    service = LightRAGService(
+        {
+            "paths": {"data_dir": str(tmp_path), "lightrag_dir": str(tmp_path / "lightrag")},
+            "lightrag": {
+                "workspace": "test",
+                "kg_skip_invalid_response_chunks": True,
+                "kg_max_invalid_response_chunks": 2,
+            },
+            "siliconflow": {},
+        },
+        workspace="test",
+    )
+    chunks = {
+        "doc_abc-chunk-001": {"content": "正常内容"},
+        "doc_abc-chunk-005": {"content": "模型返回空内容"},
+    }
+    calls: list[list[str]] = []
+
+    class InvalidResponseError(Exception):
+        pass
+
+    async def extract(current_chunks, *args, **kwargs):
+        calls.append(list(current_chunks))
+        if "doc_abc-chunk-005" in current_chunks:
+            error = InvalidResponseError("Received empty content from OpenAI API")
+            raise RuntimeError(
+                "C[1/2]: doc_abc-chunk-005: extract LLM func"
+            ) from error
+        return ["ok"]
+
+    stats = {"kept": 2, "skipped": 0, "reasons": {}}
+    result = asyncio.run(
+        service._extract_entities_with_recovery(
+            extract,
+            chunks,
+            (),
+            {},
+            stats,
+        )
+    )
+
+    assert result == ["ok"]
+    assert calls == [
+        ["doc_abc-chunk-001", "doc_abc-chunk-005"],
+        ["doc_abc-chunk-001"],
+    ]
+    assert stats["invalid_response_chunks"] == ["doc_abc-chunk-005"]
+    assert stats["reasons"]["llm_invalid_response"] == 1
     assert service._kg_status_for_success(skip_kg=False) == "partial"
 
 

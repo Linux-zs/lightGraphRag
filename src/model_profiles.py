@@ -520,6 +520,93 @@ async def test_chat(profile_id: str, model: str, config: dict[str, Any] | None =
     return {"ok": True, "model": model, "usage": data.get("usage", {})}
 
 
+async def test_kg(profile_id: str, model: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Test the structured, non-empty response contract used by KG extraction."""
+    cfg = config or get_config()
+    profile = get_profile_with_key(profile_id, cfg)
+    headers = _auth_headers(_require_api_key(profile), json_content=True)
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是实体关系抽取器，只输出合法 JSON 对象。",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "从句子“A系统依赖B数据库”中抽取实体和关系，"
+                    '输出格式：{"entities":[],"relationships":[]}。'
+                ),
+            },
+        ],
+        "max_tokens": min(int(cfg.get("siliconflow", {}).get("kg_max_tokens", 1536)), 512),
+        "temperature": 0,
+    }
+    if bool(cfg.get("lightrag", {}).get("entity_extraction_use_json", True)):
+        payload["response_format"] = {"type": "json_object"}
+
+    model_name = (model or "").lower()
+    hybrid_markers = (
+        "qwen3",
+        "glm-4.5",
+        "glm-4.6",
+        "glm-5",
+        "deepseek-v3.1",
+        "deepseek-v3.2",
+        "hunyuan-a13b",
+    )
+    if (
+        bool(cfg.get("lightrag", {}).get("disable_thinking", True))
+        and "instruct" not in model_name
+        and "coder" not in model_name
+        and any(marker in model_name for marker in hybrid_markers)
+    ):
+        payload["enable_thinking"] = False
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            f"{profile['api_base'].rstrip('/')}/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    choices = data.get("choices") if isinstance(data, dict) else None
+    message = choices[0].get("message") if isinstance(choices, list) and choices else None
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str) or not content.strip():
+        request_id = response.headers.get("x-request-id", "")
+        raise ValueError(
+            "KG 模型接口返回成功，但 choices[0].message.content 为空；"
+            "该模型或代理与 LightRAG 实体抽取不兼容"
+            + (f"（request_id={request_id}）" if request_id else "")
+        )
+
+    if payload.get("response_format"):
+        candidate = content.strip()
+        if candidate.startswith("```"):
+            candidate = candidate.removeprefix("```json").removeprefix("```")
+            candidate = candidate.removesuffix("```").strip()
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "KG 模型未返回合法 JSON；请更换支持 JSON Object 模式的模型。"
+                f"响应预览：{content[:160]}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("KG 模型返回的 JSON 顶层不是对象")
+
+    return {
+        "ok": True,
+        "model": model,
+        "usage": data.get("usage", {}),
+        "preview": content[:300],
+    }
+
+
 async def test_embedding(profile_id: str, model: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
     profile = get_profile_with_key(profile_id, config)
     headers = _auth_headers(_require_api_key(profile), json_content=True)

@@ -49,6 +49,7 @@ from src.model_profiles import (
     save_bindings,
     test_chat,
     test_embedding,
+    test_kg,
     test_rerank,
     upsert_profile,
 )
@@ -2672,6 +2673,9 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                         "kg_timed_out_chunks": list(
                             (item.get("kg_filter") or {}).get("timed_out") or []
                         ),
+                        "kg_invalid_response_chunks": list(
+                            (item.get("kg_filter") or {}).get("invalid_response_chunks") or []
+                        ),
                         "stage_timings": stage_timings,
                     }
                     results.append(result)
@@ -2867,6 +2871,9 @@ async def _run_graph_backfill_task(task_id: str, req: GraphBackfillRequest) -> N
                         "kg_relation_count": item.get("kg_relation_count", 0),
                         "kg_timed_out_chunks": list(
                             (item.get("kg_filter") or {}).get("timed_out") or []
+                        ),
+                        "kg_invalid_response_chunks": list(
+                            (item.get("kg_filter") or {}).get("invalid_response_chunks") or []
                         ),
                         "stage_timings": stage_timings,
                     }
@@ -3932,6 +3939,15 @@ async def api_test_chat_model(req: ModelCapabilityTestRequest):
     except Exception as exc:
         logger.exception("Chat model test failed")
         raise HTTPException(400, f"Chat model test failed: {exc}")
+
+
+@app.post("/api/model-profiles/test-kg")
+async def api_test_kg_model(req: ModelCapabilityTestRequest):
+    try:
+        return await test_kg(req.profile_id, req.model, get_config())
+    except Exception as exc:
+        logger.exception("KG model test failed")
+        raise HTTPException(400, f"KG model test failed: {exc}")
 
 
 @app.post("/api/model-profiles/test-embedding")

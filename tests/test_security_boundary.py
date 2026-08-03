@@ -119,3 +119,65 @@ def test_siliconflow_backend_omits_empty_authorization_header():
     backend = SiliconFlowBackend({"api_key": ""})
 
     assert "Authorization" not in backend._headers()
+
+
+def test_kg_model_test_uses_structured_output_and_rejects_empty_content(monkeypatch):
+    payloads = []
+    responses = [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"entities":[],"relationships":[]}'
+                    }
+                }
+            ],
+            "usage": {},
+        },
+        {"choices": [{"message": {"content": ""}}], "usage": {}},
+    ]
+
+    class FakeResponse:
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return responses.pop(0)
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, _url, *, headers, json):
+            payloads.append(json)
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        model_profiles,
+        "get_profile_with_key",
+        lambda *_args, **_kwargs: {
+            "api_base": "https://example.com/v1",
+            "api_key": "secret",
+        },
+    )
+    monkeypatch.setattr(model_profiles.httpx, "AsyncClient", lambda **_kwargs: FakeClient())
+    config = {
+        "lightrag": {
+            "entity_extraction_use_json": True,
+            "disable_thinking": True,
+        },
+        "siliconflow": {"kg_max_tokens": 1536},
+    }
+
+    result = asyncio.run(model_profiles.test_kg("profile", "example-model", config))
+    assert result["ok"] is True
+    assert payloads[0]["response_format"] == {"type": "json_object"}
+    assert payloads[0]["max_tokens"] == 512
+
+    with pytest.raises(ValueError, match="content 为空"):
+        asyncio.run(model_profiles.test_kg("profile", "example-model", config))

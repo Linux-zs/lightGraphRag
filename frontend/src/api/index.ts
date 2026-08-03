@@ -621,6 +621,13 @@ export function testChatModel(profile_id: string, model: string) {
   })
 }
 
+export function testKgModel(profile_id: string, model: string) {
+  return request<{ ok: boolean; model: string; usage?: Record<string, unknown>; preview: string }>('/model-profiles/test-kg', {
+    method: 'POST',
+    body: JSON.stringify({ profile_id, model }),
+  })
+}
+
 export function testEmbeddingModel(profile_id: string, model: string) {
   return request<{ ok: boolean; model: string; dimensions: number; preview: number[] }>('/model-profiles/test-embedding', {
     method: 'POST',

@@ -50,6 +50,10 @@ lightrag:
   # 只跳过该块的实体关系抽取；超过上限后才终止文档索引。
   kg_skip_timed_out_chunks: true
   kg_max_timed_out_chunks: 3
+  # OpenAI 兼容接口偶尔会返回 200 但 choices/content 为空。单个异常 chunk
+  # 不应让整份文档的文本和向量索引失败；超过上限通常说明 KG 模型或接口不兼容。
+  kg_skip_invalid_response_chunks: true
+  kg_max_invalid_response_chunks: 3
   workspace: default
 llm:
   backend: siliconflow

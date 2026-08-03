@@ -18,6 +18,7 @@ import {
   saveModelProfile,
   testChatModel,
   testEmbeddingModel,
+  testKgModel,
   testRerankModel,
   updateModelBindings,
   updateModelConfig,
@@ -372,9 +373,12 @@ export default function ModelSettings({ workspace }: Props) {
     setTesting(purpose)
     setMessage('')
     try {
-      if (purpose === 'chat' || purpose === 'kg') {
+      if (purpose === 'chat') {
         await testChatModel(binding.profile_id, binding.model)
-        setMessage(purpose === 'kg' ? 'KG 抽取模型测试通过' : '大语言模型测试通过')
+        setMessage('大语言模型测试通过')
+      } else if (purpose === 'kg') {
+        await testKgModel(binding.profile_id, binding.model)
+        setMessage('KG 抽取模型测试通过，结构化 JSON 响应正常')
       } else if (purpose === 'embedding') {
         const result = await testEmbeddingModel(binding.profile_id, binding.model)
         updateBinding('embedding', { embed_dim: result.dimensions })
