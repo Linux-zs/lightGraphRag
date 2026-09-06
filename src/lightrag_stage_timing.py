@@ -36,6 +36,7 @@ import inspect
 import logging
 import time
 from contextlib import contextmanager
+from functools import wraps
 from typing import Any, Callable
 
 _STAGE_KEYS = ("parse", "vector", "kg", "merge")
@@ -52,6 +53,7 @@ except Exception:  # pragma: no cover - defensive
 # Active collector for the current ainsert scope. Wrappers read this so the
 # timing is attributed to the right document even across concurrent workspaces.
 _ACTIVE_COLLECTOR = contextvars.ContextVar("lightgraphrag_stage_collector", default=None)
+_ACTIVE_STAGES = contextvars.ContextVar("lightgraphrag_active_stages", default=frozenset())
 
 
 class StageTimingCollector:
@@ -95,6 +97,11 @@ class StageTimingCollector:
             _ACTIVE_COLLECTOR.reset(token)
 
 
+def time_index_stage(key: str):
+    """Time an adapter stage once, suppressing nested SDK timing hooks."""
+    return lambda func: _wrap_async(func, key)
+
+
 def _wrap_async(orig, key: str, *, activate_current_stage: bool = True):
     """Wrap an async callable, attributing its wall time to ``key``.
 
@@ -104,17 +111,20 @@ def _wrap_async(orig, key: str, *, activate_current_stage: bool = True):
     if getattr(orig, "_lightgraphrag_timing_wrapped", False):
         return orig
 
+    @wraps(orig)
     async def wrapper(*args, **kwargs):
         coll = _ACTIVE_COLLECTOR.get()
-        if coll is None:
+        if coll is None or key in _ACTIVE_STAGES.get():
             return await orig(*args, **kwargs)
+        token = _ACTIVE_STAGES.set(_ACTIVE_STAGES.get() | {key})
         start = time.perf_counter()
-        if activate_current_stage:
-            await coll.notify(key, "start")
         try:
+            if activate_current_stage:
+                await coll.notify(key, "start")
             return await orig(*args, **kwargs)
         finally:
             coll.t[key] += time.perf_counter() - start
+            _ACTIVE_STAGES.reset(token)
             await coll.notify(key, "finish")
 
     wrapper._lightgraphrag_timing_wrapped = True

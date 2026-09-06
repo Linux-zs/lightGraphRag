@@ -30,7 +30,8 @@ from loguru import logger
 from src.config_loader import get_config
 from src.doc_processor.parsers.base_parser import Document
 from src.exceptions import ManifestCorruptedError
-from src.lightrag_stage_timing import install_stage_timing
+from src.kg_request_policy import complete_kg
+from src.lightrag_stage_timing import install_stage_timing, time_index_stage
 from src.model_profiles import get_runtime_model_config
 
 
@@ -735,6 +736,17 @@ class LightRAGService:
             keyword_extraction: bool = False,
             **kwargs: Any,
         ):
+            if purpose == "kg":
+                return await complete_kg(
+                    openai_complete_if_cache,
+                    failure_kind=self._kg_failure_kind,
+                    workspace=self.workspace,
+                    settings=self.config.get("lightrag", {}),
+                    model=model, prompt=prompt, system_prompt=system_prompt,
+                    history_messages=history_messages or [], base_url=base_url,
+                    api_key=api_key, timeout=timeout,
+                    keyword_extraction=keyword_extraction, **kwargs,
+                )
             try:
                 return await openai_complete_if_cache(
                     model=model,
@@ -748,42 +760,6 @@ class LightRAGService:
                     **kwargs,
                 )
             except Exception as exc:
-                can_fallback_json_mode = (
-                    purpose == "kg"
-                    and kwargs.get("response_format") is not None
-                    and self._kg_failure_kind(exc) == "invalid_response"
-                )
-                if can_fallback_json_mode:
-                    fallback_kwargs = dict(kwargs)
-                    fallback_kwargs.pop("response_format", None)
-                    logger.warning(
-                        "KG model returned empty content in forced JSON mode; "
-                        "retrying once without response_format. model={}, api={}, root={}",
-                        model,
-                        base_url,
-                        self._kg_failure_detail(exc),
-                    )
-                    try:
-                        return await openai_complete_if_cache(
-                            model=model,
-                            prompt=prompt,
-                            system_prompt=system_prompt,
-                            history_messages=history_messages or [],
-                            base_url=base_url,
-                            api_key=api_key,
-                            timeout=timeout,
-                            keyword_extraction=keyword_extraction,
-                            **fallback_kwargs,
-                        )
-                    except Exception as fallback_exc:
-                        logger.error(
-                            "{} model fallback call failed: model={}, api={}, root={}",
-                            purpose,
-                            model,
-                            base_url,
-                            self._kg_failure_detail(fallback_exc),
-                        )
-                        raise
                 logger.error(
                     "{} model call failed: model={}, api={}, root={}",
                     purpose,
@@ -1020,6 +996,7 @@ class LightRAGService:
             required_kind="timeout",
         )
 
+    @time_index_stage("kg")
     async def _extract_entities_with_recovery(
         self,
         original_extract: Callable[..., Awaitable[Any]],
@@ -1027,76 +1004,121 @@ class LightRAGService:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         stats: dict[str, Any],
+        *,
+        max_async: int | None = None,
     ) -> Any:
+        """Isolate SDK fail-fast extraction to one chunk per bounded worker."""
         settings = self._kg_filter_settings()
-        remaining = dict(chunks)
+        if not chunks:
+            return []
+        concurrency = max(1, int(
+            max_async if max_async is not None
+            else self.config.get("lightrag", {}).get("llm_model_max_async", 4)
+        ))
+        work = iter(enumerate(chunks.items()))
+        results: list[list[Any]] = [[] for _ in chunks]
+        fatal_errors: list[Exception] = []
         timed_out: list[str] = []
         invalid_responses: list[str] = []
+        loop = asyncio.get_running_loop()
+        queued_at = loop.time()
+        diagnostics: dict[str, Any] = {}
+        stats["chunk_diagnostics"] = diagnostics
+        self._last_kg_filter_stats = stats
 
-        while remaining:
-            try:
-                return await original_extract(remaining, *args, **kwargs)
-            except Exception as exc:
-                failure_kind = self._kg_failure_kind(exc)
-                chunk_id = self._failed_kg_chunk_id(
-                    remaining,
-                    exc,
-                    required_kind=failure_kind,
+        def record_failure(chunk_id: str, exc: Exception) -> None:
+            failure_kind = self._kg_failure_kind(exc)
+            if failure_kind == "timeout":
+                skipped = timed_out
+                skip_enabled = settings["skip_timed_out_chunks"]
+                skip_limit = settings["max_timed_out_chunks"]
+                stats_key = "timed_out"
+                reason_key = "llm_timeout"
+            elif failure_kind == "invalid_response":
+                skipped = invalid_responses
+                skip_enabled = settings["skip_invalid_response_chunks"]
+                skip_limit = settings["max_invalid_response_chunks"]
+                stats_key = "invalid_response_chunks"
+                reason_key = "llm_invalid_response"
+            else:
+                raise exc
+
+            if not skip_enabled or len(skipped) >= skip_limit:
+                if failure_kind == "invalid_response":
+                    runtime = self._runtime_models().get("kg", {})
+                    raise RuntimeError(
+                        "KG model returned an empty or invalid response "
+                        f"for chunk {chunk_id} after retries. "
+                        f"Model={runtime.get('model', '')}, "
+                        f"API={runtime.get('base_url', '')}, "
+                        f"detail={self._kg_failure_detail(exc)}"
+                    ) from exc
+                raise exc
+
+            skipped.append(chunk_id)
+            stats[stats_key] = list(skipped)
+            stats["kept"] = len(chunks) - len(timed_out) - len(invalid_responses)
+            stats["skipped"] = int(stats.get("skipped") or 0) + 1
+            reasons = stats.setdefault("reasons", {})
+            reasons[reason_key] = int(reasons.get(reason_key) or 0) + 1
+            logger.warning(
+                "KG chunk skipped workspace={} chunk={} reason={} count={}/{} root={}",
+                self.workspace, chunk_id, reason_key, len(skipped), skip_limit,
+                self._kg_failure_detail(exc),
+            )
+
+        async def worker() -> None:
+            while not fatal_errors:
+                try:
+                    index, (chunk_id, chunk) = next(work)
+                except StopIteration:
+                    return
+                started = loop.time()
+                diagnostic = {
+                    "queue_seconds": round(started - queued_at, 3),
+                    "status": "running",
+                }
+                diagnostics[chunk_id] = diagnostic
+                logger.info(
+                    "KG chunk started workspace={} chunk={} queue_seconds={}",
+                    self.workspace, chunk_id, diagnostic["queue_seconds"],
                 )
-                if failure_kind == "timeout":
-                    skipped = timed_out
-                    skip_enabled = settings["skip_timed_out_chunks"]
-                    skip_limit = settings["max_timed_out_chunks"]
-                    stats_key = "timed_out"
-                    reason_key = "llm_timeout"
-                    label = "timed out"
-                elif failure_kind == "invalid_response":
-                    skipped = invalid_responses
-                    skip_enabled = settings["skip_invalid_response_chunks"]
-                    skip_limit = settings["max_invalid_response_chunks"]
-                    stats_key = "invalid_response_chunks"
-                    reason_key = "llm_invalid_response"
-                    label = "returned an empty or invalid response"
-                else:
+                try:
+                    results[index] = await original_extract({chunk_id: chunk}, *args, **kwargs)
+                    diagnostic["status"] = "succeeded"
+                except asyncio.CancelledError:
+                    diagnostic["status"] = "cancelled"
                     raise
+                except Exception as exc:
+                    diagnostic["failure_kind"] = self._kg_failure_kind(exc)
+                    try:
+                        record_failure(chunk_id, exc)
+                        diagnostic["status"] = "skipped"
+                    except Exception as fatal:
+                        diagnostic["status"] = "failed"
+                        fatal_errors.append(fatal)
+                finally:
+                    # Includes role queueing, cache lookup, provider retries and parsing.
+                    # It must not be presented as pure HTTP or model inference time.
+                    diagnostic["processing_seconds"] = round(loop.time() - started, 3)
+                    logger.info(
+                        "KG chunk finished workspace={} chunk={} status={} "
+                        "queue_seconds={} processing_seconds={}",
+                        self.workspace, chunk_id, diagnostic["status"],
+                        diagnostic["queue_seconds"], diagnostic["processing_seconds"],
+                    )
 
-                can_skip = skip_enabled and bool(chunk_id) and len(skipped) < skip_limit
-                if not can_skip:
-                    if failure_kind == "invalid_response":
-                        kg_runtime = self._runtime_models().get("kg", {})
-                        raise RuntimeError(
-                            "KG model returned an empty or invalid response "
-                            f"for chunk {chunk_id or 'unknown'} after retries. "
-                            f"Model={kg_runtime.get('model', '')}, "
-                            f"API={kg_runtime.get('base_url', '')}, "
-                            f"detail={self._kg_failure_detail(exc)}"
-                        ) from exc
-                    raise
-
-                skipped.append(chunk_id)
-                remaining.pop(chunk_id, None)
-                stats[stats_key] = list(skipped)
-                stats["kept"] = len(remaining)
-                stats["skipped"] = int(stats.get("skipped") or 0) + 1
-                reasons = stats.setdefault("reasons", {})
-                reasons[reason_key] = int(reasons.get(reason_key) or 0) + 1
-                self._last_kg_filter_stats = stats
-                kg_runtime = self._runtime_models().get("kg", {})
-                logger.warning(
-                    "KG extraction {} for chunk {} in workspace {}; "
-                    "skipping this chunk and continuing ({}/{}). "
-                    "model={}, api={}, detail={}",
-                    label,
-                    chunk_id,
-                    self.workspace,
-                    len(skipped),
-                    skip_limit,
-                    kg_runtime.get("model", ""),
-                    kg_runtime.get("base_url", ""),
-                    self._kg_failure_detail(exc),
-                )
-
-        return []
+        workers = [asyncio.create_task(worker()) for _ in range(min(concurrency, len(chunks)))]
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            for task in workers:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+        if fatal_errors:
+            raise fatal_errors[0]
+        return [result for batch in results for result in batch]
 
     @contextmanager
     def _temporary_index_llm_and_kg_filter(
@@ -1169,6 +1191,7 @@ class LightRAGService:
                             args[1:],
                             kwargs,
                             stats,
+                            max_async=getattr(rag, "llm_model_max_async", None),
                         )
                     return await original_extract(filtered_chunks, *args[1:], **kwargs)
 

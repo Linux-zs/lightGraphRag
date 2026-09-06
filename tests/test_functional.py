@@ -164,8 +164,8 @@ def test_kg_timeout_recovery_skips_only_the_failed_chunk(tmp_path: Path):
 
     assert result == ["ok"]
     assert calls == [
-        ["doc_abc-chunk-001", "doc_abc-chunk-002"],
         ["doc_abc-chunk-001"],
+        ["doc_abc-chunk-002"],
     ]
     assert stats["timed_out"] == ["doc_abc-chunk-002"]
     assert service._kg_status_for_success(skip_kg=False) == "partial"
@@ -217,8 +217,8 @@ def test_kg_invalid_response_recovery_skips_only_the_failed_chunk(tmp_path: Path
 
     assert result == ["ok"]
     assert calls == [
-        ["doc_abc-chunk-001", "doc_abc-chunk-005"],
         ["doc_abc-chunk-001"],
+        ["doc_abc-chunk-005"],
     ]
     assert stats["invalid_response_chunks"] == ["doc_abc-chunk-005"]
     assert stats["reasons"]["llm_invalid_response"] == 1
