@@ -58,7 +58,7 @@ describe('index task polling recovery', () => {
       getIndexTaskWithRetry('task-2', controller.signal, 3, wait),
     ).rejects.toMatchObject({ name: 'AbortError' })
 
-    expect(api.getIndexTask).toHaveBeenCalledOnce()
+    expect(api.getIndexTask).not.toHaveBeenCalled()
     expect(wait).not.toHaveBeenCalled()
   })
 })

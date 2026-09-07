@@ -9,12 +9,15 @@ from loguru import logger
 from openai import APIConnectionError, APIStatusError
 from tenacity import stop_after_attempt
 
+from src.kg_response_validation import validate_extraction_response
+
 
 async def complete_kg(complete, *, failure_kind, workspace, settings, **kwargs):
     # Keep LightRAG's response handling, but own the retry budget in one place.
     retry_with = getattr(complete, "retry_with", None)
     single_call = retry_with(stop=stop_after_attempt(1), reraise=True) if retry_with else complete
     kwargs = dict(kwargs)
+    extraction_format = kwargs.pop("_kg_extraction_format", None)
     kwargs["openai_client_configs"] = {
         **kwargs.get("openai_client_configs", {}), "max_retries": 0,
     }
@@ -38,6 +41,8 @@ async def complete_kg(complete, *, failure_kind, workspace, settings, **kwargs):
         )
         try:
             result = await asyncio.wait_for(single_call(**kwargs), min(timeout, max(0, deadline - started)))
+            if extraction_format:
+                await validate_extraction_response(result, extraction_format)
             output_chars = len(result) if isinstance(result, str) else 0
             status = "succeeded"
             return result

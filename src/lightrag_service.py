@@ -30,7 +30,9 @@ from loguru import logger
 from src.config_loader import get_config
 from src.doc_processor.parsers.base_parser import Document
 from src.exceptions import ManifestCorruptedError
+from src.index_versioning import allow_document_replacement
 from src.kg_request_policy import complete_kg
+from src.kg_response_validation import ExtractionCacheView
 from src.lightrag_stage_timing import install_stage_timing, time_index_stage
 from src.model_profiles import get_runtime_model_config
 
@@ -1006,6 +1008,7 @@ class LightRAGService:
         stats: dict[str, Any],
         *,
         max_async: int | None = None,
+        cancellation: asyncio.Event | None = None,
     ) -> Any:
         """Isolate SDK fail-fast extraction to one chunk per bounded worker."""
         settings = self._kg_filter_settings()
@@ -1068,7 +1071,7 @@ class LightRAGService:
             )
 
         async def worker() -> None:
-            while not fatal_errors:
+            while not fatal_errors and not (cancellation and cancellation.is_set()):
                 try:
                     index, (chunk_id, chunk) = next(work)
                 except StopIteration:
@@ -1085,6 +1088,8 @@ class LightRAGService:
                 )
                 try:
                     results[index] = await original_extract({chunk_id: chunk}, *args, **kwargs)
+                    diagnostic["entity_count"] = sum(len(nodes) for nodes, _ in results[index])
+                    diagnostic["relation_count"] = sum(len(edges) for _, edges in results[index])
                     diagnostic["status"] = "succeeded"
                 except asyncio.CancelledError:
                     diagnostic["status"] = "cancelled"
@@ -1118,7 +1123,12 @@ class LightRAGService:
             await asyncio.gather(*workers, return_exceptions=True)
         if fatal_errors:
             raise fatal_errors[0]
-        return [result for batch in results for result in batch]
+        combined = [result for batch in results for result in batch]
+        stats["entity_count"] = len({key for nodes, _ in combined for key in nodes})
+        stats["relation_count"] = len({tuple(sorted(key)) for _, edges in combined for key in edges})
+        stats["empty_chunks"] = [key for key, value in diagnostics.items()
+                                 if value["status"] == "succeeded" and not value["entity_count"] and not value["relation_count"]]
+        return combined
 
     @contextmanager
     def _temporary_index_llm_and_kg_filter(
@@ -1154,7 +1164,13 @@ class LightRAGService:
             if max_records is not None:
                 rag.entity_extract_max_records = max(1, int(max_records))
             kg_runtime = self._runtime_models().get("kg", {})
-            kg_llm_func = self._make_kg_llm_func()
+            raw_kg_llm_func = self._make_kg_llm_func()
+            extraction_format = None
+
+            async def kg_llm_func(*args: Any, **kwargs: Any):
+                if extraction_format:
+                    kwargs["_kg_extraction_format"] = extraction_format
+                return await raw_kg_llm_func(*args, **kwargs)
             kg_llm_kwargs = self._llm_kwargs("kg")
             rag.llm_model_func = kg_llm_func
             rag.llm_model_name = kg_runtime.get("model") or original_llm_name
@@ -1171,6 +1187,7 @@ class LightRAGService:
 
             if original_extract is not None:
                 async def filtered_extract(*args: Any, **kwargs: Any):
+                    nonlocal extraction_format
                     if not args:
                         return await original_extract(*args, **kwargs)
                     filtered_chunks, stats = self._filter_kg_chunks(args[0])
@@ -1185,14 +1202,38 @@ class LightRAGService:
                     if isinstance(filtered_chunks, dict) and not filtered_chunks:
                         return []
                     if isinstance(filtered_chunks, dict):
-                        return await self._extract_entities_with_recovery(
+                        extraction_format = "json" if getattr(rag, "entity_extraction_use_json", True) else "text"
+                        original_cache = getattr(rag, "llm_response_cache", None)
+                        if original_cache is not None:
+                            rag.llm_response_cache = ExtractionCacheView(original_cache, extraction_format)
+                        cancellation = asyncio.Event()
+                        extraction = asyncio.create_task(self._extract_entities_with_recovery(
                             original_extract,
                             filtered_chunks,
                             args[1:],
                             kwargs,
                             stats,
                             max_async=getattr(rag, "llm_model_max_async", None),
-                        )
+                            cancellation=cancellation,
+                        ))
+                        try:
+                            # SDK extraction spawns children that don't follow parent cancellation.
+                            return await asyncio.shield(extraction)
+                        except asyncio.CancelledError:
+                            cancellation.set()
+                            state = getattr(rag, "_role_llm_states", {}).get("extract")
+                            shutdown = getattr(getattr(state, "wrapped", None), "shutdown", None)
+                            try:
+                                if shutdown is not None:
+                                    await shutdown(graceful=False)
+                            finally:
+                                # Do not delete the temporary index until nested SDK work has stopped.
+                                await asyncio.gather(extraction, return_exceptions=True)
+                            raise
+                        finally:
+                            extraction_format = None
+                            if original_cache is not None:
+                                rag.llm_response_cache = original_cache
                     return await original_extract(filtered_chunks, *args[1:], **kwargs)
 
                 rag._process_extract_entities = filtered_extract
@@ -1225,6 +1266,28 @@ class LightRAGService:
                     except AttributeError:
                         pass
 
+    def _document_chunk_options(self, chunk_size=None, chunk_overlap=None, separators=None) -> dict[str, Any]:
+        defaults = self.config.get("chunking", {})
+        size = int(chunk_size if chunk_size is not None else defaults.get("chunk_size", 512))
+        overlap = int(chunk_overlap if chunk_overlap is not None else defaults.get("chunk_overlap", 50))
+        if size <= 0 or not 0 <= overlap < size:
+            raise ValueError("chunk_overlap must be non-negative and smaller than chunk_size")
+        splitters = list(separators if separators is not None else defaults.get("separators", ["\n\n", "\n", "。", " ", ""]))
+        if "" not in splitters:
+            splitters.append("")
+        return {"chunk_token_size": size, "recursive_character": {"chunk_overlap_token_size": overlap, "separators": splitters}}
+
+    async def preview_document_chunks(self, doc: Document, *, chunk_size=None, chunk_overlap=None, separators=None) -> list[dict[str, Any]]:
+        from lightrag.chunker import chunking_by_recursive_character
+
+        options = self._document_chunk_options(chunk_size, chunk_overlap, separators)
+        rag = await self.get_rag()
+        return await asyncio.to_thread(
+            chunking_by_recursive_character, rag.tokenizer,
+            sanitize_text_for_encoding(doc.raw_text).strip(), options["chunk_token_size"],
+            **options["recursive_character"],
+        )
+
     async def _insert_document_text(
         self,
         rag: LightRAG,
@@ -1232,15 +1295,14 @@ class LightRAGService:
         doc_id: str,
         *,
         skip_kg: bool,
+        chunk_options: dict[str, Any] | None = None,
     ) -> str:
-        if not skip_kg:
-            return await rag.ainsert(doc.raw_text, ids=[doc_id], file_paths=[doc.file_path])
-
         track_id = await rag.apipeline_enqueue_documents(
             doc.raw_text,
             ids=[doc_id],
             file_paths=[doc.file_path],
-            process_options="!",
+            process_options="R!" if skip_kg else "R",
+            chunk_options=chunk_options or self._document_chunk_options(),
         )
         await rag.apipeline_process_enqueue_documents()
         return track_id
@@ -1253,6 +1315,8 @@ class LightRAGService:
             return "partial"
         if stats.get("enabled") and stats.get("total") and not stats.get("kept"):
             return "filtered_empty"
+        if stats.get("entity_count") == 0 and stats.get("relation_count") == 0:
+            return "no_entities"
         return "complete"
 
     @property
@@ -2045,15 +2109,7 @@ class LightRAGService:
         await self.cleanup_interrupted_index_docs()
         index_mode = "fast" if str(index_mode).lower() == "fast" else "complete"
         skip_kg = index_mode == "fast"
-        if chunk_size is not None:
-            rag.chunk_token_size = chunk_size
-        if chunk_overlap is not None:
-            rag.chunk_overlap_token_size = chunk_overlap
-        if separators is not None:
-            rag.addon_params = rag.addon_params or {}
-            rag.addon_params.setdefault("chunker", {}).setdefault("recursive_character", {})[
-                "separators"
-            ] = separators
+        chunk_options = self._document_chunk_options(chunk_size, chunk_overlap, separators)
         guidance = self.graph_extraction_guidance()
         if guidance:
             rag.addon_params["entity_types_guidance"] = guidance
@@ -2092,6 +2148,7 @@ class LightRAGService:
         item["last_index_attempt_status"] = "processing"
         manifest["documents"][doc_id] = item
         self._save_manifest(manifest)
+        published = False
         try:
             collector = install_stage_timing(rag)
             collector.on_update = stage_update_callback
@@ -2101,6 +2158,8 @@ class LightRAGService:
                     skip_kg=skip_kg,
                     max_entities=kg_max_entities,
                     max_records=kg_max_records,
+                ), allow_document_replacement(
+                    rag, [previous_active_id, *item.get("retired_index_doc_ids", [])] if previous_active_id else [],
                 ):
                     with collector.scope():
                         result = await self._insert_document_text(
@@ -2108,13 +2167,17 @@ class LightRAGService:
                             doc,
                             index_doc_id,
                             skip_kg=skip_kg,
+                            chunk_options=chunk_options,
                         )
                 self._last_stage_timings = collector.to_stages()
             finally:
                 collector.on_update = None
             status = await self.get_doc_status(index_doc_id)
-            if status and status.status == "failed":
-                raise RuntimeError(status.error_msg or "LightRAG document processing failed")
+            if status is None or status.status != "processed":
+                raise RuntimeError(
+                    (status.error_msg if status else "")
+                    or "LightRAG did not produce a processed index version; the previous index was preserved"
+                )
 
             retired_ids = list(item.get("retired_index_doc_ids") or [])
             if previous_active_id and previous_active_id != index_doc_id:
@@ -2145,12 +2208,15 @@ class LightRAGService:
                     "chunks_list": status.chunks_list if status else item.get("chunks_list", []),
                     "error_msg": status.error_msg if status else "",
                     "chunking": {
-                        "chunk_size": chunk_size,
-                        "chunk_overlap": chunk_overlap,
-                        "separators": separators,
+                        "chunk_size": chunk_options["chunk_token_size"],
+                        "chunk_overlap": chunk_options["recursive_character"]["chunk_overlap_token_size"],
+                        "separators": chunk_options["recursive_character"]["separators"],
+                        "strategy": "recursive_token",
                     },
                     "index_mode": index_mode,
                     "kg_status": self._kg_status_for_success(skip_kg=skip_kg),
+                    "kg_entity_count": self._last_kg_filter_stats.get("entity_count", 0),
+                    "kg_relation_count": self._last_kg_filter_stats.get("relation_count", 0),
                     "kg_filter": self._last_kg_filter_stats,
                     "kg_model": "" if skip_kg else self._runtime_models().get("kg", {}).get("model", ""),
                     "kg_extraction_limits": {
@@ -2163,32 +2229,15 @@ class LightRAGService:
                 }
             )
             manifest["documents"][doc_id] = item
-            self._save_manifest(manifest)
             self.record_embedding_signature(embedding_snapshot, overwrite=True)
-            if previous_active_id and previous_active_id != index_doc_id:
-                try:
-                    deletion = await rag.adelete_by_doc_id(previous_active_id)
-                    deletion_status = str(
-                        getattr(deletion, "status", "") or ""
-                    ).lower()
-                    if deletion_status in {"success", "not_found"}:
-                        latest = self._load_manifest()
-                        latest_item = latest["documents"].get(doc_id, {})
-                        latest_item["retired_index_doc_ids"] = [
-                            value
-                            for value in latest_item.get("retired_index_doc_ids", [])
-                            if value != previous_active_id
-                        ]
-                        latest["documents"][doc_id] = latest_item
-                        self._save_manifest(latest)
-                except Exception as cleanup_exc:
-                    logger.warning(
-                        "Retaining old index version {} after cleanup failure: {}",
-                        previous_active_id,
-                        cleanup_exc,
-                    )
-            return item
+            self._save_manifest(manifest)
+            published = True
+            await self.cleanup_retired_index_docs(doc_id)
+            return self._load_manifest()["documents"][doc_id]
         except (Exception, asyncio.CancelledError) as exc:
+            # Publication is the commit point. Retirement must never roll it back.
+            if published:
+                raise
             latest = self._load_manifest()
             failed_item = {
                 **previous_item,
@@ -2332,6 +2381,7 @@ class LightRAGService:
             raise KeyError(f"Document not found in workspace: {doc_name_or_id}")
 
         doc_id, item = match
+        index_doc_id = str(item.get("active_index_doc_id") or doc_id)
         if not item.get("indexed"):
             raise ValueError("Document must be indexed before graph backfill")
         chunk_ids = list(item.get("chunks_list") or [])
@@ -2347,7 +2397,7 @@ class LightRAGService:
                 continue
             chunks[chunk_id] = {
                 **record,
-                "full_doc_id": record.get("full_doc_id") or doc_id,
+                "full_doc_id": index_doc_id,
                 "file_path": record.get("file_path") or item.get("file_path") or item.get("doc_name"),
             }
         if not chunks:
@@ -2401,7 +2451,7 @@ class LightRAGService:
                     global_config=rag._build_global_config(),
                     full_entities_storage=rag.full_entities,
                     full_relations_storage=rag.full_relations,
-                    doc_id=doc_id,
+                    doc_id=index_doc_id,
                     pipeline_status=pipeline_status,
                     pipeline_status_lock=pipeline_status_lock,
                     llm_response_cache=rag.llm_response_cache,
@@ -2428,6 +2478,8 @@ class LightRAGService:
             item.update(
                 {
                     "kg_status": self._kg_status_for_success(skip_kg=False),
+                    "kg_entity_count": len(entity_names),
+                    "kg_relation_count": len(relation_pairs),
                     "kg_filter": self._last_kg_filter_stats,
                     "kg_model": self._runtime_models().get("kg", {}).get("model", ""),
                     "kg_extraction_limits": {
@@ -2792,6 +2844,57 @@ class LightRAGService:
             "deletion": "; ".join(deletions),
         }
 
+    async def cleanup_retired_index_docs(self, logical_doc_id: str | None = None) -> list[str]:
+        """Retry durable retirement records without altering the published version."""
+        pending = [
+            (doc_id, index_id)
+            for doc_id, item in self._load_manifest()["documents"].items()
+            if logical_doc_id is None or doc_id == logical_doc_id
+            for index_id in item.get("retired_index_doc_ids", [])
+        ]
+        if not pending:
+            return []
+        rag = await self.get_rag()
+        failures = []
+        for doc_id, index_id in pending:
+            latest = self._load_manifest()
+            item = latest["documents"].get(doc_id)
+            if not item or index_id not in item.get("retired_index_doc_ids", []):
+                continue
+            try:
+                if index_id == item.get("active_index_doc_id"):
+                    raise RuntimeError("Active index version cannot be retired")
+                result = await rag.adelete_by_doc_id(index_id)
+                if str(getattr(result, "status", "")).lower() not in {"success", "not_found"}:
+                    raise RuntimeError(getattr(result, "message", "") or "Index retirement failed")
+            except (Exception, asyncio.CancelledError) as exc:
+                latest = self._load_manifest()
+                item = latest["documents"][doc_id]
+                item["index_cleanup_error"] = str(exc) or "Index retirement cancelled"
+                self._save_manifest(latest)
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                failures.append(index_id)
+                logger.warning("Index retirement pending workspace={} doc={} version={} error={}", self.workspace, doc_id, index_id, exc)
+            else:
+                latest = self._load_manifest()
+                item = latest["documents"][doc_id]
+                item["retired_index_doc_ids"] = [value for value in item.get("retired_index_doc_ids", []) if value != index_id]
+                if not item["retired_index_doc_ids"]:
+                    item["index_cleanup_error"] = ""
+                self._save_manifest(latest)
+        return failures
+
+    async def _ensure_current_index_versions(self) -> None:
+        failures = await self.cleanup_retired_index_docs()
+        if failures:
+            # Graph descriptions can combine sources, so filtering only vector hits
+            # is insufficient. Fail closed until both graph and vectors are clean.
+            raise RuntimeError(
+                "INDEX_CLEANUP_PENDING: 旧索引版本尚未清理完成，暂不能可靠检索；"
+                "请检查存储或模型接口后重试，系统会继续清理。"
+            )
+
     def _query_param(
         self,
         *,
@@ -2881,6 +2984,7 @@ class LightRAGService:
         history: list[dict[str, str]] | None = None,
     ) -> LightRAGQueryResult:
         self.assert_embedding_compatible()
+        await self._ensure_current_index_versions()
         rag = await self.get_rag()
         result = await rag.aquery_llm(
             query,
@@ -2910,6 +3014,7 @@ class LightRAGService:
         history: list[dict[str, str]] | None = None,
     ) -> LightRAGStreamResult:
         self.assert_embedding_compatible()
+        await self._ensure_current_index_versions()
         rag = await self.get_rag()
         result = await rag.aquery_llm(
             query,
@@ -2947,6 +3052,7 @@ class LightRAGService:
         enable_rerank: bool = True,
     ) -> dict[str, Any]:
         self.assert_embedding_compatible()
+        await self._ensure_current_index_versions()
         rag = await self.get_rag()
         result = await rag.aquery_llm(
             query,
@@ -2976,6 +3082,7 @@ class LightRAGService:
     ) -> dict[str, Any]:
         """Inspect LightRAG chunk-vector recall before and after reranking."""
         self.assert_embedding_compatible()
+        await self._ensure_current_index_versions()
         rag = await self.get_rag()
         raw_hits = await rag.chunks_vdb.query(query, top_k=top_k)
         vector_hits: list[dict[str, Any]] = []

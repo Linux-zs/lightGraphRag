@@ -199,6 +199,8 @@ export interface DocInfo {
   graph_rule?: GraphRuleSummary
   index_mode?: 'complete' | 'fast'
   kg_status?: 'complete' | 'skipped' | 'filtered_empty' | 'failed' | string
+  kg_entity_count?: number
+  kg_relation_count?: number
   kg_model?: string
   kg_extraction_limits?: {
     max_entities_per_chunk?: number
@@ -295,10 +297,11 @@ export function previewChunks(params: {
   separators: string[]
   chunk_size: number
   chunk_overlap: number
-}) {
+}, signal?: AbortSignal) {
   return request<ChunkPreviewItem[]>('/kb/preview-chunks', {
     method: 'POST',
     body: JSON.stringify(params),
+    signal,
   })
 }
 
@@ -311,10 +314,10 @@ export function indexDocument(params: {
   index_mode?: 'complete' | 'fast'
   kg_max_entities?: number
   kg_max_records?: number
-}) {
+}, signal?: AbortSignal) {
   return request<IndexTask>(
     '/kb/index',
-    { method: 'POST', body: JSON.stringify(params) },
+    { method: 'POST', body: JSON.stringify(params), signal },
   )
 }
 
@@ -343,7 +346,7 @@ export interface DocumentDeleteCleanup {
   cleanup_error?: string
 }
 
-export function deleteDocument(docName: string, workspace = DEFAULT_WORKSPACE) {
+export function deleteDocument(docName: string, workspace = DEFAULT_WORKSPACE, signal?: AbortSignal) {
   return request<{
     deleted: number
     doc_id: string
@@ -351,11 +354,11 @@ export function deleteDocument(docName: string, workspace = DEFAULT_WORKSPACE) {
     graph_residuals: GraphDeleteResiduals
   } & DocumentDeleteCleanup>(
     `/kb/documents/${encodeURIComponent(docName)}?workspace=${encodeURIComponent(workspace)}`,
-    { method: 'DELETE' },
+    { method: 'DELETE', signal },
   )
 }
 
-export function batchDeleteDocuments(docNames: string[], workspace = DEFAULT_WORKSPACE) {
+export function batchDeleteDocuments(docNames: string[], workspace = DEFAULT_WORKSPACE, signal?: AbortSignal) {
   return request<{
     deleted_chunks: number
     doc_count: number
@@ -365,7 +368,7 @@ export function batchDeleteDocuments(docNames: string[], workspace = DEFAULT_WOR
     cleanup_error?: string
   }>(
     '/kb/batch-delete',
-    { method: 'POST', body: JSON.stringify({ workspace, doc_names: docNames }) },
+    { method: 'POST', body: JSON.stringify({ workspace, doc_names: docNames }), signal },
   )
 }
 
@@ -378,10 +381,10 @@ export function batchIndexDocuments(params: {
   index_mode?: 'complete' | 'fast'
   kg_max_entities?: number
   kg_max_records?: number
-}) {
+}, signal?: AbortSignal) {
   return request<IndexTask>(
     '/kb/batch-index',
-    { method: 'POST', body: JSON.stringify(params) },
+    { method: 'POST', body: JSON.stringify(params), signal },
   )
 }
 
@@ -395,6 +398,7 @@ export interface IndexTaskResult {
   kg_entity_count?: number
   kg_relation_count?: number
   kg_timed_out_chunks?: string[]
+  kg_invalid_response_chunks?: string[]
   stage_timings?: {
     parse: number
     chunk_vector: number
@@ -447,8 +451,8 @@ export function listIndexTasks(signal?: AbortSignal) {
   return request<IndexTask[]>('/kb/index-tasks', { signal })
 }
 
-export function cancelIndexTask(taskId: string) {
-  return request<IndexTask>(`/kb/index-tasks/${taskId}/cancel`, { method: 'POST' })
+export function cancelIndexTask(taskId: string, signal?: AbortSignal) {
+  return request<IndexTask>(`/kb/index-tasks/${taskId}/cancel`, { method: 'POST', signal })
 }
 
 // --- Raw text preview / edit (pre-chunking) ---
@@ -461,16 +465,17 @@ export interface RawTextResponse {
   source: string
 }
 
-export function getDocumentRawText(docName: string, workspace = DEFAULT_WORKSPACE) {
+export function getDocumentRawText(docName: string, workspace = DEFAULT_WORKSPACE, signal?: AbortSignal) {
   return request<RawTextResponse>(
     `/kb/documents/${encodeURIComponent(docName)}/raw-text?workspace=${encodeURIComponent(workspace)}`,
+    { signal },
   )
 }
 
-export function updateDocumentRawText(docName: string, raw_text: string, workspace = DEFAULT_WORKSPACE) {
+export function updateDocumentRawText(docName: string, raw_text: string, workspace = DEFAULT_WORKSPACE, signal?: AbortSignal) {
   return request<{ file_name: string; char_count: number; message: string }>(
     `/kb/documents/${encodeURIComponent(docName)}/raw-text?workspace=${encodeURIComponent(workspace)}`,
-    { method: 'PUT', body: JSON.stringify({ raw_text }) },
+    { method: 'PUT', body: JSON.stringify({ raw_text }), signal },
   )
 }
 
@@ -489,9 +494,10 @@ export interface DocumentChunksResponse {
   chunks: DocumentChunkItem[]
 }
 
-export function getDocumentChunks(docName: string, workspace = DEFAULT_WORKSPACE) {
+export function getDocumentChunks(docName: string, workspace = DEFAULT_WORKSPACE, signal?: AbortSignal) {
   return request<DocumentChunksResponse>(
     `/kb/documents/${encodeURIComponent(docName)}/chunks?workspace=${encodeURIComponent(workspace)}`,
+    { signal },
   )
 }
 
@@ -633,10 +639,11 @@ export function backfillDocumentGraph(params: {
   doc_names: string[]
   kg_max_entities?: number
   kg_max_records?: number
-}) {
+}, signal?: AbortSignal) {
   return request<IndexTask>('/kb/graph-backfill', {
     method: 'POST',
     body: JSON.stringify(params),
+    signal,
   })
 }
 

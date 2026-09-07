@@ -55,6 +55,7 @@ export async function getIndexTaskWithRetry(
 ): Promise<IndexTask> {
   let lastError: unknown
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    signal?.throwIfAborted()
     try {
       return await getIndexTask(taskId, signal)
     } catch (error) {
@@ -64,6 +65,19 @@ export async function getIndexTaskWithRetry(
     }
   }
   throw lastError
+}
+
+function waitForPoll(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve()
+    const finish = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', finish)
+      resolve()
+    }
+    const timer = setTimeout(finish, milliseconds)
+    signal?.addEventListener('abort', finish, { once: true })
+  })
 }
 
 export default function KBManagement({
@@ -121,48 +135,76 @@ export default function KBManagement({
   const [chunkLoading, setChunkLoading] = useState(false)
   const [graphRule, setGraphRule] = useState<GraphGovernanceConfig | null>(null)
   const mountedRef = useRef(true)
-  const pollingTaskIdsRef = useRef<Set<string>>(new Set())
+  const pollingTasksRef = useRef(new Map<string, Promise<IndexTask | undefined>>())
   const taskRunIdRef = useRef(0)
   const requestAbortRef = useRef<AbortController | null>(null)
+  const workspaceRef = useRef(workspace)
+  workspaceRef.current = workspace
+  const rawRequestRef = useRef(0)
+  const chunkRequestRef = useRef(0)
+
+  const operationScope = () => {
+    const runId = taskRunIdRef.current
+    const signal = requestAbortRef.current?.signal
+    return {
+      runId, signal,
+      current: () => mountedRef.current && taskRunIdRef.current === runId &&
+        workspaceRef.current === workspace && !signal?.aborted,
+    }
+  }
 
   const isTaskTerminal = (task: IndexTask) =>
     ['succeeded', 'failed', 'partial', 'cancelled'].includes(task.status)
 
-  const pollIndexTask = async (
+  const pollIndexTask = (
     taskId: string,
-    onUpdate: (task: IndexTask) => void,
-    onDone?: (task: IndexTask) => void,
-    runId = taskRunIdRef.current,
+    scope: 'single' | 'batch',
+    operation: ReturnType<typeof operationScope>,
   ) => {
-    if (pollingTaskIdsRef.current.has(taskId)) {
-      return getIndexTask(taskId)
-    }
-    pollingTaskIdsRef.current.add(taskId)
-    try {
-      let finalTask = await getIndexTaskWithRetry(
-        taskId,
-        requestAbortRef.current?.signal,
-      )
-      if (!mountedRef.current || taskRunIdRef.current !== runId) return finalTask
-      onUpdate(finalTask)
-      while (!isTaskTerminal(finalTask)) {
-        await new Promise((resolve) => setTimeout(resolve, 1500))
-        finalTask = await getIndexTaskWithRetry(
-          taskId,
-          requestAbortRef.current?.signal,
-        )
-        if (!mountedRef.current || taskRunIdRef.current !== runId) return finalTask
-        onUpdate(finalTask)
-        await loadDocs(runId, requestAbortRef.current?.signal)
+    const key = `${operation.runId}:${taskId}`
+    const existing = pollingTasksRef.current.get(key)
+    if (existing) return existing
+    const setTask = scope === 'single' ? setIndexTask : setBatchIndexTask
+    const setBusy = scope === 'single' ? setIndexing : setBatchIndexing
+    const setMessage = scope === 'single' ? setIndexMsg : setBatchMsg
+    const monitor = async () => {
+      let failures = 0
+      try {
+        while (operation.current()) {
+          let task: IndexTask
+          try {
+            task = await getIndexTaskWithRetry(taskId, operation.signal, 3,
+              (milliseconds) => waitForPoll(milliseconds, operation.signal))
+          } catch (error) {
+            if (!operation.current()) return
+            setBusy(false)
+            const detail = (error as Error).message || '网络错误'
+            if ((error as { status?: number }).status === 404) {
+              setMessage(`任务不存在: ${detail}`)
+              return
+            }
+            setMessage(`任务状态同步中断: ${detail}；正在重试，不代表索引失败`)
+            failures += 1
+            await waitForPoll(Math.min(15000, 2000 * failures), operation.signal)
+            continue
+          }
+          if (!operation.current()) return
+          failures = 0
+          setTask(task)
+          setBusy(!isTaskTerminal(task))
+          setMessage(scope === 'single' ? formatTaskMessage(task) : formatBatchTaskMessage(task))
+          await loadDocs(operation.runId, operation.signal)
+          if (!operation.current()) return
+          if (isTaskTerminal(task)) return task
+          await waitForPoll(1500, operation.signal)
+        }
+      } finally {
+        pollingTasksRef.current.delete(key)
       }
-      if (mountedRef.current && taskRunIdRef.current === runId) {
-        onDone?.(finalTask)
-        await loadDocs(runId, requestAbortRef.current?.signal)
-      }
-      return finalTask
-    } finally {
-      pollingTaskIdsRef.current.delete(taskId)
     }
+    const promise = monitor()
+    pollingTasksRef.current.set(key, promise)
+    return promise
   }
 
   const formatTaskMessage = (task: IndexTask) => {
@@ -214,58 +256,57 @@ export default function KBManagement({
     return Date.now() - updatedAt <= 60 * 60 * 1000
   }
 
-  const restoreIndexTasks = async (runId = taskRunIdRef.current) => {
-    try {
-      const tasks = await listIndexTasks()
-      if (!mountedRef.current || taskRunIdRef.current !== runId) return
-      const candidates = tasks.filter(
-        (task) => task.workspace === workspace &&
-          (task.kind === 'single' || task.kind === 'batch' || task.kind === 'kg_backfill'),
+  const restoreIndexTasks = async (operation = operationScope()) => {
+    let tasks: IndexTask[] = []
+    while (operation.current()) {
+      try {
+        tasks = await listIndexTasks(operation.signal)
+        break
+      } catch (error) {
+        if (!operation.current()) return
+        setIndexMsg(`恢复任务状态失败: ${(error as Error).message}；正在重试`)
+        await waitForPoll(5000, operation.signal)
+      }
+    }
+    if (!operation.current()) return
+    const candidates = tasks.filter(
+      (task) => task.workspace === workspace &&
+        (task.kind === 'single' || task.kind === 'batch' || task.kind === 'kg_backfill'),
+    )
+    const pickTask = (kind: 'single' | 'batch') => {
+      const matches = (task: IndexTask) => kind === 'single'
+        ? task.kind === 'single'
+        : task.kind === 'batch' || task.kind === 'kg_backfill'
+      return candidates.find((task) => matches(task) && !isTaskTerminal(task)) ||
+        candidates.find((task) => matches(task) && isRecentTask(task))
+    }
+
+    const singleTask = pickTask('single')
+    if (singleTask) {
+      setIndexTask(singleTask)
+      setIndexing(!isTaskTerminal(singleTask))
+      setIndexMsg(
+        isTaskTerminal(singleTask)
+          ? formatTaskMessage(singleTask)
+          : `已恢复索引任务: ${singleTask.task_id}`,
       )
-      const pickTask = (kind: 'single' | 'batch') => {
-        const matches = (task: IndexTask) => kind === 'single'
-          ? task.kind === 'single'
-          : task.kind === 'batch' || task.kind === 'kg_backfill'
-        return candidates.find((task) => matches(task) && !isTaskTerminal(task)) ||
-          candidates.find((task) => matches(task) && isRecentTask(task))
+      if (!isTaskTerminal(singleTask)) {
+        void pollIndexTask(singleTask.task_id, 'single', operation)
       }
+    }
 
-      const singleTask = pickTask('single')
-      if (singleTask) {
-        setIndexTask(singleTask)
-        setIndexing(!isTaskTerminal(singleTask))
-        setIndexMsg(
-          isTaskTerminal(singleTask)
-            ? formatTaskMessage(singleTask)
-            : `已恢复索引任务: ${singleTask.task_id}`,
-        )
-        if (!isTaskTerminal(singleTask)) {
-          void pollIndexTask(singleTask.task_id, setIndexTask, (finalTask) => {
-            setIndexing(false)
-            setIndexMsg(formatTaskMessage(finalTask))
-          }, runId)
-        }
+    const batchTask = pickTask('batch')
+    if (batchTask) {
+      setBatchIndexTask(batchTask)
+      setBatchIndexing(!isTaskTerminal(batchTask))
+      setBatchMsg(
+        isTaskTerminal(batchTask)
+          ? formatBatchTaskMessage(batchTask)
+          : `已恢复批量索引任务: ${batchTask.task_id}`,
+      )
+      if (!isTaskTerminal(batchTask)) {
+        void pollIndexTask(batchTask.task_id, 'batch', operation)
       }
-
-      const batchTask = pickTask('batch')
-      if (batchTask) {
-        setBatchIndexTask(batchTask)
-        setBatchIndexing(!isTaskTerminal(batchTask))
-        setBatchMsg(
-          isTaskTerminal(batchTask)
-            ? formatBatchTaskMessage(batchTask)
-            : `已恢复批量索引任务: ${batchTask.task_id}`,
-        )
-        if (!isTaskTerminal(batchTask)) {
-          void pollIndexTask(batchTask.task_id, setBatchIndexTask, (finalTask) => {
-            setBatchIndexing(false)
-            setBatchMsg(formatBatchTaskMessage(finalTask))
-            if (finalTask.status !== 'failed') setCheckedDocs(new Set())
-          }, runId)
-        }
-      }
-    } catch {
-      // Task restore is best-effort; document list and manual refresh still work.
     }
   }
 
@@ -284,6 +325,7 @@ export default function KBManagement({
 
   const kgStatusLabel = (status?: string) => {
     if (status === 'complete') return '已建图谱'
+    if (status === 'no_entities') return '未抽取到实体关系'
     if (status === 'partial') return '部分图谱'
     if (status === 'skipped') return '跳过KG'
     if (status === 'filtered_empty') return '无有效KG块'
@@ -293,6 +335,7 @@ export default function KBManagement({
 
   const kgStatusClass = (status?: string) => {
     if (status === 'complete') return 'bg-violet-50 text-violet-700'
+    if (status === 'no_entities') return 'bg-gray-100 text-gray-600'
     if (status === 'partial') return 'bg-amber-50 text-amber-700'
     if (status === 'skipped') return 'bg-gray-100 text-gray-600'
     if (status === 'filtered_empty') return 'bg-amber-50 text-amber-700'
@@ -313,14 +356,16 @@ export default function KBManagement({
 
   const handleDeleteWorkspace = async () => {
     if (isDefaultWorkspace || deletingWorkspace) return
+    const operation = operationScope()
     setDeletingWorkspace(true)
     setWorkspaceDeleteError('')
     try {
       await onDeleteWorkspace()
     } catch (error) {
+      if (!operation.current()) return
       setWorkspaceDeleteError((error as Error).message || '删除知识库失败')
     } finally {
-      setDeletingWorkspace(false)
+      if (operation.current()) setDeletingWorkspace(false)
     }
   }
 
@@ -341,22 +386,28 @@ export default function KBManagement({
   }
 
   const handleUpload = async (file: File) => {
+    const operation = operationScope()
     setUploading(true)
     setChunks([])
     setIndexMsg('')
     try {
-      const data = await uploadDocument(file, workspace)
+      const data = await uploadDocument(file, workspace, operation.signal)
+      if (!operation.current()) return
       setUploaded(data)
       if (data.index_invalidated) {
         setIndexMsg('同名文档内容已更新，旧索引仍可查询；请重新预览并确认索引以切换到新内容。')
       }
+      void loadDocs(operation.runId, operation.signal)
+    } catch (error) {
+      if (operation.current()) throw error
     } finally {
-      setUploading(false)
+      if (operation.current()) setUploading(false)
     }
   }
 
   /** Upload multiple files sequentially */
   const handleMultiUpload = async (files: File[]) => {
+    const operation = operationScope()
     setUploading(true)
     setBatchMsg('')
     let lastData: UploadedFile | null = null
@@ -364,6 +415,7 @@ export default function KBManagement({
     let invalidatedCount = 0
     const total = files.length
     for (let i = 0; i < total; i++) {
+      if (!operation.current()) return
       const file = files[i]
       if (!file) {
         failures.push(`第 ${i + 1} 个文件: 文件对象为空`)
@@ -371,11 +423,13 @@ export default function KBManagement({
         continue
       }
       try {
-        const data = await uploadDocument(file, workspace)
+        const data = await uploadDocument(file, workspace, operation.signal)
+        if (!operation.current()) return
         lastData = data
         if (data.index_invalidated) invalidatedCount += 1
         setBatchMsg(`已上传 ${i + 1}/${total}: ${data.file_name}`)
       } catch (e: unknown) {
+        if (!operation.current()) return
         const message = e instanceof Error ? e.message : String(e)
         failures.push(`${file.name}: ${message}`)
         setBatchMsg(`上传失败 (${i + 1}/${total}) ${file.name}: ${message}`)
@@ -391,11 +445,12 @@ export default function KBManagement({
       )
     }
     setUploading(false)
-    loadDocs()
+    void loadDocs(operation.runId, operation.signal)
   }
 
   const handlePreview = async () => {
     if (!uploaded) return
+    const operation = operationScope()
     setPreviewing(true)
     setPreviewError('')
     setIndexMsg('')
@@ -411,18 +466,21 @@ export default function KBManagement({
         separators: sepArray,
         chunk_size: chunkSize,
         chunk_overlap: chunkOverlap,
-      })
+      }, operation.signal)
+      if (!operation.current()) return
       setChunks(data)
     } catch (e: unknown) {
+      if (!operation.current()) return
       setPreviewError((e as Error).message || '切分预览失败')
       setChunks([])
     } finally {
-      setPreviewing(false)
+      if (operation.current()) setPreviewing(false)
     }
   }
 
   const handleIndex = async () => {
     if (!uploaded) return
+    const operation = operationScope()
     setIndexing(true)
     setIndexMsg('')
     setIndexTask(null)
@@ -442,15 +500,18 @@ export default function KBManagement({
         index_mode: indexMode,
         kg_max_entities: kgMaxEntities,
         kg_max_records: kgMaxRecords,
-      })
+      }, operation.signal)
+      if (!operation.current()) return
       setIndexTask(task)
       setIndexMsg(`索引任务已创建: ${task.task_id}`)
-      const finalTask = await pollIndexTask(task.task_id, setIndexTask)
+      const finalTask = await pollIndexTask(task.task_id, 'single', operation)
+      if (!operation.current() || !finalTask) return
       setIndexMsg(formatTaskMessage(finalTask))
     } catch (e: unknown) {
+      if (!operation.current()) return
       setIndexMsg(`索引失败: ${(e as Error).message || '未知错误'}`)
     } finally {
-      setIndexing(false)
+      if (operation.current()) setIndexing(false)
     }
   }
 
@@ -480,10 +541,12 @@ export default function KBManagement({
   }
 
   const handleDelete = async (docName: string) => {
+    const operation = operationScope()
     setDeleting(docName)
     setBatchMsg('')
     try {
-      const result = await deleteDocument(docName, workspace)
+      const result = await deleteDocument(docName, workspace, operation.signal)
+      if (!operation.current()) return
       const residualWarning = formatGraphResidualWarning(
         result.doc_name,
         result.graph_residuals,
@@ -495,10 +558,7 @@ export default function KBManagement({
         setBatchIndexTask(result.cleanup_task)
         setBatchIndexing(!isTaskTerminal(result.cleanup_task))
         if (!isTaskTerminal(result.cleanup_task)) {
-          void pollIndexTask(result.cleanup_task.task_id, setBatchIndexTask, (finalTask) => {
-            setBatchIndexing(false)
-            setBatchMsg(`删除后的图谱清理：${formatTaskMessage(finalTask)}`)
-          })
+          void pollIndexTask(result.cleanup_task.task_id, 'batch', operation)
         }
       }
       setCheckedDocs((prev) => {
@@ -506,11 +566,12 @@ export default function KBManagement({
         next.delete(docName)
         return next
       })
-      loadDocs()
+      void loadDocs(operation.runId, operation.signal)
     } catch (e: unknown) {
+      if (!operation.current()) return
       setBatchMsg(`删除失败: ${(e as Error).message || '未知错误'}`)
     } finally {
-      setDeleting(null)
+      if (operation.current()) setDeleting(null)
     }
   }
 
@@ -532,10 +593,12 @@ export default function KBManagement({
 
   const handleBatchDelete = async () => {
     if (checkedDocs.size === 0) return
+    const operation = operationScope()
     setBatchDeleting(true)
     setBatchMsg('')
     try {
-      const result = await batchDeleteDocuments([...checkedDocs], workspace)
+      const result = await batchDeleteDocuments([...checkedDocs], workspace, operation.signal)
+      if (!operation.current()) return
       const residualItems = result.graph_residuals?.items.filter((item) => item.has_residuals || !item.checked) || []
       const errorSuffix = result.errors?.length ? `，${result.errors.length} 个失败` : ''
       if (result.cleanup_error) {
@@ -549,10 +612,7 @@ export default function KBManagement({
         setBatchIndexTask(result.cleanup_task)
         setBatchIndexing(!isTaskTerminal(result.cleanup_task))
         if (!isTaskTerminal(result.cleanup_task)) {
-          void pollIndexTask(result.cleanup_task.task_id, setBatchIndexTask, (finalTask) => {
-            setBatchIndexing(false)
-            setBatchMsg(`删除后的图谱清理：${formatTaskMessage(finalTask)}`)
-          })
+          void pollIndexTask(result.cleanup_task.task_id, 'batch', operation)
         }
       } else if (residualItems.length > 0) {
         const nodes = residualItems.reduce((sum, item) => sum + (item.node_count || 0), 0)
@@ -564,16 +624,18 @@ export default function KBManagement({
         setBatchMsg(`批量删除完成: ${result.deleted_chunks} 个文档，提交 ${result.doc_count} 个${errorSuffix}`)
       }
       setCheckedDocs(new Set())
-      loadDocs()
+      void loadDocs(operation.runId, operation.signal)
     } catch (e: unknown) {
+      if (!operation.current()) return
       setBatchMsg(`批量删除失败: ${(e as Error).message}`)
     } finally {
-      setBatchDeleting(false)
+      if (operation.current()) setBatchDeleting(false)
     }
   }
 
   const handleBatchIndex = async () => {
     if (checkedDocs.size === 0) return
+    const operation = operationScope()
     setBatchIndexing(true)
     setBatchMsg('')
     setBatchIndexTask(null)
@@ -592,22 +654,26 @@ export default function KBManagement({
         index_mode: indexMode,
         kg_max_entities: kgMaxEntities,
         kg_max_records: kgMaxRecords,
-      })
+      }, operation.signal)
+      if (!operation.current()) return
       setBatchIndexTask(task)
       setBatchMsg(`批量索引任务已创建: ${task.task_id}`)
-      const finalTask = await pollIndexTask(task.task_id, setBatchIndexTask)
+      const finalTask = await pollIndexTask(task.task_id, 'batch', operation)
+      if (!operation.current() || !finalTask) return
       const ok = finalTask.results.filter((r) => r.status === 'ok').length
       const fail = finalTask.errors.length
       setBatchMsg(`${formatTaskMessage(finalTask)}: ${ok} 成功${fail > 0 ? `, ${fail} 失败` : ''}`)
       if (finalTask.status !== 'failed') setCheckedDocs(new Set())
     } catch (e: unknown) {
+      if (!operation.current()) return
       setBatchMsg(`批量索引失败: ${(e as Error).message}`)
     } finally {
-      setBatchIndexing(false)
+      if (operation.current()) setBatchIndexing(false)
     }
   }
 
   const handleGraphBackfill = async (docNames: string[]) => {
+    const operation = operationScope()
     const eligible = docNames.filter((name) => {
       const doc = docs.find((item) => item.doc_name === name)
       return doc ? canBackfillGraph(doc) : false
@@ -622,22 +688,27 @@ export default function KBManagement({
         doc_names: eligible,
         kg_max_entities: kgMaxEntities,
         kg_max_records: kgMaxRecords,
-      })
+      }, operation.signal)
+      if (!operation.current()) return
       setBatchIndexTask(task)
       setBatchMsg(`图谱补建任务已创建: ${task.task_id}`)
-      const finalTask = await pollIndexTask(task.task_id, setBatchIndexTask)
+      const finalTask = await pollIndexTask(task.task_id, 'batch', operation)
+      if (!operation.current() || !finalTask) return
       setBatchMsg(formatBatchTaskMessage(finalTask))
       if (finalTask.status !== 'failed') setCheckedDocs(new Set())
     } catch (e: unknown) {
+      if (!operation.current()) return
       setBatchMsg(`图谱补建失败: ${(e as Error).message || '未知错误'}`)
     } finally {
-      setBatchIndexing(false)
+      if (operation.current()) setBatchIndexing(false)
     }
   }
 
   const handleCancelTask = async (task: IndexTask, scope: 'single' | 'batch') => {
+    const operation = operationScope()
     try {
-      const updated = await cancelIndexTask(task.task_id)
+      const updated = await cancelIndexTask(task.task_id, operation.signal)
+      if (!operation.current()) return
       if (scope === 'single') {
         setIndexTask(updated)
         setIndexMsg(updated.message || '已请求取消')
@@ -647,6 +718,7 @@ export default function KBManagement({
       }
     } catch (e: unknown) {
       const msg = `取消失败: ${(e as Error).message}`
+      if (!operation.current()) return
       scope === 'single' ? setIndexMsg(msg) : setBatchMsg(msg)
     }
   }
@@ -760,7 +832,8 @@ export default function KBManagement({
               .map((result) => (
                 <div key={`${result.doc_name}-kg-partial`}>
                   {result.doc_name}: 已保留文本和向量，跳过{' '}
-                  {result.kg_timed_out_chunks?.length || 0} 个超时 KG 块
+                  {result.kg_timed_out_chunks?.length || 0} 个超时块、
+                  {result.kg_invalid_response_chunks?.length || 0} 个响应异常块
                 </div>
               ))}
           </div>
@@ -772,50 +845,62 @@ export default function KBManagement({
   // --- Raw text viewer / editor ---
 
   const openRawText = async (docName: string) => {
+    const operation = operationScope()
+    const requestId = ++rawRequestRef.current
     setRawTextDocName(docName)
     setRawTextModalOpen(true)
     setRawTextLoading(true)
     setRawTextMsg('')
     try {
-      const data = await getDocumentRawText(docName, workspace)
+      const data = await getDocumentRawText(docName, workspace, operation.signal)
+      if (!operation.current() || rawRequestRef.current !== requestId) return
       setRawTextContent(data.raw_text)
     } catch (e: unknown) {
+      if (!operation.current() || rawRequestRef.current !== requestId) return
       setRawTextMsg(`加载原始文本失败: ${(e as Error).message}`)
       setRawTextContent('')
     } finally {
-      setRawTextLoading(false)
+      if (operation.current() && rawRequestRef.current === requestId) setRawTextLoading(false)
     }
   }
 
   const saveRawText = async () => {
     if (!rawTextDocName) return
+    const operation = operationScope()
+    const requestId = rawRequestRef.current
     setRawTextSaving(true)
     setRawTextMsg('')
     try {
-      const data = await updateDocumentRawText(rawTextDocName, rawTextContent, workspace)
+      const data = await updateDocumentRawText(rawTextDocName, rawTextContent, workspace, operation.signal)
+      if (!operation.current() || rawRequestRef.current !== requestId) return
       setRawTextMsg(`已保存 (${data.char_count} 字符)，旧索引仍可查询；请重新预览并索引以切换到新内容`)
-      await loadDocs()
+      await loadDocs(operation.runId, operation.signal)
     } catch (e: unknown) {
+      if (!operation.current() || rawRequestRef.current !== requestId) return
       setRawTextMsg(`保存失败: ${(e as Error).message}`)
     } finally {
-      setRawTextSaving(false)
+      if (operation.current() && rawRequestRef.current === requestId) setRawTextSaving(false)
     }
   }
 
   // --- Chunk viewer ---
 
   const openChunks = async (docName: string) => {
+    const operation = operationScope()
+    const requestId = ++chunkRequestRef.current
     setChunkModalDocName(docName)
     setChunkModalOpen(true)
     setChunkLoading(true)
     setChunkList([])
     try {
-      const data = await getDocumentChunks(docName, workspace)
+      const data = await getDocumentChunks(docName, workspace, operation.signal)
+      if (!operation.current() || chunkRequestRef.current !== requestId) return
       setChunkList(data.chunks)
     } catch {
+      if (!operation.current() || chunkRequestRef.current !== requestId) return
       setChunkList([])
     } finally {
-      setChunkLoading(false)
+      if (operation.current() && chunkRequestRef.current === requestId) setChunkLoading(false)
     }
   }
 
@@ -826,7 +911,16 @@ export default function KBManagement({
     requestAbortRef.current = controller
     const runId = taskRunIdRef.current + 1
     taskRunIdRef.current = runId
-    pollingTaskIdsRef.current.clear()
+    setDocs([])
+    setUploading(false)
+    setPreviewing(false)
+    setDeleting(null)
+    setDeletingWorkspace(false)
+    setBatchDeleting(false)
+    setRawTextLoading(false)
+    setRawTextSaving(false)
+    setChunkLoading(false)
+    setGraphRule(null)
     setIndexTask(null)
     setBatchIndexTask(null)
     setIndexing(false)
@@ -847,12 +941,11 @@ export default function KBManagement({
     setChunkList([])
     void loadDocs(runId, controller.signal)
     void loadGraphRule()
-    void restoreIndexTasks(runId)
+    void restoreIndexTasks(operationScope())
     return () => {
       controller.abort()
       mountedRef.current = false
       taskRunIdRef.current += 1
-      pollingTaskIdsRef.current.clear()
     }
   }, [workspace])
 
@@ -893,7 +986,7 @@ export default function KBManagement({
             )}
           </details>
         </div>
-        <FileUpload onUpload={handleUpload} onMultiUpload={handleMultiUpload} uploading={uploading} />
+        <FileUpload key={workspace} onUpload={handleUpload} onMultiUpload={handleMultiUpload} uploading={uploading} />
 
         {uploaded && (
           <div className="mt-4 p-4 bg-gray-50 rounded-lg border border-gray-200">
@@ -1262,6 +1355,9 @@ export default function KBManagement({
                       <span
                         title={[
                           doc.kg_model,
+                          doc.kg_entity_count != null && doc.kg_relation_count != null
+                            ? `本次抽取 ${doc.kg_entity_count} 个实体 / ${doc.kg_relation_count} 条关系`
+                            : '',
                           doc.kg_extraction_limits?.max_entities_per_chunk
                             ? `每块实体上限 ${doc.kg_extraction_limits.max_entities_per_chunk}，记录上限 ${doc.kg_extraction_limits.max_records_per_chunk}`
                             : '',

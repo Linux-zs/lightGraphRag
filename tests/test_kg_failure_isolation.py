@@ -140,7 +140,7 @@ def test_chunk_concurrency_is_bounded_and_results_are_preserved(tmp_path):
             peak = max(peak, active)
             try:
                 await asyncio.sleep(0.005)
-                return [name]
+                return [({name: []}, {})]
             finally:
                 active -= 1
 
@@ -148,7 +148,7 @@ def test_chunk_concurrency_is_bounded_and_results_are_preserved(tmp_path):
         results = await service._extract_entities_with_recovery(
             extract, chunks, (), {}, {"kept": 9, "skipped": 0},
         )
-        assert results == list(chunks)
+        assert results == [({name: []}, {}) for name in chunks]
         assert seen == Counter(chunks.keys())
         assert peak == 2
 
@@ -255,7 +255,7 @@ def test_parallel_chunk_timings_emit_one_document_stage(tmp_path):
 
         async def extract(current, *args, **kwargs):
             await asyncio.sleep(0.03)
-            return list(current)
+            return [({name: []}, {}) for name in current]
 
         # The SDK class hook is already instrumented by install_stage_timing.
         wrapped = _wrap_async(extract, "kg")

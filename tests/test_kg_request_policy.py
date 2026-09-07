@@ -34,7 +34,8 @@ def test_real_sdk_request_budget(monkeypatch, case, expected):
     service = LightRAGService.__new__(LightRAGService)
     service.config = {"lightrag": {"kg_llm_retry_delay": 0}}
     service.workspace = "test"
-    service._runtime_models = lambda: {"kg": {"model": "probe", "base_url": "https://synthetic.invalid/v1", "api_key": "synthetic", "timeout": 1}}
+    # Allow cold SDK/client initialization under coverage; timeout behavior has a separate test.
+    service._runtime_models = lambda: {"kg": {"model": "probe", "base_url": "https://synthetic.invalid/v1", "api_key": "synthetic", "timeout": 5}}
 
     async def run():
         call = service._make_kg_llm_func()

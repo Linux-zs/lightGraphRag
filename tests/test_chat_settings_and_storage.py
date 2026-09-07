@@ -142,6 +142,9 @@ def test_text_recall_returns_vector_and_rerank_positions():
         def assert_embedding_compatible(self):
             return None
 
+        async def _ensure_current_index_versions(self):
+            return None
+
         async def get_rag(self):
             return SimpleNamespace(chunks_vdb=FakeVectorStore())
 

@@ -85,7 +85,7 @@ def test_failed_reindex_keeps_active_version_and_marks_attempt_stale(
             }
         }
     )
-    fake_rag = SimpleNamespace(addon_params={})
+    fake_rag = SimpleNamespace(addon_params={}, doc_status=object())
     service._rag = fake_rag
     monkeypatch.setattr(service, "assert_embedding_compatible", lambda: None)
     monkeypatch.setattr(service, "cleanup_interrupted_index_docs", AsyncMock(return_value=[]))

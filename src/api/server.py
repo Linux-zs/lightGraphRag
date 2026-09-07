@@ -27,7 +27,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
-from pydantic import BaseModel, BeforeValidator, Field
+from pydantic import BaseModel, BeforeValidator, Field, model_validator
 from starlette.background import BackgroundTask
 
 from src.config_loader import (
@@ -35,7 +35,6 @@ from src.config_loader import (
     get_effective_write_config_path,
     reset_config,
 )
-from src.doc_processor.chunker import TextChunker
 from src.doc_processor.loader import DocumentLoader
 from src.doc_processor.parsers.base_parser import Document
 from src.exceptions import ManifestCorruptedError
@@ -838,24 +837,30 @@ def _default_chunk_overlap() -> int:
 WorkspaceName = Annotated[str, BeforeValidator(sanitize_workspace)]
 
 
-class ChunkPreviewRequest(BaseModel):
-    workspace: WorkspaceName = DEFAULT_WORKSPACE
-    file_name: str
+class ChunkingRequest(BaseModel):
     separators: list[str] = Field(default_factory=_default_index_separators)
     chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
     chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
+
+    @model_validator(mode="after")
+    def validate_overlap(self):
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError("chunk_overlap must be smaller than chunk_size")
+        return self
+
+
+class ChunkPreviewRequest(ChunkingRequest):
+    workspace: WorkspaceName = DEFAULT_WORKSPACE
+    file_name: str
 
 class ChunkPreviewItem(BaseModel):
     index: int
     text: str
     char_count: int
 
-class IndexRequest(BaseModel):
+class IndexRequest(ChunkingRequest):
     workspace: WorkspaceName = DEFAULT_WORKSPACE
     file_name: str
-    separators: list[str] = Field(default_factory=_default_index_separators)
-    chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
-    chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
     index_mode: Literal["complete", "fast"] = "complete"
     kg_max_entities: int = Field(default=24, ge=1, le=200)
     kg_max_records: int = Field(default=48, ge=1, le=400)
@@ -3074,6 +3079,8 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                         "status": "ok",
                         "chunks": item.get("chunk_count", 0),
                         "kg_status": item.get("kg_status", ""),
+                        "kg_entity_count": item.get("kg_entity_count", 0),
+                        "kg_relation_count": item.get("kg_relation_count", 0),
                         "kg_timed_out_chunks": list(
                             (item.get("kg_filter") or {}).get("timed_out") or []
                         ),
@@ -3538,20 +3545,19 @@ async def preview_chunks(req: ChunkPreviewRequest):
     if doc is None:
         raise HTTPException(404, f"File '{req.file_name}' not uploaded yet")
 
-    chunker = TextChunker(
+    chunks = await get_lightrag_service(req.workspace).preview_document_chunks(
+        doc,
         chunk_size=req.chunk_size,
         chunk_overlap=req.chunk_overlap,
         separators=req.separators,
     )
-    chunks = chunker.chunk_document(doc)
-
     result = [
-        ChunkPreviewItem(index=c.chunk_index, text=c.text, char_count=len(c.text))
+        ChunkPreviewItem(index=c["chunk_order_index"], text=c["content"], char_count=len(c["content"]))
         for c in chunks
     ]
     # Cache for indexing
     _chunk_cache[key] = [
-        {"index": c.chunk_index, "text": c.text} for c in chunks
+        {"index": c["chunk_order_index"], "text": c["content"]} for c in chunks
     ]
     return result
 
@@ -3652,21 +3658,15 @@ class BatchDeleteRequest(BaseModel):
     workspace: WorkspaceName = DEFAULT_WORKSPACE
     doc_names: list[str] = Field(min_length=1, max_length=100)
 
-class BatchIndexRequest(BaseModel):
+class BatchIndexRequest(ChunkingRequest):
     workspace: WorkspaceName = DEFAULT_WORKSPACE
     doc_names: list[str] = Field(min_length=1, max_length=100)
-    separators: list[str] = Field(default_factory=_default_index_separators)
-    chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
-    chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
     index_mode: Literal["complete", "fast"] = "complete"
     kg_max_entities: int = Field(default=24, ge=1, le=200)
     kg_max_records: int = Field(default=48, ge=1, le=400)
 
-class RebuildIndexRequest(BaseModel):
+class RebuildIndexRequest(ChunkingRequest):
     workspace: WorkspaceName = DEFAULT_WORKSPACE
-    separators: list[str] = Field(default_factory=_default_index_separators)
-    chunk_size: int = Field(default_factory=_default_chunk_size, ge=100, le=2000)
-    chunk_overlap: int = Field(default_factory=_default_chunk_overlap, ge=0, le=500)
     index_mode: Literal["complete", "fast"] = "complete"
     kg_max_entities: int = Field(default=24, ge=1, le=200)
     kg_max_records: int = Field(default=48, ge=1, le=400)
@@ -4084,12 +4084,12 @@ async def get_document_chunks(doc_name: str, workspace: WorkspaceName = Query(DE
         chunking = item.get("chunking") or {}
         cfg = get_config()
         default_chunking = cfg.get("chunking", {})
-        chunker = TextChunker(
+        local_chunks = await service.preview_document_chunks(
+            doc,
             chunk_size=chunking.get("chunk_size") or default_chunking.get("chunk_size", 512),
-            chunk_overlap=chunking.get("chunk_overlap") or default_chunking.get("chunk_overlap", 50),
+            chunk_overlap=chunking.get("chunk_overlap") if chunking.get("chunk_overlap") is not None else default_chunking.get("chunk_overlap", 50),
             separators=chunking.get("separators") or default_chunking.get("separators", ["\n\n", "\n", "。", ""]),
         )
-        local_chunks = chunker.chunk_document(doc)
     except Exception as e:
         logger.warning("Fallback chunk preview failed for {}: {}", doc_name, e)
         return {"doc_name": item.get("doc_name", doc_name), "total": 0, "chunks": []}
@@ -4099,10 +4099,10 @@ async def get_document_chunks(doc_name: str, workspace: WorkspaceName = Query(DE
     for i, chunk in enumerate(local_chunks):
         chunks.append(
             {
-                "chunk_id": lightrag_ids[i] if i < len(lightrag_ids) else chunk.chunk_id,
+                "chunk_id": lightrag_ids[i] if i < len(lightrag_ids) else f"preview-{i}",
                 "chunk_index": i,
-                "text": chunk.text,
-                "char_count": len(chunk.text),
+                "text": chunk["content"],
+                "char_count": len(chunk["content"]),
             }
         )
     return {"doc_name": item.get("doc_name", doc_name), "total": len(chunks), "chunks": chunks}
