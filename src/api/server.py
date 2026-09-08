@@ -3040,11 +3040,15 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                         if event == "start":
                             if _should_advance_index_stage(active_stage, public_stage):
                                 active_stage = public_stage
+                            if active_stage == public_stage:
                                 updates["current_stage"] = public_stage
                                 updates["current_stage_started_at"] = _task_now()
                                 updates["message"] = (
                                     f"正在{_index_stage_label(public_stage)}: {doc_name}"
                                 )
+                        elif event in {"finish", "end"} and active_stage == public_stage:
+                            updates["current_stage"] = ""
+                            updates["current_stage_started_at"] = ""
                         await _update_index_task(task_id, **updates)
 
                     await _update_index_task(
@@ -3258,6 +3262,13 @@ async def _run_graph_backfill_task(task_id: str, req: GraphBackfillRequest) -> N
                                 "current_stage": stage,
                                 "current_stage_started_at": _task_now(),
                                 "message": f"正在{_index_stage_label(stage)}: {doc_name}",
+                            }
+                        )
+                    elif event in {"finish", "end"}:
+                        updates.update(
+                            {
+                                "current_stage": "",
+                                "current_stage_started_at": "",
                             }
                         )
                     await _update_index_task(task_id, **updates)

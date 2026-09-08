@@ -101,7 +101,7 @@ export default function Dashboard({ workspace, onWorkspaceChanged }: Props) {
     if (!startedAt) return fallback
     const start = new Date(startedAt).getTime()
     if (!Number.isFinite(start)) return fallback
-    return Math.max(fallback, (Date.now() - start) / 1000)
+    return fallback + Math.max(0, (Date.now() - start) / 1000)
   }
 
   const formatTaskKind = (kind: IndexTask['kind']) => {

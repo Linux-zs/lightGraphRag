@@ -271,3 +271,52 @@ def test_parallel_chunk_timings_emit_one_document_stage(tmp_path):
         assert collector.t["kg"] >= 0.02
 
     asyncio.run(run())
+
+
+def test_parallel_stage_calls_measure_wall_clock_union():
+    async def run():
+        collector = StageTimingCollector()
+        events = []
+        collector.on_update = lambda timings, stage, event: events.append((stage, event))
+
+        async def operation():
+            await asyncio.sleep(0.04)
+
+        first = _wrap_async(operation, "vector")
+        second = _wrap_async(operation, "vector")
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with collector.scope():
+            await asyncio.gather(first(), second())
+        wall_seconds = loop.time() - started
+
+        assert events == [("vector", "start"), ("vector", "finish")]
+        assert 0.03 <= collector.t["vector"] <= wall_seconds + 0.01
+        assert collector.t["vector"] < 0.07
+
+    asyncio.run(run())
+
+
+def test_nested_stage_is_attributed_only_to_outer_stage():
+    async def run():
+        collector = StageTimingCollector()
+        events = []
+        collector.on_update = lambda timings, stage, event: events.append((stage, event))
+
+        async def vector_flush():
+            await asyncio.sleep(0.02)
+
+        wrapped_vector_flush = _wrap_async(vector_flush, "vector")
+
+        async def final_flush():
+            await wrapped_vector_flush()
+
+        wrapped_final_flush = _wrap_async(final_flush, "merge")
+        with collector.scope():
+            await wrapped_final_flush()
+
+        assert events == [("merge", "start"), ("merge", "finish")]
+        assert collector.t["merge"] >= 0.015
+        assert collector.t["vector"] == 0.0
+
+    asyncio.run(run())
