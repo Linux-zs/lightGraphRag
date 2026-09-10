@@ -197,6 +197,7 @@ export interface DocInfo {
   last_index_attempt_status?: string
   last_index_error?: string
   graph_rule?: GraphRuleSummary
+  kg_policy_stale?: boolean | null
   index_mode?: 'complete' | 'fast'
   kg_status?: 'complete' | 'skipped' | 'filtered_empty' | 'failed' | string
   kg_entity_count?: number
@@ -389,6 +390,7 @@ export function batchIndexDocuments(params: {
 }
 
 export interface IndexTaskResult {
+  kg_policy_rejections?: Record<string, number>
   doc_name: string
   doc_id?: string
   status: 'ok' | 'error'
@@ -408,6 +410,7 @@ export interface IndexTaskResult {
 }
 
 export interface IndexTask {
+  phase?: string
   task_id: string
   kind: 'single' | 'batch' | 'rebuild' | 'kg_backfill'
   workspace?: string
@@ -486,6 +489,7 @@ export interface DocumentChunkItem {
   chunk_index: number
   text: string
   char_count: number
+  source_location?: { start: number; end: number; pages: number[]; text_sha256: string } | null
 }
 
 export interface DocumentChunksResponse {
@@ -516,6 +520,10 @@ export function recallTest(params: {
     body: JSON.stringify(params),
     signal,
   })
+}
+
+export function recoverIndexTask(taskId: string, workspace: string, signal?: AbortSignal) {
+  return request<IndexTask>(`/kb/index-tasks/${encodeURIComponent(taskId)}/recover?workspace=${encodeURIComponent(workspace)}`, { method: 'POST', signal })
 }
 
 export function textRecallTest(params: {
@@ -1188,6 +1196,7 @@ export interface ChatSettings {
   temperature: number
   top_p: number
   max_tokens: number
+  context_window?: number
   frequency_penalty: number
   presence_penalty: number
   mode: string
@@ -1201,6 +1210,7 @@ export interface Citation {
   doc_name: string
   chunk_index: number
   excerpt: string
+  chunk_id?: string
 }
 
 export interface ChatSendResponse {

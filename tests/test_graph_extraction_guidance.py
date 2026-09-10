@@ -45,7 +45,8 @@ def test_graph_guidance_strict_mode_is_explicit(tmp_path):
 
     assert "strict whitelist" in guidance
     assert "hard constraints" in guidance
-    assert "do not use `Other`" in guidance
+    assert "Other unless explicitly listed" in guidance
+    assert "Do not force unrelated entities into the nearest type" in guidance
 
 
 def test_apply_graph_rule_template_supports_noise_reducing_profile(tmp_path):

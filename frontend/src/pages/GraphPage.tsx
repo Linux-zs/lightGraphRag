@@ -74,7 +74,7 @@ const EXTRACTION_MODES: {
 }[] = [
   { key: 'assist', label: '辅助', hint: '通用抽取优先，规则只做归类和纠偏' },
   { key: 'enhanced', label: '增强', hint: '优先使用领域规则，但不会压制重要实体' },
-  { key: 'strict', label: '严格', hint: '类型和关系接近白名单，只适合规范业务库' },
+  { key: 'strict', label: '严格', hint: '实体必须在白名单内；已配置的关系类型也会强制过滤' },
 ]
 
 function splitLines(text: string) {
@@ -108,6 +108,12 @@ function changeTitle(change: GraphChange) {
 }
 
 export default function GraphPage({ workspace }: Props) {
+  return <GraphWorkspace key={workspace} workspace={workspace} />
+}
+
+function GraphWorkspace({ workspace }: Props) {
+  const mounted = useRef(false)
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
   const loadRequestRef = useRef(0)
   const loadAbortRef = useRef<AbortController | null>(null)
   const confirm = useConfirm()
@@ -118,6 +124,7 @@ export default function GraphPage({ workspace }: Props) {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [graphLoadError, setGraphLoadError] = useState('')
   const [notice, setNotice] = useState('')
   const [latestEvidence, setLatestEvidence] = useState<EvidenceChain | null>(null)
   const [ruleTemplates, setRuleTemplates] = useState<GraphRuleTemplate[]>([])
@@ -171,9 +178,16 @@ export default function GraphPage({ workspace }: Props) {
     requestId = loadRequestRef.current,
     signal?: AbortSignal,
   ) => {
-    const graph = await getGraph(nextLimit, workspace, signal)
-    if (requestId !== loadRequestRef.current) return
-    setData(graph)
+    try {
+      const graph = await getGraph(nextLimit, workspace, signal)
+      if (requestId !== loadRequestRef.current || signal?.aborted) return
+      setData(graph)
+      setGraphLoadError('')
+    } catch (error) {
+      if (requestId === loadRequestRef.current && !signal?.aborted)
+        setGraphLoadError((error as Error).message || '图谱加载失败')
+      throw error
+    }
   }
 
   const loadConfig = async (requestId = loadRequestRef.current, signal?: AbortSignal) => {
@@ -209,13 +223,15 @@ export default function GraphPage({ workspace }: Props) {
     setLoading(true)
     setError('')
     try {
-      await Promise.all([
+      const results = await Promise.allSettled([
         loadGraph(nextLimit, requestId, controller.signal),
         loadConfig(requestId, controller.signal),
         loadTemplates(requestId, controller.signal),
         loadImportHistory(requestId, controller.signal),
       ])
       if (requestId !== loadRequestRef.current) return
+      const failure = results.find(result => result.status === 'rejected')
+      if (failure?.status === 'rejected') throw failure.reason
     } catch (e) {
       if (requestId !== loadRequestRef.current) return
       if (controller.signal.aborted) return
@@ -227,6 +243,10 @@ export default function GraphPage({ workspace }: Props) {
 
   useEffect(() => {
     loadRequestRef.current += 1
+    setData(null)
+    setGraphLoadError('')
+    setSelectedNode(null)
+    setSelectedEdge(null)
     setGraphImportFile(null)
     setGraphImportPreview(null)
     setSelectedImportEntities(new Set())
@@ -299,17 +319,19 @@ export default function GraphPage({ workspace }: Props) {
   }
 
   const runAction = async (fn: () => Promise<unknown>, message: string) => {
+    if (!mounted.current) return
     setSaving(true)
     setError('')
     setNotice('')
     try {
       await fn()
+      if (!mounted.current) return
       setNotice(message)
       await loadAll(limit)
     } catch (e) {
-      setError((e as Error).message || '操作失败')
+      if (mounted.current) setError((e as Error).message || '操作失败')
     } finally {
-      setSaving(false)
+      if (mounted.current) setSaving(false)
     }
   }
 
@@ -336,7 +358,7 @@ export default function GraphPage({ workspace }: Props) {
       message: `将“${selected?.name || selectedTemplateId}”套用到知识库“${workspace}”。新规则只影响后续上传和重新索引的文档。`,
       confirmLabel: '套用规则',
     })
-    if (!ok) return
+    if (!ok || !mounted.current) return
     return runAction(async () => {
       const cfg = await applyGraphRuleTemplate(workspace, selectedTemplateId)
       setConfig(cfg)
@@ -377,7 +399,7 @@ export default function GraphPage({ workspace }: Props) {
       confirmLabel: '删除模板',
       tone: 'danger',
     })
-    if (!ok) return
+    if (!ok || !mounted.current) return
     return runAction(async () => {
       await deleteGraphRuleTemplate(template.id)
       await loadTemplates()
@@ -428,7 +450,7 @@ export default function GraphPage({ workspace }: Props) {
       confirmLabel: '删除实体',
       tone: 'danger',
     })
-    if (!ok) return
+    if (!ok || !mounted.current) return
     return runAction(async () => {
       await deleteGraphEntity(selectedNode.id, workspace)
       setSelectedNode(null)
@@ -472,7 +494,7 @@ export default function GraphPage({ workspace }: Props) {
       confirmLabel: '删除关系',
       tone: 'danger',
     })
-    if (!ok) return
+    if (!ok || !mounted.current) return
     return runAction(async () => {
       await deleteGraphRelation({
         workspace,
@@ -525,7 +547,7 @@ export default function GraphPage({ workspace }: Props) {
       message: `将对知识库“${workspace}”应用 ${changes.length} 条图谱变更。`,
       confirmLabel: '应用变更',
     })
-    if (!ok) return
+    if (!ok || !mounted.current) return
     return runAction(async () => {
       await applyGraphChanges(workspace, changes)
       setSuggestions([])
@@ -568,7 +590,7 @@ export default function GraphPage({ workspace }: Props) {
       message: `将导入 ${entities.length} 个实体和 ${relationships.length} 条关系。专用资料不会进入普通文本向量召回。`,
       confirmLabel: '确认导入',
     })
-    if (!ok) return
+    if (!ok || !mounted.current) return
     setApplyingImport(true)
     setError('')
     try {
@@ -624,14 +646,20 @@ export default function GraphPage({ workspace }: Props) {
         ].map(([label, value]) => (
           <div key={label} className="border border-gray-200 rounded-lg bg-white p-4">
             <div className="text-xs text-gray-400">{label}</div>
-            <div className="text-2xl font-bold text-gray-800">{value}</div>
+            <div className="text-2xl font-bold text-gray-800">{data ? value : '—'}</div>
           </div>
         ))}
       </div>
 
+      {!loading && data && graphLoadError && <p role="alert" className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">图谱刷新失败，以下为上次成功加载的数据，可能已过期。请点击刷新重试。</p>}
       {loading ? (
         <div className="h-[560px] border border-gray-200 rounded-lg bg-white flex items-center justify-center text-sm text-gray-400">
           加载图谱...
+        </div>
+      ) : !data && graphLoadError ? (
+        <div role="alert" className="h-[360px] border border-amber-200 rounded-lg bg-amber-50 flex flex-col items-center justify-center gap-3 text-sm text-amber-900">
+          <p>图谱加载失败，当前无法确认节点和关系数量。请检查后端连接或索引恢复状态。</p>
+          <button className="rounded border border-amber-700 bg-white px-3 py-2 focus-visible:outline focus-visible:outline-2" onClick={() => void loadAll()}>重试加载图谱</button>
         </div>
       ) : !data || data.nodes.length === 0 ? (
         <div className="h-[360px] border border-gray-200 rounded-lg bg-white flex items-center justify-center text-sm text-gray-400">
@@ -643,8 +671,9 @@ export default function GraphPage({ workspace }: Props) {
             <GraphView
               nodes={data.nodes}
               edges={data.edges}
+              directed={data.metadata?.directed === true}
               hitNodes={evidenceNodeIds}
-              pathNodes={evidenceNodeIds}
+              pathEdges={latestEvidence?.edges}
             />
           </div>
           <div className="border border-gray-200 rounded-lg bg-white overflow-hidden">
@@ -738,13 +767,14 @@ export default function GraphPage({ workspace }: Props) {
             <div>
               <h3 className="text-sm font-semibold text-gray-800">抽取模式</h3>
               <p className="mt-1 text-xs text-gray-500">
-                规则默认只是辅助。只有切到严格模式时，实体类型和关系类型才接近白名单。
+                辅助和增强模式使用规则引导抽取；严格模式会在入图前执行白名单过滤。
               </p>
             </div>
             <label className="shrink-0 flex items-center gap-2 text-xs text-gray-600">
               <input
                 type="checkbox"
                 checked={allowOtherEntityType}
+                disabled={extractionMode === 'strict'}
                 onChange={(e) => setAllowOtherEntityType(e.target.checked)}
                 className="h-4 w-4 rounded accent-gray-900"
               />
@@ -756,6 +786,7 @@ export default function GraphPage({ workspace }: Props) {
             {EXTRACTION_MODES.map((mode) => (
               <button
                 key={mode.key}
+                aria-pressed={extractionMode === mode.key}
                 onClick={() => setExtractionMode(mode.key)}
                 className={`rounded-lg border px-3 py-2 text-left transition-colors ${
                   extractionMode === mode.key
@@ -774,7 +805,7 @@ export default function GraphPage({ workspace }: Props) {
           </div>
           {extractionMode === 'strict' && (
             <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-              严格模式可能导致非模板领域文档抽不出实体关系。普通知识库建议使用辅助或增强模式。
+              严格模式必须填写实体类型。关系类型非空时，仅保留与其中一个类型完全匹配的关系；留空则不限制关系类型。Other 只有明确列入实体白名单才允许，与上方开关无关。修改规则不会自动清理旧图谱，需要重新索引。
             </div>
           )}
         </div>
@@ -798,7 +829,7 @@ export default function GraphPage({ workspace }: Props) {
             />
           </div>
           <div className="border border-gray-200 rounded-lg bg-white p-4">
-            <label className="block text-sm font-semibold text-gray-800 mb-2">关系类型偏好</label>
+            <label className="block text-sm font-semibold text-gray-800 mb-2">{extractionMode === 'strict' ? '关系类型白名单（可选）' : '关系类型偏好'}</label>
             <textarea
               value={relationTypesText}
               onChange={(e) => setRelationTypesText(e.target.value)}

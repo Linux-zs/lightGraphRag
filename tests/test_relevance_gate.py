@@ -1,6 +1,18 @@
 from src.api.server import _citations_are_relevant
 
 
+def test_matching_filename_is_not_answer_evidence():
+    citations = [{"doc_name": "MySQL.md", "file_path": "MySQL/audit.md",
+                  "excerpt": "员工示例表包含姓名和城市。"}]
+    assert not _citations_are_relevant("MySQL 如何启用审计日志", citations, [])
+
+
+def test_evidence_after_excerpt_and_eighth_source_is_considered():
+    citations = [{"excerpt": "无关示例内容。"} for _ in range(8)]
+    citations.append({"excerpt": "背景资料。", "answer_content": "背景资料。" * 100 + "MySQL 审计日志需要启用审计插件。"})
+    assert _citations_are_relevant("MySQL 如何启用审计日志", citations, [])
+
+
 def test_news_info_business_question_is_not_rejected_as_general_news():
     citations = [
         {

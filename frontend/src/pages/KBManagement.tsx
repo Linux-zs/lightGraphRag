@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { ChevronDown, ShieldCheck, SlidersHorizontal, Trash2 } from 'lucide-react'
 import FileUpload from '../components/FileUpload'
+import IndexRecovery from '../components/IndexRecovery'
+import ExtractionPolicySummary from '../components/ExtractionPolicySummary'
 import ChunkPreview from '../components/ChunkPreview'
 import { RangeField } from '../components/ui'
 import {
@@ -352,7 +354,7 @@ export default function KBManagement({
   }
 
   const canBackfillGraph = (doc: DocInfo) =>
-    Boolean(doc.indexed) && doc.kg_status !== 'complete'
+    Boolean(doc.indexed) && doc.kg_status !== 'complete' && doc.kg_policy_stale !== true
 
   const handleDeleteWorkspace = async () => {
     if (isDefaultWorkspace || deletingWorkspace) return
@@ -816,6 +818,7 @@ export default function KBManagement({
             )
           })}
         </div>
+        <ExtractionPolicySummary results={task.results} />
         {task.errors.length > 0 && (
           <div className="mt-2 space-y-1">
             {task.errors.slice(0, 3).map((err) => (
@@ -951,6 +954,14 @@ export default function KBManagement({
 
   return (
     <div className="space-y-5 sm:space-y-8">
+      <IndexRecovery key={workspace} workspace={workspace} onRecovered={async task => {
+        const operation = operationScope()
+        const data = await listDocuments(workspace, operation.signal)
+        if (!operation.current()) return
+        setDocs(data)
+        setBatchIndexTask(task)
+        setBatchMsg(task.message)
+      }} />
       {/* Page header */}
       <div>
         <h2 className="text-xl font-bold text-gray-800">知识库管理</h2>
@@ -1373,6 +1384,7 @@ export default function KBManagement({
                         className="text-xs bg-amber-50 text-amber-700 px-2 py-0.5 rounded"
                       >
                         {doc.graph_rule?.rule_template_name || graphRule?.rule_template_name || '未记录'}
+                        {doc.kg_policy_stale === true && <span className="ml-2 text-amber-700" title="当前抽取规则或参考内容与生成此图谱时不同；需要重新索引才能更新已有图谱。">规则已变更，待重建</span>}
                       </span>
                     </td>
                     <td className="py-2.5">

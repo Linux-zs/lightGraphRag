@@ -124,10 +124,14 @@ def test_failed_reindex_keeps_active_version_and_marks_attempt_stale(
     assert item["last_index_attempt"]["index_doc_id"].startswith("doc_123-v")
 
 
+@pytest.mark.parametrize("rollback_fails", [False, True])
 def test_shadow_commit_rolls_back_workspace_manifest_and_embedding_meta(
     tmp_path,
     monkeypatch,
+    rollback_fails,
 ):
+    # This test injects swap failures; publication validation has separate tests.
+    monkeypatch.setattr("src.index_validation.validate_index", lambda *args: {})
     active = _service(tmp_path, "kb")
     active.workspace_dir.mkdir(parents=True)
     (active.workspace_dir / "state.txt").write_text("old", encoding="utf-8")
@@ -161,24 +165,45 @@ def test_shadow_commit_rolls_back_workspace_manifest_and_embedding_meta(
     real_replace = os.replace
 
     def fail_on_shadow_embedding(src, dst):
+        if Path(src).resolve() == active.workspace_dir.resolve():
+            journal = json.loads((tmp_path / "shadow" / "publication.json").read_text(encoding="utf-8"))
+            assert journal["state"] == "prepared"
+            assert journal["workspace"] == "kb"
+            assert all(item["had_active"] for item in journal["artifacts"])
         if Path(src).resolve() == shadow.embedding_meta_path.resolve():
             raise OSError("simulated metadata swap failure")
         return real_replace(src, dst)
 
     monkeypatch.setattr(server.os, "replace", fail_on_shadow_embedding)
 
-    with pytest.raises(OSError, match="metadata swap"):
+    task = {"workspace": "kb", "task_id": "task", "phase": "committing"}
+    monkeypatch.setattr(server, "_index_tasks", {"task": task})
+    monkeypatch.setattr(server, "_persist_index_task", lambda _: None)
+    if rollback_fails:
+        def fail_rollback(_):
+            raise OSError("simulated rollback failure")
+        monkeypatch.setattr("src.publication_recovery.rollback_artifacts", fail_rollback)
+
+    with pytest.raises(OSError, match="rollback failure" if rollback_fails else "metadata swap"):
         asyncio.run(
             server._commit_shadow_rebuild(
-                {"workspace": "kb", "task_id": "task"},
+                task,
                 shadow,
             )
         )
 
+    if rollback_fails:
+        assert task["phase"] == "recovery_required"
+        assert (tmp_path / "shadow" / "previous" / "workspace" / "state.txt").read_text(encoding="utf-8") == "old"
+        journal = json.loads((tmp_path / "shadow" / "publication.json").read_text(encoding="utf-8"))
+        assert journal["state"] == "prepared"
+        return
     assert (active.workspace_dir / "state.txt").read_text(encoding="utf-8") == "old"
     assert set(active._load_manifest()["documents"]) == {"old"}
     meta = json.loads(active.embedding_meta_path.read_text(encoding="utf-8"))
     assert meta["model"] == "old"
+    journal = json.loads((tmp_path / "shadow" / "publication.json").read_text(encoding="utf-8"))
+    assert journal["state"] == "rolled_back"
 
 
 def test_model_mutations_are_blocked_while_index_task_is_active(monkeypatch):

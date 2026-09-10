@@ -42,6 +42,7 @@ frontend/tsconfig.tsbuildinfo
 # Documents, local test data, and screenshots
 *.md
 !docs/USER_MANUAL.md
+!docs/optimization-progress.md
 *.pdf
 *.doc
 *.docx

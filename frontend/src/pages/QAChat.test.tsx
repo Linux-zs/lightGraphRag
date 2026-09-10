@@ -14,6 +14,7 @@ vi.mock('../api', async (importOriginal) => {
   return {
     ...actual,
     getChatSession: vi.fn(),
+    getDocumentChunks: vi.fn(),
     listModelProfiles: vi.fn(),
     getModelBindings: vi.fn(),
     getModelConfig: vi.fn(),
@@ -99,6 +100,36 @@ function renderChat(props: Partial<React.ComponentProps<typeof QAChat>> = {}) {
 describe('QAChat async state', () => {
   afterEach(cleanup)
 
+  it('shows verified source pages and does not reopen a closed citation on late response', async () => {
+    const saved = session('cited', 'old', 'answer')
+    vi.mocked(api.getChatSession).mockResolvedValue({ ...saved, messages: [{
+      role: 'assistant', content: 'answer', timestamp: '',
+      citations: [{ index: 1, doc_name: 'source.pdf', chunk_index: -1, chunk_id: 'evidence', excerpt: 'evidence' }],
+    }] })
+    const response = { doc_name: 'source.pdf', total: 1, chunks: [{
+      chunk_id: 'evidence', chunk_index: 8, text: 'evidence text', char_count: 13,
+      source_location: { start: 12, end: 25, pages: [3, 4], text_sha256: 'hash' },
+    }] }
+    vi.mocked(api.getDocumentChunks).mockResolvedValueOnce(response)
+    renderChat({ activeId: 'cited' })
+    await userEvent.click(await screen.findByRole('button', { name: /引用文档/ }))
+    const trigger = screen.getByRole('button', { name: 'source.pdf' })
+    await userEvent.click(trigger)
+    expect(await screen.findByText(/原文第 3、4 页/)).toBeInTheDocument()
+    await userEvent.keyboard('{Escape}')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(trigger).toHaveFocus()
+
+    const pending = deferred<typeof response>()
+    vi.mocked(api.getDocumentChunks).mockReturnValueOnce(pending.promise)
+    await userEvent.click(trigger)
+    await userEvent.click(screen.getByRole('button', { name: '关闭' }))
+    const calls = vi.mocked(api.getDocumentChunks).mock.calls
+    expect(calls[calls.length - 1][2]?.aborted).toBe(true)
+    pending.resolve(response)
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  })
+
   beforeEach(() => {
     vi.mocked(api.listModelProfiles).mockResolvedValue([])
     vi.mocked(api.getModelBindings).mockResolvedValue({
@@ -126,6 +157,37 @@ describe('QAChat async state', () => {
       answer_prompt_template_id: '',
       answer_system_prompt: '',
     })
+  })
+
+  it('exposes and saves the total context budget independently of output length', async () => {
+    vi.mocked(api.getChatSession).mockResolvedValue(session('budget', 'old', 'answer'))
+    vi.mocked(api.updateChatSessionSettings).mockImplementation(async (_id, settings) => settings)
+    renderChat({ activeId: 'budget' })
+    await screen.findByText('answer')
+    await userEvent.click(screen.getByRole('button', { name: /mix.*20 块/ }))
+    const select = screen.getByRole('combobox', { name: '上下文总预算（输入＋输出）' })
+    expect(select).toHaveValue('32768')
+    await userEvent.selectOptions(select, '16384')
+    await waitFor(() => expect(api.updateChatSessionSettings).toHaveBeenCalledWith(
+      'budget', expect.objectContaining({ context_window: 16384, max_tokens: 4096 }), 'old',
+    ))
+    expect(screen.getByText(/并非自动识别模型窗口/)).toBeInTheDocument()
+  })
+
+  it('shows settings save failure and retries the same draft', async () => {
+    vi.mocked(api.getChatSession).mockResolvedValue(session('budget', 'old', 'answer'))
+    vi.mocked(api.updateChatSessionSettings).mockRejectedValueOnce(new Error('offline'))
+      .mockImplementationOnce(async (_id, settings) => settings)
+    renderChat({ activeId: 'budget' })
+    await screen.findByText('answer')
+    await userEvent.click(screen.getByRole('button', { name: /mix.*20 块/ }))
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: '上下文总预算（输入＋输出）' }), '16384')
+    expect(await screen.findByRole('alert')).toHaveTextContent('设置保存失败')
+    await userEvent.click(screen.getByRole('button', { name: '重试保存' }))
+    expect(await screen.findByText('设置已保存')).toBeInTheDocument()
+    expect(api.updateChatSessionSettings).toHaveBeenLastCalledWith(
+      'budget', expect.objectContaining({ context_window: 16384 }), 'old',
+    )
   })
 
   it('drops a late session response after switching workspace and session', async () => {

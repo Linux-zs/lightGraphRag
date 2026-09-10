@@ -66,6 +66,20 @@ npm ci
 
 ## 五、启动
 
+Windows 下一键启动前后端：
+
+```text
+双击 start-dev.cmd
+```
+
+脚本会在后台启动前后端，等待服务身份检查通过后打开浏览器。日志位于 `.workbuddy/dev-logs/`。已识别为本应用的服务不会重复启动；首次启动前端且缺少 `node_modules` 时会自动执行 `npm ci`。`uv run` 会自动使用项目的 Python 环境，不需要提前激活 `.venv`。默认等待 180 秒，可用 `-StartupTimeoutSeconds 300` 调整；超时不会自动终止仍在启动的服务。前端端口固定为 5173，冲突时报错，不会悄悄切换端口。
+
+也可以从 PowerShell 启动但不自动打开浏览器：
+
+```powershell
+.\scripts\start-dev.ps1 -NoBrowser
+```
+
 启动后端：
 
 ```powershell

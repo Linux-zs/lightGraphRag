@@ -43,21 +43,19 @@ def _manifest_item(indexed=False):
     }
 
 
-def test_prepare_embedding_text_removes_non_bmp_chars(tmp_path):
+def test_prepare_embedding_text_preserves_meaningful_unicode_and_punctuation(tmp_path):
     service = _service(tmp_path)
 
     safe = service._prepare_embedding_text("# Title 📖\x00 body | TCP/IP (config)", 700)
 
-    assert "📖" not in safe
+    assert "📖" in safe
     assert "\x00" not in safe
-    assert "|" not in safe
-    assert "/" not in safe
-    assert "(" not in safe
-    assert safe == "# Title body TCP IP config"
-    assert service._prepare_embedding_text("📖\x00", 700) == "empty document chunk"
+    assert safe == "# Title 📖 body | TCP/IP (config)"
+    with pytest.raises(ValueError, match="empty text"):
+        service._prepare_embedding_text("\x00", 700)
 
 
-def test_embedding_fallback_splits_batch_and_shortens_bad_text(tmp_path, monkeypatch):
+def test_embedding_fallback_splits_batch_without_substituting_bad_text(tmp_path, monkeypatch):
     service = _service(tmp_path)
     calls: list[list[str]] = []
 
@@ -71,7 +69,8 @@ def test_embedding_fallback_splits_batch_and_shortens_bad_text(tmp_path, monkeyp
 
     monkeypatch.setattr(lightrag_service.openai_embed, "func", fake_embed)
 
-    result = asyncio.run(
+    with pytest.raises(RuntimeError, match="no shortened or placeholder"):
+        asyncio.run(
         service._embed_texts_with_fallback(
             ["normal chunk", "x" * 480],
             embed_model="embed",
@@ -81,10 +80,9 @@ def test_embedding_fallback_splits_batch_and_shortens_bad_text(tmp_path, monkeyp
         )
     )
 
-    assert result.shape == (2, 1024)
     assert ["normal chunk", "x" * 480] in calls
     assert ["normal chunk"] in calls
-    assert any(len(batch) == 1 and len(batch[0]) <= 120 for batch in calls)
+    assert calls == [["normal chunk", "x" * 480], ["normal chunk"], ["x" * 480]]
 
 
 def test_delete_uses_actual_lightrag_status_even_if_manifest_is_not_indexed(tmp_path):
@@ -205,6 +203,41 @@ def test_graph_audit_replay_is_oldest_first_and_does_not_append_audit(tmp_path):
     assert calls == [("create", "A"), ("edit", "A")]
     assert result["applied"] == 2
     assert len(service.load_graph_governance()["audit_log"]) == 2
+
+
+def test_graph_mutations_survive_display_retention_and_service_restart(tmp_path):
+    service = _service(tmp_path)
+    for index in range(205):
+        service.append_graph_audit("create_entity", {"entity_name": f"entity-{index}"})
+    assert len(service.load_graph_governance()["audit_log"]) == 200
+    reopened = _service(tmp_path)
+    create = AsyncMock()
+    reopened._rag = SimpleNamespace(acreate_entity=create)
+    result = asyncio.run(reopened.replay_graph_audit())
+    assert result["applied"] == 205
+    assert create.call_args_list[0].kwargs["entity_name"] == "entity-0"
+    assert create.call_args_list[-1].kwargs["entity_name"] == "entity-204"
+    assert len(reopened._load_graph_mutations()) == 205
+
+
+def test_graph_mutations_seed_legacy_history_once(tmp_path):
+    service = _service(tmp_path)
+    cfg = service.load_graph_governance()
+    cfg["audit_log"] = [{"id": "legacy", "action": "create_entity", "payload": {"entity_name": "old"}}]
+    service.save_graph_governance(cfg)
+    service.append_graph_audit("delete_entity", {"entity_name": "old"})
+    service.append_graph_audit("create_entity", {"entity_name": "new"})
+    assert [e["action"] for e in service._load_graph_mutations()] == [
+        "create_entity", "delete_entity", "create_entity",
+    ]
+
+
+def test_corrupt_graph_mutation_history_does_not_fall_back_to_truncated_log(tmp_path):
+    service = _service(tmp_path)
+    service.append_graph_audit("create_entity", {"entity_name": "old"})
+    service.graph_mutations_path.write_text("broken", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="mutation journal"):
+        service._load_graph_mutations()
 
 
 def test_graph_backfill_reuses_existing_chunks_without_chunk_vector_upsert(tmp_path, monkeypatch):
@@ -651,6 +684,12 @@ def test_empty_cleanup_rebuild_can_run_while_caller_holds_workspace_lock(
     monkeypatch,
 ):
     class FakeService:
+        def load_graph_governance(self):
+            return {}
+
+        def graph_extraction_guidance(self, config=None):
+            return ""
+
         async def replay_graph_audit(self):
             return {"applied": 0, "skipped": 0, "errors": []}
 

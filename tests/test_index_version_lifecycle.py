@@ -26,7 +26,7 @@ def versioned_service(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "_runtime_models", lambda: {"embedding": {}, "kg": {"model": "fake"}})
     monkeypatch.setattr(service, "record_embedding_signature", lambda *a, **kw: None)
     monkeypatch.setattr(service, "graph_extraction_guidance", lambda **kw: "")
-    monkeypatch.setattr(service, "graph_governance_summary", lambda: {})
+    monkeypatch.setattr(service, "graph_governance_summary", lambda config=None: {})
     monkeypatch.setattr(service, "_temporary_index_llm_and_kg_filter", lambda *a, **kw: nullcontext())
     monkeypatch.setattr(service, "get_doc_status", AsyncMock(return_value=LightRAGDocStatus(doc_id="new", status="processed")))
 

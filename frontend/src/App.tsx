@@ -1,11 +1,12 @@
-import { FormEvent, useEffect, useRef, useState } from 'react'
+import { FormEvent, lazy, Suspense, useEffect, useRef, useState } from 'react'
 import Layout from './components/Layout'
-import QAChat from './pages/QAChat'
-import KBManagement from './pages/KBManagement'
-import RecallTest from './pages/RecallTest'
-import GraphPage from './pages/GraphPage'
-import ModelSettings from './pages/ModelSettings'
-import Dashboard from './pages/Dashboard'
+import PageBoundary from './components/PageBoundary'
+const QAChat = lazy(() => import('./pages/QAChat'))
+const KBManagement = lazy(() => import('./pages/KBManagement'))
+const RecallTest = lazy(() => import('./pages/RecallTest'))
+const GraphPage = lazy(() => import('./pages/GraphPage'))
+const ModelSettings = lazy(() => import('./pages/ModelSettings'))
+const Dashboard = lazy(() => import('./pages/Dashboard'))
 import {
   ChatSessionListItem,
   createChatSession,
@@ -64,35 +65,51 @@ export default function App() {
     ),
   )
   const [authOpen, setAuthOpen] = useState(false)
+  const [operationError, setOperationError] = useState('')
   const [authToken, setAuthToken] = useState(() => getAppToken())
   const [rememberToken, setRememberToken] = useState(true)
   const workspaceRequestRef = useRef(0)
   const sessionRequestRef = useRef(0)
+  const chatViewRef = useRef({ workspace, generation: 0, activeChatId })
+  if (chatViewRef.current.workspace !== workspace) {
+    chatViewRef.current = { workspace, generation: chatViewRef.current.generation + 1, activeChatId }
+  } else {
+    chatViewRef.current.activeChatId = activeChatId
+  }
 
   const loadWorkspaces = async (current = workspace, signal?: AbortSignal) => {
     const requestId = ++workspaceRequestRef.current
+    const generation = chatViewRef.current.generation
     try {
       const data = await listWorkspaces(signal)
-      if (requestId !== workspaceRequestRef.current) return []
+      if (requestId !== workspaceRequestRef.current || signal?.aborted) return null
       setWorkspaces(data)
-      if (!data.some((item) => item.workspace === current) && data[0]) {
+      if (generation === chatViewRef.current.generation && !data.some((item) => item.workspace === current) && data[0]) {
         setWorkspace(data[0].workspace)
         localStorage.setItem(WORKSPACE_STORAGE_KEY, data[0].workspace)
       }
       return data
-    } catch {/* ignore */}
-    return []
+    } catch (error) {
+      if (!signal?.aborted && requestId === workspaceRequestRef.current) {
+        setOperationError(`加载知识库失败：${(error as Error).message}`)
+      }
+    }
+    return null
   }
 
   const loadChatSessions = async (targetWorkspace = workspace, signal?: AbortSignal) => {
     const requestId = ++sessionRequestRef.current
     try {
       const data = await listChatSessions(targetWorkspace, signal)
-      if (requestId !== sessionRequestRef.current) return []
+      if (requestId !== sessionRequestRef.current || signal?.aborted) return null
       setChatSessions(data)
       return data
-    } catch {/* ignore */}
-    return []
+    } catch (error) {
+      if (!signal?.aborted && requestId === sessionRequestRef.current) {
+        setOperationError(`加载会话失败：${(error as Error).message}`)
+      }
+    }
+    return null
   }
 
   const reloadCurrentChatSessions = async () => {
@@ -128,7 +145,7 @@ export default function App() {
     setActiveChatId(storedActive)
     setChatSessions([])
     void loadChatSessions(workspace, controller.signal).then((sessions) => {
-      if (storedActive && !sessions.some((session) => session.id === storedActive)) {
+      if (!controller.signal.aborted && sessions && storedActive && !sessions.some((session) => session.id === storedActive)) {
         setActiveChatId(null)
         localStorage.removeItem(chatStorageKey(workspace))
       }
@@ -163,12 +180,14 @@ export default function App() {
   }
 
   const handleCreateWorkspace = async (name: string, ruleTemplateId: string) => {
+    const generation = chatViewRef.current.generation
     const created = await createWorkspace(name, ruleTemplateId)
-    await loadWorkspaces()
-    handleWorkspaceChange(created.workspace)
+    await loadWorkspaces(chatViewRef.current.workspace)
+    if (generation === chatViewRef.current.generation) handleWorkspaceChange(created.workspace)
   }
 
   const handleDeleteWorkspace = async (target: string) => {
+    const generation = chatViewRef.current.generation
     const info = workspaces.find((item) => item.workspace === target)
     if (info?.is_default) return
     const ok = await confirm({
@@ -180,9 +199,10 @@ export default function App() {
     if (!ok) return
     try {
       await deleteWorkspace(target)
-      const nextWorkspaces = await loadWorkspaces(target)
-      if (target === workspace) {
-        const next = nextWorkspaces[0]?.workspace || DEFAULT_WORKSPACE
+      localStorage.removeItem(chatStorageKey(target))
+      const nextWorkspaces = await loadWorkspaces(chatViewRef.current.workspace)
+      if (generation === chatViewRef.current.generation && target === workspace) {
+        const next = nextWorkspaces?.[0]?.workspace || DEFAULT_WORKSPACE
         setWorkspace(next)
         localStorage.setItem(WORKSPACE_STORAGE_KEY, next)
         handleSetActiveChatId(null)
@@ -196,12 +216,18 @@ export default function App() {
   }
 
   const handleNewChat = async () => {
+    const generation = chatViewRef.current.generation
+    setOperationError('')
     try {
       const created = await createChatSession(workspace)
+      if (generation !== chatViewRef.current.generation) return
       setChatSessions((prev) => [created, ...prev])
       handleSetActiveChatId(created.id)
       handleNavigate('chat')
-    } catch {/* ignore */}
+    } catch (error) {
+      if (generation !== chatViewRef.current.generation) return
+      setOperationError(`新建会话失败：${(error as Error).message}`)
+    }
   }
 
   const handleSelectChat = (id: string) => {
@@ -210,13 +236,19 @@ export default function App() {
   }
 
   const handleDeleteChat = async (id: string) => {
+    const generation = chatViewRef.current.generation
+    setOperationError('')
     try {
       await deleteChatSession(id, workspace)
+      if (generation !== chatViewRef.current.generation) return
       setChatSessions((prev) => prev.filter((item) => item.id !== id))
-      if (activeChatId === id) {
+      if (chatViewRef.current.activeChatId === id) {
         handleSetActiveChatId(null)
       }
-    } catch {/* ignore */}
+    } catch (error) {
+      if (generation !== chatViewRef.current.generation) return
+      setOperationError(`删除会话失败：${(error as Error).message}`)
+    }
   }
 
   const submitToken = (event: FormEvent) => {
@@ -242,6 +274,12 @@ export default function App() {
       onSelectChat={handleSelectChat}
       onDeleteChat={handleDeleteChat}
     >
+      {operationError && <div role="alert" className="flex items-center justify-between gap-3 border-b border-red-200 bg-red-50 p-3 text-sm text-red-800">
+        <span>{operationError}</span>
+        <button className="ui-button-secondary shrink-0" onClick={() => setOperationError('')}>关闭提示</button>
+      </div>}
+      <PageBoundary key={page}>
+      <Suspense fallback={<p role="status" className="p-6 text-sm text-gray-600">正在加载页面…</p>}>
       {page === 'chat' && (
         <QAChat
           workspace={workspace}
@@ -266,6 +304,8 @@ export default function App() {
       {page === 'graph' && <GraphPage workspace={workspace} />}
       {page === 'models' && <ModelSettings workspace={workspace} />}
       {page === 'dashboard' && <Dashboard workspace={workspace} onWorkspaceChanged={loadWorkspaces} />}
+      </Suspense>
+      </PageBoundary>
     </Layout>
     {authOpen && (
       <div className="fixed inset-0 z-[200] grid place-items-center bg-gray-950/35 p-4">

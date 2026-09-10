@@ -13,6 +13,8 @@ import {
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import GraphView from '../components/GraphView'
+import { locateCitationChunk } from '../utils/citationLocator'
+import { useChatSettingsSave } from '../utils/useChatSettingsSave'
 import { useConfirm } from '../components/ConfirmDialog'
 import { RangeField, SelectField, Toggle } from '../components/ui'
 import WorkspaceSwitcher from '../components/WorkspaceSwitcher'
@@ -29,7 +31,6 @@ import {
   Citation,
   EvidenceChain,
   ModelProfile,
-  updateChatSessionSettings,
   WorkspaceInfo,
 } from '../api'
 
@@ -42,6 +43,7 @@ const DEFAULT_CHAT_SETTINGS: ChatSettings = {
   temperature: 0.7,
   top_p: 0.9,
   max_tokens: 4096,
+  context_window: 32768,
   frequency_penalty: 0.3,
   presence_penalty: 0.2,
   mode: 'mix',
@@ -217,7 +219,6 @@ export default function QAChat({
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const streamingRef = useRef(false)
-  const settingsSaveTimerRef = useRef<number | null>(null)
   const streamAbortRef = useRef<AbortController | null>(null)
   const sessionAbortRef = useRef<AbortController | null>(null)
   const sessionRequestRef = useRef(0)
@@ -241,10 +242,25 @@ export default function QAChat({
     text: string
     loading: boolean
     error: string | null
+    pages?: number[]
   } | null>(null)
+  const chunkRequestRef = useRef<AbortController | null>(null)
+  const chunkTriggerRef = useRef<HTMLElement | null>(null)
+  const closeChunkModal = useCallback(() => {
+    chunkRequestRef.current?.abort()
+    chunkRequestRef.current = null
+    setChunkModal(null)
+    chunkTriggerRef.current?.focus()
+  }, [])
+  useEffect(() => {
+    closeChunkModal()
+    return () => chunkRequestRef.current?.abort()
+  }, [workspace, closeChunkModal])
 
   const [showSettings, setShowSettings] = useState(false)
   const [chatSettings, setChatSettings] = useState<ChatSettings>(DEFAULT_CHAT_SETTINGS)
+  const settingsSave = useChatSettingsSave(workspace, activeId)
+  const { getUnsavedDraft, schedule: scheduleSettingsSave } = settingsSave
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>([])
 
   const scrollToBottom = useCallback(() => {
@@ -274,7 +290,7 @@ export default function QAChat({
       const data = await getChatSession(id, workspace, controller.signal)
       if (requestId !== sessionRequestRef.current || controller.signal.aborted) return
       setMessages(data.messages)
-      setChatSettings(data.settings || DEFAULT_CHAT_SETTINGS)
+      setChatSettings(getUnsavedDraft(workspace, id) || data.settings || DEFAULT_CHAT_SETTINGS)
       const restoredCitations: CitationMap = new Map()
       const restoredEvidence: EvidenceMap = new Map()
       data.messages.forEach((msg, idx) => {
@@ -296,7 +312,7 @@ export default function QAChat({
     } finally {
       if (requestId === sessionRequestRef.current) setLoadingSession(false)
     }
-  }, [workspace])
+  }, [workspace, getUnsavedDraft])
 
   useEffect(() => {
     let cancelled = false
@@ -315,6 +331,7 @@ export default function QAChat({
           temperature: config.chat_temperature,
           top_p: config.chat_top_p,
           max_tokens: config.chat_max_tokens,
+          context_window: 32768,
           frequency_penalty: config.frequency_penalty,
           presence_penalty: config.presence_penalty,
           mode: 'mix',
@@ -346,26 +363,12 @@ export default function QAChat({
     }
   }, [activeId, loadActiveSession, resetConversationState])
 
-  useEffect(() => () => {
-    if (settingsSaveTimerRef.current !== null) {
-      window.clearTimeout(settingsSaveTimerRef.current)
-    }
-  }, [])
-
   const updateSettings = useCallback((patch: Partial<ChatSettings>) => {
-    setChatSettings((previous) => {
-      const next = { ...previous, ...patch }
-      if (activeId) {
-        if (settingsSaveTimerRef.current !== null) {
-          window.clearTimeout(settingsSaveTimerRef.current)
-        }
-        settingsSaveTimerRef.current = window.setTimeout(() => {
-          void updateChatSessionSettings(activeId, next, workspace)
-        }, 350)
-      }
-      return next
-    })
-  }, [activeId, workspace])
+    if (loadingSession || sending) return
+    const next = { ...chatSettings, ...patch }
+    setChatSettings(next)
+    scheduleSettingsSave(next)
+  }, [chatSettings, loadingSession, sending, scheduleSettingsSave])
 
   /**
    * Handle clicking a [数字] superscript in the answer body.
@@ -437,19 +440,25 @@ export default function QAChat({
   /**
    * Open the chunk-preview modal for a specific document + chunk.
    * Fetches the full chunk text via getDocumentChunks and locates the
-   * matching chunk_index.
+   * stable chunk ID (legacy citations require an unambiguous excerpt match).
    */
-  const handleDocNameClick = useCallback(async (docName: string, chunkIndex: number) => {
+  const handleDocNameClick = useCallback(async (docName: string, chunkIndex: number, chunkId?: string, excerpt?: string) => {
+    chunkRequestRef.current?.abort()
+    const controller = new AbortController()
+    chunkRequestRef.current = controller
+    chunkTriggerRef.current = document.activeElement as HTMLElement | null
     setChunkModal({ docName, chunkIndex, text: '', loading: true, error: null })
     try {
-      const data = await getDocumentChunks(docName, workspace)
-      const chunk = data.chunks.find((c) => c.chunk_index === chunkIndex)
+      const data = await getDocumentChunks(docName, workspace, controller.signal)
+      if (controller.signal.aborted || chunkRequestRef.current !== controller) return
+      const chunk = locateCitationChunk(data.chunks, chunkId, excerpt)
       if (chunk) {
-        setChunkModal({ docName, chunkIndex, text: chunk.text, loading: false, error: null })
+        setChunkModal({ docName, chunkIndex: chunk.chunk_index, text: chunk.text, loading: false, error: null, pages: chunk.source_location?.pages })
       } else {
-        setChunkModal({ docName, chunkIndex, text: '', loading: false, error: '未找到该文本块' })
+        setChunkModal({ docName, chunkIndex, text: '', loading: false, error: '引用对应的原文块已变更或无法唯一定位，请重新提问获取当前版本的引用。' })
       }
     } catch (e) {
+      if (controller.signal.aborted || chunkRequestRef.current !== controller) return
       const rawMessage = (e as Error).message
       const hint =
         rawMessage === 'Not Found'
@@ -467,7 +476,7 @@ export default function QAChat({
 
   const handleSend = async () => {
     const text = input.trim()
-    if (!text || sending) return
+    if (!text || sending || loadingSession) return
     setInput('')
     setSending(true)
     setGenerationStatus('')
@@ -487,6 +496,12 @@ export default function QAChat({
     let sessionIdFromStream: string | null = null
 
     try {
+      if (settingsSave.status === 'pending' || settingsSave.status === 'saving') {
+        setGenerationStatus('等待对话设置保存…')
+      }
+      await settingsSave.flushCurrent()
+      if (controller.signal.aborted) return
+      setGenerationStatus('')
       const response = await chatSendStream({
         session_id: activeId,
         workspace,
@@ -718,7 +733,7 @@ export default function QAChat({
                       {num}
                     </span>
                     <button
-                      onClick={() => handleDocNameClick(c.doc_name, c.chunk_index)}
+                      onClick={() => handleDocNameClick(c.doc_name, c.chunk_index, c.chunk_id, c.excerpt)}
                       className="text-gray-700 font-medium truncate hover:text-primary-600 hover:underline cursor-pointer text-left"
                       title={`点击查看 ${c.doc_name} #${c.chunk_index} 的完整文本`}
                     >
@@ -769,7 +784,7 @@ export default function QAChat({
                 nodes={evidence.nodes}
                 edges={evidence.edges}
                 hitNodes={hitNodes}
-                pathNodes={hitNodes}
+                pathEdges={evidence.edges}
               />
             </div>
             <div className="rounded-lg border border-gray-200 bg-white overflow-hidden">
@@ -880,7 +895,22 @@ export default function QAChat({
         </button>
       </div>
 
-      <div className="mt-5 grid gap-6 lg:grid-cols-2">
+      <div className="mt-3 text-xs" aria-live="polite">
+        {settingsSave.status === 'error' ? (
+          <div role="alert" className="flex items-center gap-2 text-red-700">
+            <span>设置保存失败，当前修改尚未保存：{settingsSave.error}</span>
+            <button type="button" className="ui-button shrink-0" onClick={settingsSave.retry}>重试保存</button>
+          </div>
+        ) : (
+          <span className="text-gray-600">
+            {loadingSession ? '正在加载对话设置…' : !activeId ? '将在创建对话时保存' :
+              settingsSave.status === 'pending' ? '等待保存…' :
+              settingsSave.status === 'saving' ? '正在保存…' :
+              settingsSave.status === 'saved' ? '设置已保存' : ''}
+          </span>
+        )}
+      </div>
+      <fieldset disabled={loadingSession || sending} className="mt-5 grid min-w-0 gap-6 disabled:opacity-60 lg:grid-cols-2">
         <section>
           <div className="mb-4 flex items-center gap-2 text-sm font-semibold text-gray-800">
             <Sparkles size={16} />
@@ -891,8 +921,18 @@ export default function QAChat({
               onChange={(value) => updateSettings({ temperature: value })} />
             <RangeField label="Top-P" value={chatSettings.top_p} min={0} max={1} step={0.05}
               onChange={(value) => updateSettings({ top_p: value })} />
-            <RangeField label="Max Tokens" value={chatSettings.max_tokens} min={256} max={8192} step={256}
+            <RangeField label="最大输出 Tokens" value={chatSettings.max_tokens} min={256} max={32768} step={256}
               onChange={(value) => updateSettings({ max_tokens: value })} />
+            <SelectField label="上下文总预算（输入＋输出）" value={String(chatSettings.context_window ?? 32768)}
+              onChange={(event) => updateSettings({ context_window: Number(event.target.value) })}>
+              {Array.from(new Set([8192, 16384, 32768, 65536, 131072, 262144, 1048576, 2000000,
+                chatSettings.context_window ?? 32768])).sort((a, b) => a - b).map((size) => (
+                <option key={size} value={size}>{size.toLocaleString()} Tokens</option>
+              ))}
+            </SelectField>
+            <p className="text-xs leading-5 text-gray-600">
+              包含系统提示、历史、原文、图谱和输出预留。使用通用分词估算，并非自动识别模型窗口；请按模型实际能力设置，超限将停止发送。
+            </p>
             <RangeField label="Frequency Penalty" value={chatSettings.frequency_penalty} min={-2} max={2} step={0.1}
               onChange={(value) => updateSettings({ frequency_penalty: value })} />
             <RangeField label="Presence Penalty" value={chatSettings.presence_penalty} min={-2} max={2} step={0.1}
@@ -930,7 +970,7 @@ export default function QAChat({
             </div>
           </div>
         </section>
-      </div>
+      </fieldset>
     </div>
   )
 
@@ -954,6 +994,7 @@ export default function QAChat({
           onChange={(event) => handleModelSelection(event.target.value)}
           className="min-w-0 max-w-64 flex-1 appearance-none truncate bg-transparent font-medium text-gray-800 outline-none"
           aria-label="选择回答模型"
+          disabled={loadingSession || sending}
         >
           {modelProfiles.map((profile) => {
             const models = (profile.models_cache || []).filter(isLikelyChatModel)
@@ -995,6 +1036,7 @@ export default function QAChat({
         <span className={chatSettings.enable_rerank ? 'text-emerald-600' : 'text-gray-400'}>
           Rerank {chatSettings.enable_rerank ? '开' : '关'}
         </span>
+        {!showSettings && settingsSave.status === 'error' && <span role="status" className="text-red-700">设置保存失败</span>}
       </button>
     </div>
   )
@@ -1162,19 +1204,33 @@ export default function QAChat({
       {chunkModal && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-          onClick={() => setChunkModal(null)}
+          onClick={closeChunkModal}
         >
           <div
             className="mx-4 flex max-h-[80vh] w-full max-w-2xl flex-col rounded-lg bg-white shadow-2xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="citation-dialog-title"
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') closeChunkModal()
+              if (event.key === 'Tab') {
+                event.preventDefault()
+                event.currentTarget.querySelector('button')?.focus()
+              }
+            }}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-5 py-3 border-b border-gray-200 flex items-center justify-between shrink-0">
-              <h3 className="text-sm font-semibold text-gray-800 truncate">
+              <h3 id="citation-dialog-title" className="text-sm font-semibold text-gray-800 truncate">
                 {chunkModal.docName}
-                <span className="text-gray-400 font-normal ml-1">#{chunkModal.chunkIndex}</span>
+                <span className="text-gray-500 font-normal ml-1">
+                  {chunkModal.chunkIndex >= 0 ? `文本块 #${chunkModal.chunkIndex}` : '文本块定位中'}
+                  {chunkModal.pages?.length ? ` · 原文第 ${chunkModal.pages.join('、')} 页` : ''}
+                </span>
               </h3>
               <button
-                onClick={() => setChunkModal(null)}
+                onClick={closeChunkModal}
+                autoFocus
                 className="ui-icon-button ml-3"
                 aria-label="关闭"
               >

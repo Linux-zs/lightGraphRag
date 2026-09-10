@@ -32,6 +32,9 @@ from src.doc_processor.parsers.base_parser import Document
 from src.exceptions import ManifestCorruptedError
 from src.index_versioning import allow_document_replacement
 from src.kg_request_policy import complete_kg
+from src.extraction_policy import enforce_entity_types, policy_fingerprint, validate_extraction_policy
+from src.source_location import locate_source_text
+from src.sdk_storage_scope import isolate_file_storage_runtime
 from src.kg_response_validation import ExtractionCacheView
 from src.lightrag_stage_timing import install_stage_timing, time_index_stage
 from src.model_profiles import get_runtime_model_config
@@ -296,6 +299,8 @@ class LightRAGService:
             "base_url": str(embedding.get("base_url") or "").rstrip("/"),
             "model": str(embedding.get("model") or ""),
             "embed_dim": int(embedding.get("embed_dim") or 0),
+            "embed_max_chars": int(embedding.get("embed_max_chars", 480)),
+            "embed_max_tokens": int(embedding.get("embed_max_tokens", 480)),
         }
 
     def record_embedding_signature(
@@ -330,6 +335,8 @@ class LightRAGService:
         if self.embedding_meta_path.exists():
             try:
                 stored = json.loads(self.embedding_meta_path.read_text(encoding="utf-8"))
+                if not isinstance(stored, dict):
+                    raise ValueError("Embedding metadata must be an object")
             except Exception as exc:
                 return {
                     "compatible": False,
@@ -337,16 +344,15 @@ class LightRAGService:
                     "current": current,
                     "stored": None,
                 }
-        elif indexed and initialize_legacy:
-            stored = self.record_embedding_signature(current)
-
-        compatible = not indexed or stored is None or all(
+        # Missing historical metadata is not evidence that today's settings
+        # produced the existing vectors. Never silently stamp a legacy index.
+        compatible = not indexed or stored is not None and all(
             stored.get(key) == current.get(key)
-            for key in ("base_url", "model", "embed_dim")
+            for key in ("base_url", "model", "embed_dim", "embed_max_chars", "embed_max_tokens")
         )
         return {
             "compatible": compatible,
-            "reason": "" if compatible else "Embedding model configuration differs from the existing index",
+            "reason": "" if compatible else "Embedding model/input limits differ from the index or historical metadata is incomplete",
             "current": current,
             "stored": stored,
             "indexed_documents": sum(
@@ -360,7 +366,7 @@ class LightRAGService:
             stored = compatibility.get("stored") or {}
             current = compatibility.get("current") or {}
             raise RuntimeError(
-                "当前嵌入模型与该知识库已有索引不兼容，请先重建索引。"
+                "当前嵌入模型或输入限制与已有索引不兼容，或历史签名不完整，请先重建索引。"
                 f" 已有: {stored.get('model')} / {stored.get('embed_dim')}，"
                 f"当前: {current.get('model')} / {current.get('embed_dim')}"
             )
@@ -508,7 +514,13 @@ class LightRAGService:
                         },
                     },
                 )
-                await self._rag.initialize_storages()
+                try:
+                    isolate_file_storage_runtime(self._rag)
+                    await self._rag.initialize_storages()
+                except BaseException:
+                    # Do not return a half-initialized handle on the next call.
+                    await self.finalize()
+                    raise
                 logger.info("LightRAG initialized at {}", self.working_dir)
         return self._rag
 
@@ -534,7 +546,7 @@ class LightRAGService:
 
         @wrap_embedding_func_with_attrs(
             embedding_dim=embed_dim,
-            max_token_size=480,
+            max_token_size=embed_max_tokens or None,
             model_name=embed_model,
         )
         async def siliconflow_embed(texts: list[str]):
@@ -556,23 +568,6 @@ class LightRAGService:
     def _is_invalid_embedding_payload_error(exc: Exception) -> bool:
         msg = str(exc).lower()
         return "20015" in msg or "parameter is invalid" in msg
-
-    def _embedding_retry_variants(self, text: str, max_tokens: int | None) -> list[str]:
-        strict = EMBEDDING_STRICT_SAFE_RE.sub(" ", text)
-        strict = EMBEDDING_WHITESPACE_RE.sub(" ", strict).strip()
-        variants = [
-            self._prepare_embedding_text(text[:360], 360, min(max_tokens or 360, 360)),
-            self._prepare_embedding_text(text[:240], 240, min(max_tokens or 240, 240)),
-            self._prepare_embedding_text(strict[:240], 240, min(max_tokens or 240, 240)),
-            self._prepare_embedding_text(strict[:120], 120, min(max_tokens or 120, 120)),
-            "empty document chunk",
-        ]
-        unique: list[str] = []
-        for item in variants:
-            cleaned = item.strip() or "empty document chunk"
-            if cleaned not in unique:
-                unique.append(cleaned)
-        return unique
 
     async def _embed_texts_with_fallback(
         self,
@@ -614,25 +609,10 @@ class LightRAGService:
                 )
                 return np.vstack([left, right])
 
-            original = texts[0] if texts else ""
-            last_exc: Exception = exc
-            for variant in self._embedding_retry_variants(original, max_tokens):
-                if variant == original:
-                    continue
-                try:
-                    result = await embed_batch([variant])
-                    if variant != original:
-                        logger.warning(
-                            "Embedding payload was rejected; indexed one chunk with a shortened fallback ({} -> {} chars)",
-                            len(original),
-                            len(variant),
-                        )
-                    return result
-                except Exception as variant_exc:
-                    last_exc = variant_exc
-                    if not self._is_invalid_embedding_payload_error(variant_exc):
-                        raise
-            raise last_exc
+            raise RuntimeError(
+                "Embedding provider rejected an individual text; no shortened or "
+                "placeholder vector was indexed. Check the model input limits."
+            ) from exc
 
     def _prepare_embedding_text(
         self,
@@ -652,25 +632,23 @@ class LightRAGService:
         tokenizer can be loaded.
         """
         safe = CONTROL_CHARS_RE.sub(" ", text or "")
-        safe = NON_BMP_CHARS_RE.sub("", safe)
-        # SiliconFlow embedding can reject long markdown/table/code fragments
-        # with emoji, dense separators, parentheses, or slash-heavy tokens.
-        # Normalize only the embedding input; stored source chunks stay intact.
-        safe = EMBEDDING_STRUCTURAL_CHARS_RE.sub(" ", safe)
+        # Preserve Unicode and command/config punctuation: these carry meaning.
         safe = EMBEDDING_WHITESPACE_RE.sub(" ", safe).strip()
         if not safe:
-            safe = "empty document chunk"
+            raise ValueError("Cannot embed empty text after control-character cleanup")
         if max_tokens and max_tokens > 0:
             try:
                 enc = _get_embed_tokenizer()
                 if enc is not None:
-                    ids = enc.encode(safe)
+                    ids = enc.encode(safe, disallowed_special=())
                     if len(ids) > max_tokens:
-                        safe = enc.decode(ids[:max_tokens]).strip()
+                        safe = enc.decode_bytes(ids[:max_tokens]).decode("utf-8", errors="ignore").strip()
             except Exception:
                 logger.debug("Token-based embedding truncation unavailable; using char cap")
         if len(safe) > max_chars:
             safe = safe[:max_chars]
+        if not safe:
+            raise ValueError("Embedding input limit leaves empty text; increase the input limit")
         return safe
 
     @staticmethod
@@ -861,15 +839,23 @@ class LightRAGService:
         if substantive_ratio < (1 - settings["symbol_ratio_threshold"]):
             return "symbol_noise"
 
-        lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+        raw_lines = [line for line in (text or "").splitlines() if line.strip()]
+        lines = [line.strip() for line in raw_lines]
         if len(lines) >= 4:
             table_lines = sum(1 for line in lines if line.count("|") >= 2 or re.fullmatch(r"[-:| ]+", line))
-            code_lines = sum(
-                1
-                for line in lines
-                if line.startswith(("```", "    ", "\t"))
-                or len(re.findall(r"[{}();=<>/\\]", line)) >= 6
-            )
+            code_lines = 0
+            fence = ""
+            for raw_line, line in zip(raw_lines, lines):
+                marker = re.match(r"^(`{3,}|~{3,})", line)
+                if marker:
+                    token = marker.group(1)
+                    if not fence:
+                        fence = token
+                    elif token[0] == fence[0] and len(token) >= len(fence):
+                        fence = ""
+                    code_lines += 1
+                elif fence or raw_line.startswith(("    ", "\t")) or len(re.findall(r"[{}();=<>/\\]", line)) >= 6:
+                    code_lines += 1
             toc_lines = sum(
                 1
                 for line in lines
@@ -1138,7 +1124,11 @@ class LightRAGService:
         skip_kg: bool,
         max_entities: int | None = None,
         max_records: int | None = None,
+        policy_config: dict[str, Any] | None = None,
     ):
+        policy_snapshot = deepcopy(policy_config if policy_config is not None else self.load_graph_governance())
+        if not skip_kg:
+            validate_extraction_policy(policy_snapshot)
         original_llm_func = getattr(rag, "llm_model_func", None)
         original_llm_name = getattr(rag, "llm_model_name", None)
         original_llm_kwargs = getattr(rag, "llm_model_kwargs", None)
@@ -1218,7 +1208,8 @@ class LightRAGService:
                         ))
                         try:
                             # SDK extraction spawns children that don't follow parent cancellation.
-                            return await asyncio.shield(extraction)
+                            result = await asyncio.shield(extraction)
+                            return enforce_entity_types(result, policy_snapshot, stats)
                         except asyncio.CancelledError:
                             cancellation.set()
                             state = getattr(rag, "_role_llm_states", {}).get("extract")
@@ -1234,7 +1225,8 @@ class LightRAGService:
                             extraction_format = None
                             if original_cache is not None:
                                 rag.llm_response_cache = original_cache
-                    return await original_extract(filtered_chunks, *args[1:], **kwargs)
+                    result = await original_extract(filtered_chunks, *args[1:], **kwargs)
+                    return enforce_entity_types(result, policy_snapshot, stats)
 
                 rag._process_extract_entities = filtered_extract
 
@@ -1277,15 +1269,28 @@ class LightRAGService:
             splitters.append("")
         return {"chunk_token_size": size, "recursive_character": {"chunk_overlap_token_size": overlap, "separators": splitters}}
 
+    def _embedding_aligned_chunks(self, tokenizer, content: str, options: dict) -> list[dict[str, Any]]:
+        from src.embedding_chunks import embedding_aligned_chunks
+
+        embed = self._runtime_models()['embedding']
+        encoding = _get_embed_tokenizer()
+
+        def embedding_length(text: str) -> int:
+            normalized = EMBEDDING_WHITESPACE_RE.sub(' ', CONTROL_CHARS_RE.sub(' ', text)).strip()
+            return (len(encoding.encode(normalized, disallowed_special=())) if encoding is not None
+                    else len(normalized.encode('utf-8')))
+
+        return embedding_aligned_chunks(
+            tokenizer, content, options, max_chars=int(embed.get('embed_max_chars', 480)),
+            max_tokens=int(embed.get('embed_max_tokens', 480)), embedding_length=embedding_length)
+
     async def preview_document_chunks(self, doc: Document, *, chunk_size=None, chunk_overlap=None, separators=None) -> list[dict[str, Any]]:
-        from lightrag.chunker import chunking_by_recursive_character
 
         options = self._document_chunk_options(chunk_size, chunk_overlap, separators)
         rag = await self.get_rag()
         return await asyncio.to_thread(
-            chunking_by_recursive_character, rag.tokenizer,
-            sanitize_text_for_encoding(doc.raw_text).strip(), options["chunk_token_size"],
-            **options["recursive_character"],
+            self._embedding_aligned_chunks, rag.tokenizer,
+            sanitize_text_for_encoding(doc.raw_text).strip(), options,
         )
 
     async def _insert_document_text(
@@ -1297,15 +1302,25 @@ class LightRAGService:
         skip_kg: bool,
         chunk_options: dict[str, Any] | None = None,
     ) -> str:
-        track_id = await rag.apipeline_enqueue_documents(
-            doc.raw_text,
-            ids=[doc_id],
-            file_paths=[doc.file_path],
-            process_options="R!" if skip_kg else "R",
-            chunk_options=chunk_options or self._document_chunk_options(),
-        )
-        await rag.apipeline_process_enqueue_documents()
-        return track_id
+        options = deepcopy(chunk_options or self._document_chunk_options())
+        original_chunker = rag.chunking_func
+
+        def chunker(tokenizer, content, *_args, **_kwargs):
+            return self._embedding_aligned_chunks(tokenizer, content, options)
+
+        rag.chunking_func = chunker
+        try:
+            track_id = await rag.apipeline_enqueue_documents(
+                doc.raw_text, ids=[doc_id], file_paths=[doc.file_path],
+                # An explicit R selector bypasses the SDK's public custom
+                # chunker hook. Retain only the KG-skip flag on this path.
+                process_options="!" if skip_kg else "",
+                chunk_options=options,
+            )
+            await rag.apipeline_process_enqueue_documents()
+            return track_id
+        finally:
+            rag.chunking_func = original_chunker
 
     def _kg_status_for_success(self, *, skip_kg: bool) -> str:
         if skip_kg:
@@ -1486,6 +1501,7 @@ class LightRAGService:
             if key in config:
                 current[key] = config[key]
         current["workspace"] = self.workspace
+        validate_extraction_policy(current)
         current["updated_at"] = _now_iso()
         to_save = {k: v for k, v in current.items() if k != "effective_extraction_prompt"}
         _atomic_write_json(self.graph_governance_path, to_save)
@@ -1592,8 +1608,8 @@ class LightRAGService:
         )
         return self.load_graph_governance()
 
-    def graph_governance_summary(self) -> dict[str, Any]:
-        cfg = self.load_graph_governance()
+    def graph_governance_summary(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        cfg = config if config is not None else self.load_graph_governance()
         prompt = str(cfg.get("extraction_prompt") or "")
         return {
             "rule_template_id": cfg.get("rule_template_id", ""),
@@ -1687,7 +1703,7 @@ class LightRAGService:
         if mode == "strict":
             blocks.append(
                 "Extraction mode: strict whitelist. Use configured entity and relation types as hard constraints. "
-                "If an entity cannot be classified into the configured entity types, skip it unless it is essential to connect two valid entities."
+                "If an entity cannot be classified into the configured entity types, skip it. Do not invent bridge entities outside the whitelist."
             )
         elif mode == "enhanced":
             blocks.append(
@@ -1699,13 +1715,21 @@ class LightRAGService:
                 "Extraction mode: assist. Treat configured entity and relation types only as hints. "
                 "General LightRAG extraction should remain active for any document domain."
             )
-        if allow_other:
+        if mode == "strict":
+            blocks.append("Do not force unrelated entities into the nearest type. Skip entities outside the configured whitelist, including Other unless explicitly listed.")
+        elif allow_other:
             blocks.append("Entity type fallback: if no configured entity type fits, classify the entity as `Other` instead of dropping it.")
         else:
             blocks.append("Entity type fallback: do not use `Other`; choose the closest configured type, or skip only genuinely low-value entities.")
         if entity_types:
             blocks.append("Preferred entity types:\n" + "\n".join(f"- {item}" for item in entity_types))
         if relation_types:
+            if mode == "strict":
+                blocks.append(
+                    "Strict relationship contract: the relationship keywords field must contain exactly one "
+                    "configured relationship category, copied verbatim. Do not add extra keywords, combine "
+                    "categories, or invent categories. Skip relationships that do not fit a configured category."
+                )
             blocks.append(
                 "Preferred relationship categories:\n"
                 + "\n".join(f"- {item}" for item in relation_types)
@@ -1729,15 +1753,41 @@ class LightRAGService:
     def append_graph_audit(self, action: str, payload: dict[str, Any], result: Any = None) -> dict[str, Any]:
         cfg = self.load_graph_governance()
         entry = {
-            "id": hashlib.md5(f"{action}|{_now_iso()}".encode("utf-8")).hexdigest()[:12],
+            "id": uuid.uuid4().hex,
             "action": action,
             "payload": self._jsonable(payload),
             "result": self._jsonable(result),
             "created_at": _now_iso(),
         }
+        entries = self._load_graph_mutations()
+        entries.append(entry)
+        _atomic_write_json(self.graph_mutations_path, {"schema_version": 1, "entries": entries})
         cfg["audit_log"] = [entry, *list(cfg.get("audit_log") or [])][:200]
         self.save_graph_governance(cfg)
         return entry
+
+    @property
+    def graph_mutations_path(self) -> Path:
+        return self.data_dir / "graph_mutations" / f"{self.workspace}.json"
+
+    def _load_graph_mutations(self) -> list[dict[str, Any]]:
+        """Chronological, durable history; display-log retention never truncates it.
+
+        Older installations are seeded from the retained legacy history. Events
+        already discarded by older versions cannot be reconstructed here.
+        """
+        if not self.graph_mutations_path.exists():
+            return list(reversed(self.load_graph_governance().get("audit_log") or []))
+        try:
+            document = json.loads(self.graph_mutations_path.read_text(encoding="utf-8"))
+            entries = document["entries"]
+            if document.get("schema_version") != 1 or not isinstance(entries, list):
+                raise ValueError("unsupported mutation journal format")
+            if any(not isinstance(entry, dict) or not entry.get("action") for entry in entries):
+                raise ValueError("invalid mutation entry")
+            return entries
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(f"Cannot read graph mutation journal: {self.graph_mutations_path}") from exc
 
     async def create_graph_entity(self, entity_name: str, entity_data: dict[str, Any]) -> dict[str, Any]:
         rag = await self.get_rag()
@@ -2025,6 +2075,14 @@ class LightRAGService:
             "status": existing.get("status", "uploaded"),
             "chunk_count": existing.get("chunk_count", 0),
             "content_sha256": content_sha256,
+            "source_metadata": {
+                "text_sha256": content_sha256,
+                **{
+                    key: deepcopy(doc.metadata[key])
+                    for key in ("page_count", "page_spans", "pages_without_text", "ocr_performed", "title", "author")
+                    if key in doc.metadata
+                },
+            },
             "active_index_doc_id": existing.get("active_index_doc_id")
             or (doc_id if existing.get("indexed") else ""),
             "active_index_status": existing.get("active_index_status")
@@ -2096,6 +2154,7 @@ class LightRAGService:
         self,
         doc: Document,
         *,
+        graph_policy_snapshot: dict[str, Any] | None = None,
         chunk_size: int | None = None,
         chunk_overlap: int | None = None,
         separators: list[str] | None = None,
@@ -2110,7 +2169,8 @@ class LightRAGService:
         index_mode = "fast" if str(index_mode).lower() == "fast" else "complete"
         skip_kg = index_mode == "fast"
         chunk_options = self._document_chunk_options(chunk_size, chunk_overlap, separators)
-        guidance = self.graph_extraction_guidance()
+        policy_config = deepcopy(graph_policy_snapshot["config"] if graph_policy_snapshot is not None else self.load_graph_governance())
+        guidance = graph_policy_snapshot["guidance"] if graph_policy_snapshot is not None else self.graph_extraction_guidance(config=policy_config)
         if guidance:
             rag.addon_params["entity_types_guidance"] = guidance
 
@@ -2155,6 +2215,7 @@ class LightRAGService:
             try:
                 with self._temporary_index_llm_and_kg_filter(
                     rag,
+                    policy_config=policy_config,
                     skip_kg=skip_kg,
                     max_entities=kg_max_entities,
                     max_records=kg_max_records,
@@ -2191,6 +2252,10 @@ class LightRAGService:
                     "raw_text_path": doc.metadata.get("raw_text_path", item.get("raw_text_path", "")),
                     "char_count": len(doc.raw_text),
                     "indexed": True,
+                    "active_source_metadata": {
+                        "text_sha256": hashlib.sha256(doc.raw_text.encode("utf-8")).hexdigest(),
+                        "page_spans": deepcopy(doc.metadata.get("page_spans") or []),
+                    },
                     "status": status.status if status else "indexed",
                     "active_index_doc_id": index_doc_id,
                     "active_index_status": status.status if status else "processed",
@@ -2223,7 +2288,8 @@ class LightRAGService:
                         "max_entities_per_chunk": kg_max_entities,
                         "max_records_per_chunk": kg_max_records,
                     },
-                    "graph_rule": self.graph_governance_summary(),
+                    "graph_rule": self.graph_governance_summary(policy_config),
+                    "kg_policy_fingerprint": policy_fingerprint(policy_config, guidance),
                     "last_insert_result": result,
                     "updated_at": _now_iso(),
                 }
@@ -2336,6 +2402,13 @@ class LightRAGService:
         rag = await self.get_rag()
         records = await rag.text_chunks.get_by_ids(chunk_ids)
         chunks = []
+        raw_text = ""
+        raw_path = item.get("raw_text_path")
+        if raw_path:
+            try:
+                raw_text = Path(raw_path).read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                pass  # Missing source must not prevent viewing indexed evidence.
         for i, record in enumerate(records or []):
             if not record:
                 continue
@@ -2346,6 +2419,7 @@ class LightRAGService:
                     "chunk_index": record.get("chunk_order_index", i),
                     "text": text,
                     "char_count": len(text),
+                    "source_location": locate_source_text(raw_text, text, item.get("active_source_metadata") or {}),
                 }
             )
         chunks.sort(key=lambda c: c["chunk_index"])
@@ -2355,6 +2429,7 @@ class LightRAGService:
         self,
         doc_name_or_id: str,
         *,
+        graph_policy_snapshot: dict[str, Any] | None = None,
         kg_max_entities: int | None = None,
         kg_max_records: int | None = None,
         stage_update_callback: Callable[
@@ -2384,6 +2459,12 @@ class LightRAGService:
         index_doc_id = str(item.get("active_index_doc_id") or doc_id)
         if not item.get("indexed"):
             raise ValueError("Document must be indexed before graph backfill")
+        policy_config = deepcopy(graph_policy_snapshot["config"] if graph_policy_snapshot is not None else self.load_graph_governance())
+        guidance = graph_policy_snapshot["guidance"] if graph_policy_snapshot is not None else self.graph_extraction_guidance(config=policy_config)
+        previous_policy = item.get("kg_policy_fingerprint")
+        if (previous_policy and item.get("kg_status") != "skipped"
+                and previous_policy != policy_fingerprint(policy_config, guidance)):
+            raise ValueError("抽取规则已变更，不能将新规则追加到旧图谱。请重新索引该文档或重建知识库。")
         chunk_ids = list(item.get("chunks_list") or [])
         if not chunk_ids:
             raise ValueError("Document has no indexed chunks to extract")
@@ -2403,7 +2484,6 @@ class LightRAGService:
         if not chunks:
             raise ValueError("Indexed chunk records are missing from LightRAG storage")
 
-        guidance = self.graph_extraction_guidance()
         rag.addon_params = rag.addon_params or {}
         if guidance:
             rag.addon_params["entity_types_guidance"] = guidance
@@ -2427,6 +2507,7 @@ class LightRAGService:
         try:
             with self._temporary_index_llm_and_kg_filter(
                 rag,
+                policy_config=policy_config,
                 skip_kg=False,
                 max_entities=kg_max_entities,
                 max_records=kg_max_records,
@@ -2486,7 +2567,8 @@ class LightRAGService:
                         "max_entities_per_chunk": kg_max_entities,
                         "max_records_per_chunk": kg_max_records,
                     },
-                    "graph_rule": self.graph_governance_summary(),
+                    "graph_rule": self.graph_governance_summary(policy_config),
+                    "kg_policy_fingerprint": policy_fingerprint(policy_config, guidance),
                     "kg_backfilled_at": _now_iso(),
                     "updated_at": _now_iso(),
                 }
@@ -2953,10 +3035,10 @@ class LightRAGService:
         chunks = data.get("chunks") or []
         citations = []
         seen: set[tuple[str, str]] = set()
-        for chunk in chunks[:10]:
+        for chunk in chunks:
             file_path = chunk.get("file_path") or ""
-            chunk_id = chunk.get("chunk_id") or chunk.get("reference_id") or ""
-            key = (file_path, chunk_id)
+            chunk_id = chunk.get("chunk_id") or ""
+            key = (file_path, chunk_id or str(chunk.get("content") or ""))
             if key in seen:
                 continue
             seen.add(key)
@@ -2965,8 +3047,9 @@ class LightRAGService:
                 {
                     "index": len(citations) + 1,
                     "doc_name": _basename(file_path) or "LightRAG",
-                    "chunk_index": len(citations),
+                    "chunk_index": chunk.get("chunk_order_index", -1),
                     "excerpt": content[:240],
+                    "answer_content": content,
                     "chunk_id": chunk_id,
                     "file_path": file_path,
                 }
@@ -3050,6 +3133,7 @@ class LightRAGService:
         top_k: int = 40,
         chunk_top_k: int = 20,
         enable_rerank: bool = True,
+        history: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         self.assert_embedding_compatible()
         await self._ensure_current_index_versions()
@@ -3062,6 +3146,7 @@ class LightRAGService:
                 chunk_top_k=chunk_top_k,
                 enable_rerank=enable_rerank,
                 only_need_context=True,
+                history=history,
             ),
         )
         raw = self._extract_raw(result)
@@ -3154,8 +3239,7 @@ class LightRAGService:
     async def replay_graph_audit(self) -> dict[str, Any]:
         """Replay manual graph governance operations after a full rebuild."""
         rag = await self.get_rag()
-        config = self.load_graph_governance()
-        entries = list(reversed(config.get("audit_log") or []))
+        entries = self._load_graph_mutations()
         applied = 0
         skipped = 0
         errors: list[dict[str, str]] = []
@@ -3305,6 +3389,10 @@ class LightRAGService:
 
     async def list_documents(self) -> list[dict[str, Any]]:
         manifest = self._load_manifest()
+        current_policy = self.load_graph_governance()
+        current_policy_fingerprint = policy_fingerprint(
+            current_policy, self.graph_extraction_guidance(config=current_policy)
+        )
         doc_status: dict[str, Any] = {}
         try:
             rag = await self.get_rag()
@@ -3348,6 +3436,11 @@ class LightRAGService:
                     "indexed": indexed,
                     "error_msg": error_msg,
                     "index_stale": bool(item.get("index_stale", False)),
+                    "kg_policy_stale": (
+                        item["kg_policy_fingerprint"] != current_policy_fingerprint
+                        if indexed and item.get("kg_policy_fingerprint") and item.get("kg_status") != "skipped"
+                        else None
+                    ),
                     "last_index_attempt_status": item.get(
                         "last_index_attempt_status",
                         item.get("status", "uploaded"),

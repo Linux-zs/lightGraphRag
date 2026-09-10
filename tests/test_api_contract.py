@@ -19,7 +19,7 @@ def test_health_contract(monkeypatch):
     response = asyncio.run(_request("GET", "/api/health"))
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json() == {"status": "ok", "service": "lightgraphrag-workbench"}
 
 
 def test_chat_sessions_are_scoped_by_workspace_over_http(tmp_path, monkeypatch):

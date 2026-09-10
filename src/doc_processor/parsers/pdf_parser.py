@@ -24,13 +24,22 @@ class PdfParser(BaseParser):
         Returns:
             Document with extracted text and metadata.
         """
+        doc = None
         try:
             doc = fitz.open(str(file_path))
             pages_text = []
+            page_spans = []
+            offset = 0
             for page_num, page in enumerate(doc):
                 text = page.get_text("text")
                 if text.strip():
+                    if pages_text:
+                        offset += 2  # The separator used by raw_text.join below.
+                    page_spans.append({"page": page_num + 1, "start": offset, "end": offset + len(text)})
                     pages_text.append(text)
+                    offset += len(text)
+                else:
+                    page_spans.append({"page": page_num + 1, "start": offset, "end": offset, "text_missing": True})
 
             raw_text = "\n\n".join(pages_text)
 
@@ -42,10 +51,12 @@ class PdfParser(BaseParser):
                 "subject": meta.get("subject", ""),
                 "creator": meta.get("creator", ""),
                 "page_count": len(doc),
+                "page_spans": page_spans,
+                "pages_without_text": [span["page"] for span in page_spans if span.get("text_missing")],
+                "ocr_performed": False,
             }
 
             doc_id = f"pdf_{file_path.parent.name}_{file_path.stem}"
-            doc.close()
             logger.info(f"Parsed PDF: {file_path.name}, {len(pages_text)} pages with text")
             return Document(
                 doc_id=doc_id,
@@ -58,3 +69,6 @@ class PdfParser(BaseParser):
         except Exception as e:
             logger.error(f"Failed to parse PDF {file_path}: {e}")
             raise
+        finally:
+            if doc is not None:
+                doc.close()
