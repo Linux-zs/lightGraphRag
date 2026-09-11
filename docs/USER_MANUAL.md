@@ -57,7 +57,25 @@ separators: \n\n, \n, 。, ！, ？, ；, 空格
 
 ## 二、启动系统
 
-### 1. 后端
+### 1. Windows 一键启动（推荐）
+
+在项目根目录双击：
+
+```text
+start-dev.cmd
+```
+
+也可以在 PowerShell 中启动但不自动打开浏览器：
+
+```powershell
+.\scripts\start-dev.ps1 -NoBrowser
+```
+
+脚本会分别启动后端和前端并等待健康检查通过。Python 由 `uv run` 自动使用
+项目虚拟环境，无需先执行“激活环境”；前端缺少 `node_modules` 时会自动执行
+`npm ci`。运行日志位于 `.workbuddy/dev-logs/`。
+
+### 2. 单独启动后端
 
 ```powershell
 uv sync --locked --all-groups
@@ -76,7 +94,7 @@ OpenAPI：
 http://127.0.0.1:8101/docs
 ```
 
-### 2. 前端
+### 3. 单独启动前端
 
 ```powershell
 cd frontend
@@ -90,7 +108,7 @@ npm run dev
 http://127.0.0.1:5173
 ```
 
-### 3. 远程访问
+### 4. 远程访问
 
 部署或通过反向代理访问时必须设置：
 

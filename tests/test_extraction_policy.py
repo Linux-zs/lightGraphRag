@@ -10,6 +10,10 @@ def test_policy_fingerprint_ignores_metadata_but_tracks_effective_guidance():
     assert original == policy_fingerprint({**policy, 'updated_at': 'later'}, 'reference content')
     assert original != policy_fingerprint(policy, 'changed reference content')
     assert original != policy_fingerprint({**policy, 'entity_types': ['Location']}, 'reference content')
+    assert original != policy_fingerprint(
+        {**policy, 'entity_exclusion_rules': ['contains:/tmp/']},
+        'reference content',
+    )
 
 
 def test_rule_summary_uses_supplied_snapshot_instead_of_current_settings():
@@ -60,6 +64,70 @@ def test_strict_policy_removes_disallowed_entities_and_their_edges():
 def test_enhanced_mode_does_not_apply_strict_whitelist():
     results = [({"city": [{"entity_type": "Location"}]}, {})]
     assert enforce_entity_types(results, {"extraction_mode": "enhanced"}, {}) is results
+
+
+def test_entity_exclusions_apply_in_enhanced_mode_and_remove_connected_edges():
+    results = [(
+        {
+            "Unknown": [{"entity_type": "Other"}],
+            "/usr/local/app": [{"entity_type": "File"}],
+            "第12页": [{"entity_type": "Other"}],
+            "server.log": [{"entity_type": "File"}],
+            "Server": [{"entity_type": "Service"}],
+            "Database": [{"entity_type": "Database"}],
+        },
+        {
+            ("Unknown", "Server"): [{"keywords": "mentions"}],
+            ("/usr/local/app", "Server"): [{"keywords": "mentions"}],
+            ("第12页", "Server"): [{"keywords": "mentions"}],
+            ("server.log", "Server"): [{"keywords": "mentions"}],
+            ("Server", "Database"): [{"keywords": "depends on"}],
+        },
+    )]
+    stats = {}
+    filtered = enforce_entity_types(results, {
+        "extraction_mode": "enhanced",
+        "entity_exclusion_rules": [
+            "unknown", "contains:/usr/", "prefix:第", "suffix:.log",
+        ],
+    }, stats)
+
+    assert set(filtered[0][0]) == {"Server", "Database"}
+    assert set(filtered[0][1]) == {("Server", "Database")}
+    assert stats["policy_rejections"] == {
+        "relation_endpoint_not_allowed": 4,
+        "entity_name_excluded": 4,
+    }
+    assert "Unknown" in results[0][0]
+
+
+def test_relation_exclusions_match_keywords_without_filtering_descriptions():
+    records = [
+        {"keywords": "Unknown", "description": "real relationship"},
+        {"keywords": "temporary link", "description": "real relationship"},
+        {"keywords": "depends on", "description": "contains temporary link"},
+    ]
+    stats = {}
+    filtered = enforce_entity_types(
+        [({"A": [{}], "B": [{}]}, {("A", "B"): records})],
+        {
+            "extraction_mode": "assist",
+            "relation_exclusion_rules": ["unknown", "contains:temporary"],
+        },
+        stats,
+    )
+
+    assert filtered[0][1][("A", "B")] == [records[2]]
+    assert stats["policy_rejections"] == {"relation_type_excluded": 2}
+
+
+@pytest.mark.parametrize("rules", [["contains:"], ["x" * 201]])
+def test_invalid_exclusion_rules_are_configuration_errors(rules):
+    with pytest.raises(ValueError, match="entity_exclusion_rules"):
+        enforce_entity_types([], {
+            "extraction_mode": "assist",
+            "entity_exclusion_rules": rules,
+        }, {})
 
 
 def test_empty_strict_whitelist_is_configuration_error():

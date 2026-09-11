@@ -1,3 +1,5 @@
+import pytest
+
 from src.lightrag_service import LightRAGService
 
 
@@ -11,6 +13,8 @@ def test_graph_guidance_assist_mode_treats_rules_as_hints(tmp_path):
         config={
             "entity_types": ["产品"],
             "relation_types": ["供应"],
+            "entity_exclusion_rules": ["contains:/tmp/"],
+            "relation_exclusion_rules": ["unknown"],
             "aliases_text": "",
             "extraction_prompt": "优先抽取供应链实体。",
             "reference_files": [],
@@ -23,6 +27,9 @@ def test_graph_guidance_assist_mode_treats_rules_as_hints(tmp_path):
     assert "not the source of truth" in guidance
     assert "Treat configured entity and relation types only as hints" in guidance
     assert "classify the entity as `Other` instead of dropping it" in guidance
+    assert "contains:/tmp/" in guidance
+    assert "unknown" in guidance
+    assert "enforced again before graph storage" in guidance
 
 
 def test_graph_guidance_strict_mode_is_explicit(tmp_path):
@@ -66,3 +73,38 @@ def test_apply_graph_rule_template_supports_noise_reducing_profile(tmp_path):
     assert config["allow_other_entity_type"] is False
     assert "domain enhanced" in config["effective_extraction_prompt"]
     assert "do not use `Other`" in config["effective_extraction_prompt"]
+
+
+def test_custom_rule_template_round_trips_exclusion_rules(tmp_path):
+    service = LightRAGService(
+        config={"paths": {"data_dir": str(tmp_path), "lightrag_dir": str(tmp_path / "lightrag")}},
+        workspace="template_exclusions",
+    )
+    saved = service.save_graph_rule_template({
+        "name": "低噪声模板",
+        "entity_types": ["服务"],
+        "relation_types": ["依赖"],
+        "entity_exclusion_rules": ["contains:/tmp/"],
+        "relation_exclusion_rules": ["unknown"],
+    })
+
+    config = service.apply_graph_rule_template(saved["id"], extraction_mode="enhanced")
+
+    assert config["entity_exclusion_rules"] == ["contains:/tmp/"]
+    assert config["relation_exclusion_rules"] == ["unknown"]
+    assert service.load_graph_governance()["entity_exclusion_rules"] == ["contains:/tmp/"]
+
+
+def test_invalid_exclusion_rule_is_not_saved_as_template(tmp_path):
+    service = LightRAGService(
+        config={"paths": {"data_dir": str(tmp_path), "lightrag_dir": str(tmp_path / "lightrag")}},
+        workspace="invalid_template",
+    )
+
+    with pytest.raises(ValueError, match="entity_exclusion_rules"):
+        service.save_graph_rule_template({
+            "name": "无效模板",
+            "entity_exclusion_rules": ["contains:"],
+        })
+
+    assert service._load_custom_graph_rule_templates() == []

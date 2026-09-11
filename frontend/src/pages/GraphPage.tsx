@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CheckCircle2, FileUp, Loader2 } from 'lucide-react'
 import { useConfirm } from '../components/ConfirmDialog'
 import EntityPicker from '../components/EntityPicker'
@@ -14,6 +14,7 @@ import {
   deleteGraphRuleTemplate,
   deleteGraphRelation,
   getGraph,
+  getGraphNeighborhood,
   getGraphGovernanceConfig,
   GraphChange,
   GraphData,
@@ -28,6 +29,7 @@ import {
   mergeGraphEntities,
   previewGraphImport,
   saveGraphRuleTemplate,
+  searchGraphNodes,
   suggestGraphChanges,
   updateGraphEntity,
   updateGraphGovernanceConfig,
@@ -35,6 +37,7 @@ import {
   uploadGraphReference,
   EvidenceChain,
 } from '../api'
+import { appendUniqueRuleText, resolveGraphRuleIdentity } from '../utils/graphRuleIdentity'
 
 interface Props {
   workspace: string
@@ -59,6 +62,8 @@ const emptyConfig: GraphGovernanceConfig = {
   allow_other_entity_type: true,
   entity_types: [],
   relation_types: [],
+  entity_exclusion_rules: [],
+  relation_exclusion_rules: [],
   aliases_text: '',
   extraction_prompt: '',
   effective_extraction_prompt: '',
@@ -119,6 +124,7 @@ function GraphWorkspace({ workspace }: Props) {
   const confirm = useConfirm()
   const [tab, setTab] = useState<Tab>('overview')
   const [data, setData] = useState<GraphData | null>(null)
+  const [focusedGraphNodeId, setFocusedGraphNodeId] = useState<string | null>(null)
   const [config, setConfig] = useState<GraphGovernanceConfig>(emptyConfig)
   const [limit, setLimit] = useState(200)
   const [loading, setLoading] = useState(true)
@@ -140,6 +146,8 @@ function GraphWorkspace({ workspace }: Props) {
 
   const [entityTypesText, setEntityTypesText] = useState('')
   const [relationTypesText, setRelationTypesText] = useState('')
+  const [entityExclusionRulesText, setEntityExclusionRulesText] = useState('')
+  const [relationExclusionRulesText, setRelationExclusionRulesText] = useState('')
   const [aliasesText, setAliasesText] = useState('')
   const [extractionPrompt, setExtractionPrompt] = useState('')
   const [extractionMode, setExtractionMode] = useState<GraphGovernanceConfig['extraction_mode']>('assist')
@@ -182,6 +190,7 @@ function GraphWorkspace({ workspace }: Props) {
       const graph = await getGraph(nextLimit, workspace, signal)
       if (requestId !== loadRequestRef.current || signal?.aborted) return
       setData(graph)
+      setFocusedGraphNodeId(null)
       setGraphLoadError('')
     } catch (error) {
       if (requestId === loadRequestRef.current && !signal?.aborted)
@@ -197,6 +206,8 @@ function GraphWorkspace({ workspace }: Props) {
     setSelectedTemplateId(cfg.rule_template_id || '')
     setEntityTypesText(joinLines(cfg.entity_types || []))
     setRelationTypesText(joinLines(cfg.relation_types || []))
+    setEntityExclusionRulesText(joinLines(cfg.entity_exclusion_rules || []))
+    setRelationExclusionRulesText(joinLines(cfg.relation_exclusion_rules || []))
     setAliasesText(cfg.aliases_text || '')
     setExtractionPrompt(cfg.extraction_prompt || '')
     setExtractionMode(cfg.extraction_mode || 'assist')
@@ -244,6 +255,7 @@ function GraphWorkspace({ workspace }: Props) {
   useEffect(() => {
     loadRequestRef.current += 1
     setData(null)
+    setFocusedGraphNodeId(null)
     setGraphLoadError('')
     setSelectedNode(null)
     setSelectedEdge(null)
@@ -275,6 +287,24 @@ function GraphWorkspace({ workspace }: Props) {
     () => new Set((latestEvidence?.nodes || []).map((node) => node.id)),
     [latestEvidence],
   )
+  const searchAllGraphNodes = useCallback(async (query: string, signal: AbortSignal) => {
+    const result = await searchGraphNodes(query, workspace, signal)
+    return result.nodes
+  }, [workspace])
+  const openGraphSearchResult = useCallback(async (node: GraphNode) => {
+    setGraphLoadError('')
+    try {
+      const graph = await getGraphNeighborhood(node.id, limit, workspace)
+      if (!mounted.current) return
+      setData(graph)
+      setFocusedGraphNodeId(node.id)
+    } catch (error) {
+      if (mounted.current) {
+        setGraphLoadError((error as Error).message || '实体邻域加载失败')
+      }
+      throw error
+    }
+  }, [limit, workspace])
 
   const filteredNodes = useMemo(() => {
     const keyword = entityQuery.trim().toLowerCase()
@@ -336,18 +366,29 @@ function GraphWorkspace({ workspace }: Props) {
   }
 
   const saveRules = () => runAction(async () => {
+    const identity = resolveGraphRuleIdentity({
+      entityTypes: splitLines(entityTypesText),
+      relationTypes: splitLines(relationTypesText),
+      entityExclusionRules: splitLines(entityExclusionRulesText),
+      relationExclusionRules: splitLines(relationExclusionRulesText),
+      aliasesText,
+      extractionPrompt,
+    }, ruleTemplates.find((template) => template.id === config.rule_template_id))
     const cfg = await updateGraphGovernanceConfig({
       workspace,
-      rule_template_id: config.rule_template_id || selectedTemplateId,
-      rule_template_name: config.rule_template_name || '当前知识库自定义规则',
+      rule_template_id: identity.id,
+      rule_template_name: identity.name,
       extraction_mode: extractionMode,
       allow_other_entity_type: allowOtherEntityType,
       entity_types: splitLines(entityTypesText),
       relation_types: splitLines(relationTypesText),
+      entity_exclusion_rules: splitLines(entityExclusionRulesText),
+      relation_exclusion_rules: splitLines(relationExclusionRulesText),
       aliases_text: aliasesText,
       extraction_prompt: extractionPrompt,
     })
     setConfig(cfg)
+    setSelectedTemplateId(cfg.rule_template_id || '')
   }, '抽取规则已保存')
 
   const applySelectedTemplate = async () => {
@@ -365,6 +406,8 @@ function GraphWorkspace({ workspace }: Props) {
       setSelectedTemplateId(cfg.rule_template_id || '')
       setEntityTypesText(joinLines(cfg.entity_types || []))
       setRelationTypesText(joinLines(cfg.relation_types || []))
+      setEntityExclusionRulesText(joinLines(cfg.entity_exclusion_rules || []))
+      setRelationExclusionRulesText(joinLines(cfg.relation_exclusion_rules || []))
       setAliasesText(cfg.aliases_text || '')
       setExtractionPrompt(cfg.extraction_prompt || '')
       setExtractionMode(cfg.extraction_mode || 'assist')
@@ -381,6 +424,8 @@ function GraphWorkspace({ workspace }: Props) {
         description: `从知识库 ${workspace} 的当前抽取规则另存`,
         entity_types: splitLines(entityTypesText),
         relation_types: splitLines(relationTypesText),
+        entity_exclusion_rules: splitLines(entityExclusionRulesText),
+        relation_exclusion_rules: splitLines(relationExclusionRulesText),
         aliases_text: aliasesText,
         extraction_prompt: extractionPrompt,
         built_in: false,
@@ -457,6 +502,13 @@ function GraphWorkspace({ workspace }: Props) {
     }, '实体已删除')
   }
 
+  const excludeSelectedEntity = () => {
+    if (!selectedNode?.id.trim()) return
+    setEntityExclusionRulesText((current) => appendUniqueRuleText(current, selectedNode.id))
+    setTab('rules')
+    setNotice(`已将“${selectedNode.id}”加入实体排除规则草稿；保存规则并重新索引后生效。`)
+  }
+
   const addRelation = () => runAction(async () => {
     await createGraphRelation({
       workspace,
@@ -503,6 +555,14 @@ function GraphWorkspace({ workspace }: Props) {
       })
       setSelectedEdge(null)
     }, '关系已删除')
+  }
+
+  const excludeSelectedRelationType = () => {
+    const relationType = relationEdit.keywords.trim()
+    if (!relationType) return
+    setRelationExclusionRulesText((current) => appendUniqueRuleText(current, relationType))
+    setTab('rules')
+    setNotice(`已将“${relationType}”加入关系类别排除规则草稿；保存规则并重新索引后生效。`)
   }
 
   const mergeEntities = () => runAction(async () => {
@@ -652,6 +712,20 @@ function GraphWorkspace({ workspace }: Props) {
       </div>
 
       {!loading && data && graphLoadError && <p role="alert" className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">图谱刷新失败，以下为上次成功加载的数据，可能已过期。请点击刷新重试。</p>}
+      {data && meta.view === 'neighborhood' && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-teal-200 bg-teal-50 px-4 py-3 text-sm text-teal-900">
+          <span>
+            正在查看“{data.nodes.find(node => node.id === meta.focus_node_id)?.label || meta.focus_node_id}”的一跳邻域，
+            已按需载入 {meta.returned_nodes ?? data.nodes.length} 个实体。
+          </span>
+          <button
+            className="rounded-lg border border-teal-300 bg-white px-3 py-1.5 text-xs font-medium text-teal-800 hover:bg-teal-100"
+            onClick={() => void loadGraph(limit)}
+          >
+            返回图谱概览
+          </button>
+        </div>
+      )}
       {loading ? (
         <div className="h-[560px] border border-gray-200 rounded-lg bg-white flex items-center justify-center text-sm text-gray-400">
           加载图谱...
@@ -674,6 +748,9 @@ function GraphWorkspace({ workspace }: Props) {
               directed={data.metadata?.directed === true}
               hitNodes={evidenceNodeIds}
               pathEdges={latestEvidence?.edges}
+              searchAllNodes={searchAllGraphNodes}
+              onOpenSearchResult={openGraphSearchResult}
+              focusNodeId={focusedGraphNodeId}
             />
           </div>
           <div className="border border-gray-200 rounded-lg bg-white overflow-hidden">
@@ -720,6 +797,7 @@ function GraphWorkspace({ workspace }: Props) {
             <div className="shrink-0 rounded-lg bg-gray-50 px-3 py-2 text-right text-xs text-gray-500">
               <div>实体类型 {splitLines(entityTypesText).length}</div>
               <div>关系类型 {splitLines(relationTypesText).length}</div>
+              <div>排除规则 {splitLines(entityExclusionRulesText).length + splitLines(relationExclusionRulesText).length}</div>
             </div>
           </div>
 
@@ -836,6 +914,41 @@ function GraphWorkspace({ workspace }: Props) {
               className="w-full min-h-48 rounded-lg border border-gray-200 px-3 py-2 text-sm outline-none focus:border-gray-400"
               placeholder="每行一个关系类型；辅助模式下不是硬白名单"
             />
+          </div>
+        </div>
+        <div className="border border-gray-200 rounded-lg bg-white p-4">
+          <div>
+            <h3 className="text-sm font-semibold text-gray-800">入图排除规则</h3>
+            <p className="mt-1 text-xs leading-relaxed text-gray-500">
+              三种抽取模式都会在写入图谱前执行。每行一条；普通文本为忽略大小写的精确匹配，也可使用
+              <code className="mx-1 rounded bg-gray-100 px-1 py-0.5">contains:</code>
+              <code className="mr-1 rounded bg-gray-100 px-1 py-0.5">prefix:</code>
+              或 <code className="rounded bg-gray-100 px-1 py-0.5">suffix:</code>。
+            </p>
+          </div>
+          <div className="mt-3 grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-2">实体名称排除</label>
+              <textarea
+                value={entityExclusionRulesText}
+                onChange={(e) => setEntityExclusionRulesText(e.target.value)}
+                aria-label="实体名称排除"
+                className="w-full min-h-36 rounded-lg border border-gray-200 px-3 py-2 text-sm outline-none focus:border-gray-400"
+                placeholder={'例如：\nunknown\ncontains:/usr/\nprefix:第'}
+              />
+              <p className="mt-1.5 text-xs text-gray-400">被排除实体关联的边也不会入图。</p>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-700 mb-2">关系类别排除</label>
+              <textarea
+                value={relationExclusionRulesText}
+                onChange={(e) => setRelationExclusionRulesText(e.target.value)}
+                aria-label="关系类别排除"
+                className="w-full min-h-36 rounded-lg border border-gray-200 px-3 py-2 text-sm outline-none focus:border-gray-400"
+                placeholder={'例如：\nunknown\ncontains:临时关联'}
+              />
+              <p className="mt-1.5 text-xs text-gray-400">匹配关系的 keywords 类别，不扫描关系描述正文。</p>
+            </div>
           </div>
         </div>
         <div className="border border-gray-200 rounded-lg bg-white p-4">
@@ -1290,6 +1403,9 @@ function GraphWorkspace({ workspace }: Props) {
                 <button onClick={removeEntity} className="px-3 py-2 rounded-lg border border-red-200 text-red-600 text-sm">
                   删除
                 </button>
+                <button onClick={excludeSelectedEntity} className="px-3 py-2 rounded-lg border border-amber-200 bg-amber-50 text-amber-800 text-sm">
+                  加入排除草稿
+                </button>
               </div>
             </div>
           ) : (
@@ -1395,6 +1511,14 @@ function GraphWorkspace({ workspace }: Props) {
               <div className="flex gap-2">
                 <button onClick={saveRelation} className="px-3 py-2 rounded-lg bg-gray-900 text-white text-sm">保存</button>
                 <button onClick={removeRelation} className="px-3 py-2 rounded-lg border border-red-200 text-red-600 text-sm">删除</button>
+                <button
+                  onClick={excludeSelectedRelationType}
+                  disabled={!relationEdit.keywords.trim()}
+                  title={relationEdit.keywords.trim() ? '按当前 keywords 关系类别加入排除规则' : '该关系没有可排除的 keywords 类别'}
+                  className="px-3 py-2 rounded-lg border border-amber-200 bg-amber-50 text-amber-800 text-sm disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  加入排除草稿
+                </button>
               </div>
             </div>
           ) : (

@@ -3,11 +3,13 @@ import { ChevronDown, ShieldCheck, SlidersHorizontal, Trash2 } from 'lucide-reac
 import FileUpload from '../components/FileUpload'
 import IndexRecovery from '../components/IndexRecovery'
 import ExtractionPolicySummary from '../components/ExtractionPolicySummary'
+import GraphExtractionPreviewPanel from '../components/GraphExtractionPreviewPanel'
 import ChunkPreview from '../components/ChunkPreview'
 import { RangeField } from '../components/ui'
 import {
   uploadDocument,
   previewChunks,
+  previewGraphExtraction,
   indexDocument,
   listDocuments,
   deleteDocument,
@@ -25,6 +27,7 @@ import {
   DocInfo,
   DocumentChunkItem,
   GraphDeleteResiduals,
+  GraphExtractionPreview,
   GraphGovernanceConfig,
   IndexTask,
   UploadedDocument,
@@ -104,6 +107,9 @@ export default function KBManagement({
   // Preview & index state
   const [chunks, setChunks] = useState<ChunkPreviewItem[]>([])
   const [previewing, setPreviewing] = useState(false)
+  const [graphPreview, setGraphPreview] = useState<GraphExtractionPreview | null>(null)
+  const [previewingGraph, setPreviewingGraph] = useState(false)
+  const [graphPreviewError, setGraphPreviewError] = useState('')
   const [indexing, setIndexing] = useState(false)
   const [indexMsg, setIndexMsg] = useState('')
   const [indexTask, setIndexTask] = useState<IndexTask | null>(null)
@@ -391,6 +397,8 @@ export default function KBManagement({
     const operation = operationScope()
     setUploading(true)
     setChunks([])
+    setGraphPreview(null)
+    setGraphPreviewError('')
     setIndexMsg('')
     try {
       const data = await uploadDocument(file, workspace, operation.signal)
@@ -477,6 +485,39 @@ export default function KBManagement({
       setChunks([])
     } finally {
       if (operation.current()) setPreviewing(false)
+    }
+  }
+
+  const handleGraphPreview = async () => {
+    if (!uploaded || indexMode === 'fast') return
+    const operation = operationScope()
+    setPreviewingGraph(true)
+    setGraphPreviewError('')
+    setGraphPreview(null)
+    setIndexMsg('')
+    try {
+      const sepArray = separators
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((s) => s.replace(/\\n/g, '\n'))
+      const data = await previewGraphExtraction({
+        file_name: uploaded.file_name,
+        workspace,
+        separators: sepArray,
+        chunk_size: chunkSize,
+        chunk_overlap: chunkOverlap,
+        sample_chunk_count: 2,
+        kg_max_entities: kgMaxEntities,
+        kg_max_records: kgMaxRecords,
+      }, operation.signal)
+      if (!operation.current()) return
+      setGraphPreview(data)
+    } catch (error) {
+      if (!operation.current()) return
+      setGraphPreviewError((error as Error).message || '实体关系预览失败')
+    } finally {
+      if (operation.current()) setPreviewingGraph(false)
     }
   }
 
@@ -917,6 +958,7 @@ export default function KBManagement({
     setDocs([])
     setUploading(false)
     setPreviewing(false)
+    setPreviewingGraph(false)
     setDeleting(null)
     setDeletingWorkspace(false)
     setBatchDeleting(false)
@@ -933,6 +975,8 @@ export default function KBManagement({
     setWorkspaceDeleteError('')
     setUploaded(null)
     setChunks([])
+    setGraphPreview(null)
+    setGraphPreviewError('')
     setCheckedDocs(new Set())
     setPreviewError('')
     setRawTextModalOpen(false)
@@ -985,6 +1029,9 @@ export default function KBManagement({
             </span>
             <span className="rounded bg-white/70 px-2 py-0.5 text-[11px] text-amber-800">
               {graphRule?.relation_types?.length ?? 0} 类关系
+            </span>
+            <span className="rounded bg-white/70 px-2 py-0.5 text-[11px] text-amber-800">
+              {(graphRule?.entity_exclusion_rules?.length ?? 0) + (graphRule?.relation_exclusion_rules?.length ?? 0)} 条排除
             </span>
           </div>
           <details className="mt-2 text-xs text-amber-800">
@@ -1211,14 +1258,22 @@ export default function KBManagement({
         <div className="mt-5 flex flex-wrap gap-3">
           <button
             onClick={handlePreview}
-            disabled={!uploaded || previewing}
+            disabled={!uploaded || previewing || previewingGraph || indexing}
             className="px-5 py-2 text-sm font-medium rounded-lg bg-white border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             {previewing ? '切分中...' : '预览切分'}
           </button>
           <button
+            onClick={handleGraphPreview}
+            disabled={!uploaded || indexMode === 'fast' || previewingGraph || previewing || indexing}
+            title={indexMode === 'fast' ? '快速索引不会抽取知识图谱' : '调用 KG 模型抽取 2 个采样文本块，不写入图谱'}
+            className="px-5 py-2 text-sm font-medium rounded-lg border border-sky-200 bg-sky-50 text-sky-800 hover:bg-sky-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            {previewingGraph ? '抽取预览中...' : '预览实体关系'}
+          </button>
+          <button
             onClick={handleIndex}
-            disabled={!uploaded || indexing}
+            disabled={!uploaded || indexing || previewingGraph}
             className="px-5 py-2 text-sm font-medium rounded-lg bg-primary-600 text-white hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             {indexing ? '索引中...' : '确认索引'}
@@ -1248,6 +1303,23 @@ export default function KBManagement({
           </div>
         )}
         <ChunkPreview chunks={chunks} loading={previewing} />
+      </section>
+
+      <section className="rounded-lg border border-gray-200 bg-white p-4 sm:p-6">
+        <div className="mb-4 flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <h3 className="text-sm font-semibold uppercase tracking-wide text-gray-600">图谱抽取预览</h3>
+            <p className="mt-1 text-xs text-gray-400">会调用 KG 模型并产生少量模型用量，不会修改当前知识图谱。</p>
+          </div>
+          {graphPreview?.graph_rule?.rule_template_name && (
+            <span className="text-xs text-gray-400">规则：{graphPreview.graph_rule.rule_template_name}</span>
+          )}
+        </div>
+        <GraphExtractionPreviewPanel
+          preview={graphPreview}
+          loading={previewingGraph}
+          error={graphPreviewError}
+        />
       </section>
 
       {/* Document list */}
@@ -1384,7 +1456,7 @@ export default function KBManagement({
                         className="text-xs bg-amber-50 text-amber-700 px-2 py-0.5 rounded"
                       >
                         {doc.graph_rule?.rule_template_name || graphRule?.rule_template_name || '未记录'}
-                        {doc.kg_policy_stale === true && <span className="ml-2 text-amber-700" title="当前抽取规则或参考内容与生成此图谱时不同；需要重新索引才能更新已有图谱。">规则已变更，待重建</span>}
+                        {doc.kg_policy_stale === true && <span className="ml-2 text-amber-700" title="当前抽取规则、参考内容或抽取处理版本与生成此图谱时不同；需要重新索引才能更新已有图谱。">抽取版本已变更，待重建</span>}
                       </span>
                     </td>
                     <td className="py-2.5">

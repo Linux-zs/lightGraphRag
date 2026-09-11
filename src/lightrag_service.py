@@ -111,6 +111,8 @@ OPERATIONS_GRAPH_RULE_TEMPLATE = {
     "description": "适合软件部署、运维、同步链路、服务排查类文档。",
     "entity_types": ["产品", "模块", "服务", "配置项", "故障现象", "排查步骤", "文件", "数据库"],
     "relation_types": ["依赖于", "部署在", "读取", "写入", "同步到", "导致", "排查", "包含"],
+    "entity_exclusion_rules": [],
+    "relation_exclusion_rules": [],
     "aliases_text": "",
     "extraction_prompt": (
         "请从技术运维和部署文档中抽取稳定、可复用的业务实体和技术实体。"
@@ -129,6 +131,8 @@ GENERAL_GRAPH_RULE_TEMPLATE = {
     "description": "适合非特定行业文档，保守抽取人物、组织、地点、概念、事件、物品和因果关系。",
     "entity_types": ["人物", "组织", "地点", "概念", "事件", "物品", "问题", "结论"],
     "relation_types": ["属于", "包含", "影响", "导致", "关联", "发生在", "参与", "说明"],
+    "entity_exclusion_rules": [],
+    "relation_exclusion_rules": [],
     "aliases_text": "",
     "extraction_prompt": (
         "请从当前文档中抽取对理解内容有帮助的稳定实体和关系。"
@@ -147,6 +151,8 @@ SUPPLY_CHAIN_GRAPH_RULE_TEMPLATE = {
     "description": "适合供应链、药品、库存、生产、采购、断供风险类资料。",
     "entity_types": ["机构", "产品", "原料", "供应商", "生产环节", "库存", "风险", "原因", "措施"],
     "relation_types": ["采购", "供应", "生产", "储备", "依赖", "导致", "缓解", "影响"],
+    "entity_exclusion_rules": [],
+    "relation_exclusion_rules": [],
     "aliases_text": "",
     "extraction_prompt": (
         "请围绕供应链和风险分析抽取实体关系。优先抽取机构、产品、原料、供应商、生产环节、库存状态、风险因素和缓解措施；"
@@ -810,6 +816,13 @@ class LightRAGService:
             "min_substantive_chars": int(cfg.get("kg_min_substantive_chars", 8)),
             "symbol_ratio_threshold": float(cfg.get("kg_symbol_ratio_threshold", 0.78)),
             "structured_line_ratio": float(cfg.get("kg_structured_line_ratio", 0.72)),
+            "strip_bulk_record_noise": bool(
+                cfg.get("kg_strip_bulk_record_noise", True)
+            ),
+            "bulk_record_min_lines": max(
+                4,
+                int(cfg.get("kg_bulk_record_min_lines", 6)),
+            ),
             "skip_timed_out_chunks": bool(cfg.get("kg_skip_timed_out_chunks", True)),
             "max_timed_out_chunks": max(0, int(cfg.get("kg_max_timed_out_chunks", 3))),
             "skip_invalid_response_chunks": bool(
@@ -871,6 +884,122 @@ class LightRAGService:
                 return "toc_noise"
         return ""
 
+    @staticmethod
+    def _sanitize_kg_chunk_text(
+        text: str,
+        settings: dict[str, Any],
+    ) -> tuple[str, dict[str, int], int]:
+        """Remove repeated record dumps from KG input while retaining surrounding prose.
+
+        Vector chunks keep their original text. This sanitizer only operates on the
+        temporary copy passed to entity extraction, and requires repeated evidence
+        before removing a structure so that small, meaningful examples survive.
+        """
+        if not settings.get("strip_bulk_record_noise", True) or not text:
+            return text, {}, 0
+
+        raw_lines = text.splitlines()
+        if not raw_lines:
+            return text, {}, 0
+        lines = [line.strip() for line in raw_lines]
+        min_lines = max(4, int(settings.get("bulk_record_min_lines", 6)))
+        removed: set[int] = set()
+        reasons: dict[str, set[int]] = {}
+
+        def mark(reason: str, indexes: set[int]) -> None:
+            if not indexes:
+                return
+            reasons.setdefault(reason, set()).update(indexes)
+            removed.update(indexes)
+
+        # Large SQL/console tables are usually sample rows or command output. A
+        # short Markdown table is kept because it often contains useful facts.
+        table_candidates = {
+            index
+            for index, line in enumerate(lines)
+            if line.count("|") >= 2
+            or bool(re.fullmatch(r"\+[\-+=|: ]+\+", line))
+        }
+        table_runs: list[set[int]] = []
+        current_run: set[int] = set()
+        for index in range(len(lines)):
+            if index in table_candidates:
+                current_run.add(index)
+            else:
+                if current_run:
+                    table_runs.append(current_run)
+                    current_run = set()
+        if current_run:
+            table_runs.append(current_run)
+        for run in table_runs:
+            has_console_border = any(
+                re.fullmatch(r"\+[\-+=|: ]+\+", lines[index])
+                for index in run
+            )
+            if len(run) >= min_lines or (has_console_border and len(run) >= 3):
+                mark("bulk_table_rows", run)
+
+        nonblank_indexes = [index for index, line in enumerate(lines) if line]
+
+        def previous_nonblank(index: int) -> int | None:
+            for candidate in reversed(nonblank_indexes):
+                if candidate < index:
+                    return candidate
+            return None
+
+        # mysqlcheck and similar tools emit long "object  OK" inventories. The
+        # namespace may be split into the preceding line by imported HTML.
+        status_indexes = {
+            index
+            for index, line in enumerate(lines)
+            if re.fullmatch(r"[\w.$:/-]+(?:\s+[\w.$:/-]+)*\s{2,}OK", line, re.IGNORECASE)
+        }
+        if status_indexes:
+            expanded = set(status_indexes)
+            for index in status_indexes:
+                previous = previous_nonblank(index)
+                if previous is not None and re.fullmatch(r"[\w$-]+\.", lines[previous]):
+                    expanded.add(previous)
+            mark("successful_status_listing", expanded)
+
+        repeated_patterns = {
+            "schema_inventory": lambda value: "column's default character" in value.casefold(),
+            "obsolete_object_inventory": lambda value: " uses obsolete " in value.casefold(),
+        }
+        for reason, predicate in repeated_patterns.items():
+            matches = {index for index, line in enumerate(lines) if predicate(line)}
+            if not matches:
+                continue
+            expanded = set(matches)
+            for index in matches:
+                previous = previous_nonblank(index)
+                # Imported terminal output frequently splits `schema.object.`
+                # over the two lines before the explanatory record.
+                for _ in range(2):
+                    if previous is None or not re.fullmatch(r"[\w$ -]+\.", lines[previous]):
+                        break
+                    expanded.add(previous)
+                    previous = previous_nonblank(previous)
+                next_index = index + 1
+                if next_index < len(lines) and lines[next_index].casefold().startswith(
+                    ("set:", "sql_mode")
+                ):
+                    expanded.add(next_index)
+            mark(reason, expanded)
+
+        if not removed:
+            return text, {}, 0
+        cleaned = "\n".join(
+            "" if index in removed else raw_line
+            for index, raw_line in enumerate(raw_lines)
+        )
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return (
+            cleaned,
+            {reason: len(indexes) for reason, indexes in reasons.items()},
+            len(removed),
+        )
+
     def _filter_kg_chunks(self, chunks: Any) -> tuple[Any, dict[str, Any]]:
         settings = self._kg_filter_settings()
         if not settings["enabled"] or not isinstance(chunks, dict):
@@ -879,14 +1008,44 @@ class LightRAGService:
         kept: dict[str, Any] = {}
         reasons: dict[str, int] = {}
         examples: list[dict[str, str]] = []
+        sanitized_reasons: dict[str, int] = {}
+        sanitized_examples: list[dict[str, Any]] = []
+        sanitized_chunks = 0
+        removed_lines = 0
         for chunk_id, chunk in chunks.items():
-            reason = self._low_value_kg_chunk_reason(self._chunk_text(chunk), settings)
+            original_text = self._chunk_text(chunk)
+            sanitized_text, sanitation, removed_count = self._sanitize_kg_chunk_text(
+                original_text,
+                settings,
+            )
+            if sanitation:
+                sanitized_chunks += 1
+                removed_lines += removed_count
+                for sanitation_reason, count in sanitation.items():
+                    sanitized_reasons[sanitation_reason] = (
+                        sanitized_reasons.get(sanitation_reason, 0) + count
+                    )
+                if len(sanitized_examples) < 5:
+                    sanitized_examples.append(
+                        {
+                            "chunk_id": str(chunk_id),
+                            "removed_lines": removed_count,
+                            "reasons": sanitation,
+                        }
+                    )
+            reason = self._low_value_kg_chunk_reason(sanitized_text, settings)
             if reason:
                 reasons[reason] = reasons.get(reason, 0) + 1
                 if len(examples) < 5:
                     examples.append({"chunk_id": str(chunk_id), "reason": reason})
                 continue
-            kept[chunk_id] = chunk
+            if sanitation and isinstance(chunk, dict):
+                sanitized_chunk = dict(chunk)
+                target_key = "content" if "content" in sanitized_chunk else "text"
+                sanitized_chunk[target_key] = sanitized_text
+                kept[chunk_id] = sanitized_chunk
+            else:
+                kept[chunk_id] = chunk
 
         stats = {
             "enabled": True,
@@ -895,6 +1054,10 @@ class LightRAGService:
             "skipped": len(chunks) - len(kept),
             "reasons": reasons,
             "examples": examples,
+            "sanitized": sanitized_chunks,
+            "removed_lines": removed_lines,
+            "sanitized_reasons": sanitized_reasons,
+            "sanitized_examples": sanitized_examples,
         }
         return kept, stats
 
@@ -1293,6 +1456,165 @@ class LightRAGService:
             sanitize_text_for_encoding(doc.raw_text).strip(), options,
         )
 
+    async def preview_graph_extraction(
+        self,
+        doc: Document,
+        *,
+        chunk_size: int | None = None,
+        chunk_overlap: int | None = None,
+        separators: list[str] | None = None,
+        sample_chunk_count: int = 2,
+        kg_max_entities: int | None = None,
+        kg_max_records: int | None = None,
+    ) -> dict[str, Any]:
+        """Extract a small, evenly sampled graph without merging it into storage."""
+        policy_config = deepcopy(self.load_graph_governance())
+        validate_extraction_policy(policy_config)
+        guidance = self.graph_extraction_guidance(config=policy_config)
+        all_chunks = await self.preview_document_chunks(
+            doc,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=separators,
+        )
+        if not all_chunks:
+            return {
+                "file_name": doc.file_name,
+                "total_chunk_count": 0,
+                "sampled_chunks": [],
+                "entities": [],
+                "relations": [],
+                "entity_count": 0,
+                "relation_count": 0,
+                "entities_truncated": False,
+                "relations_truncated": False,
+                "filter_stats": {},
+                "elapsed_seconds": 0.0,
+                "graph_rule": self.graph_governance_summary(policy_config),
+            }
+
+        requested = max(1, min(int(sample_chunk_count), 5))
+        sample_size = min(requested, len(all_chunks))
+        if sample_size == 1:
+            sampled_indexes = [len(all_chunks) // 2]
+        else:
+            sampled_indexes = sorted({
+                round((position + 0.5) * len(all_chunks) / sample_size - 0.5)
+                for position in range(sample_size)
+            })
+        sampled = [all_chunks[index] for index in sampled_indexes]
+        preview_doc_id = "preview-" + hashlib.sha256(
+            f"{self.workspace}|{doc.file_name}|{doc.raw_text}".encode("utf-8")
+        ).hexdigest()[:16]
+        extraction_chunks = {
+            f"{preview_doc_id}-{int(chunk.get('chunk_order_index', index))}": {
+                **chunk,
+                "full_doc_id": preview_doc_id,
+                "file_path": doc.file_path or doc.file_name,
+            }
+            for index, chunk in enumerate(sampled)
+        }
+
+        rag = await self.get_rag()
+        original_addon_params = deepcopy(rag.addon_params or {})
+        rag.addon_params = deepcopy(original_addon_params)
+        if guidance:
+            rag.addon_params["entity_types_guidance"] = guidance
+        pipeline_status = {
+            "latest_message": "",
+            "history_messages": [],
+            "cancellation_requested": False,
+        }
+        pipeline_status_lock = asyncio.Lock()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        try:
+            with self._temporary_index_llm_and_kg_filter(
+                rag,
+                policy_config=policy_config,
+                skip_kg=False,
+                max_entities=kg_max_entities,
+                max_records=kg_max_records,
+            ):
+                chunk_results = await rag._process_extract_entities(
+                    extraction_chunks,
+                    pipeline_status,
+                    pipeline_status_lock,
+                )
+        finally:
+            rag.addon_params = original_addon_params
+        elapsed_seconds = round(loop.time() - started, 3)
+
+        entities_by_name: dict[str, dict[str, Any]] = {}
+        relations_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for nodes, edges in chunk_results:
+            for raw_name, records in nodes.items():
+                name = str(raw_name)
+                entity = entities_by_name.setdefault(
+                    name,
+                    {"name": name, "entity_type": "", "description": "", "record_count": 0},
+                )
+                entity["record_count"] += len(records)
+                for record in records:
+                    if not isinstance(record, dict):
+                        continue
+                    entity_type = str(record.get("entity_type") or "")
+                    description = str(record.get("description") or "")
+                    if entity_type and not entity["entity_type"]:
+                        entity["entity_type"] = entity_type
+                    if len(description) > len(entity["description"]):
+                        entity["description"] = description[:500]
+            for endpoints, records in edges.items():
+                if len(endpoints) < 2:
+                    continue
+                source, target = str(endpoints[0]), str(endpoints[1])
+                for record in records:
+                    if not isinstance(record, dict):
+                        continue
+                    keywords = str(record.get("keywords") or "")
+                    key = (source, target, keywords)
+                    relation = relations_by_key.setdefault(
+                        key,
+                        {
+                            "source": source,
+                            "target": target,
+                            "keywords": keywords,
+                            "description": "",
+                            "record_count": 0,
+                        },
+                    )
+                    relation["record_count"] += 1
+                    description = str(record.get("description") or "")
+                    if len(description) > len(relation["description"]):
+                        relation["description"] = description[:500]
+
+        entities = sorted(entities_by_name.values(), key=lambda item: item["name"].casefold())
+        relations = sorted(
+            relations_by_key.values(),
+            key=lambda item: (item["source"].casefold(), item["target"].casefold(), item["keywords"].casefold()),
+        )
+        return {
+            "file_name": doc.file_name,
+            "total_chunk_count": len(all_chunks),
+            "sampled_chunks": [
+                {
+                    "index": int(chunk.get("chunk_order_index", index)),
+                    "text": str(chunk.get("content") or "")[:1000],
+                    "char_count": len(str(chunk.get("content") or "")),
+                }
+                for index, chunk in enumerate(sampled)
+            ],
+            "entities": entities[:200],
+            "relations": relations[:200],
+            "entity_count": len(entities),
+            "relation_count": len(relations),
+            "entities_truncated": len(entities) > 200,
+            "relations_truncated": len(relations) > 200,
+            "filter_stats": deepcopy(self._last_kg_filter_stats or {}),
+            "elapsed_seconds": elapsed_seconds,
+            "graph_rule": self.graph_governance_summary(policy_config),
+        }
+
     async def _insert_document_text(
         self,
         rag: LightRAG,
@@ -1447,6 +1769,8 @@ class LightRAGService:
             "allow_other_entity_type": True,
             "entity_types": list(template["entity_types"]),
             "relation_types": list(template["relation_types"]),
+            "entity_exclusion_rules": list(template.get("entity_exclusion_rules") or []),
+            "relation_exclusion_rules": list(template.get("relation_exclusion_rules") or []),
             "aliases_text": template["aliases_text"],
             "extraction_prompt": template["extraction_prompt"],
             "reference_files": [],
@@ -1478,6 +1802,8 @@ class LightRAGService:
         merged["allow_other_entity_type"] = bool(merged.get("allow_other_entity_type", True))
         merged["entity_types"] = list(merged.get("entity_types") or [])
         merged["relation_types"] = list(merged.get("relation_types") or [])
+        merged["entity_exclusion_rules"] = list(merged.get("entity_exclusion_rules") or [])
+        merged["relation_exclusion_rules"] = list(merged.get("relation_exclusion_rules") or [])
         merged["reference_files"] = list(merged.get("reference_files") or [])
         merged["audit_log"] = list(merged.get("audit_log") or [])
         merged["effective_extraction_prompt"] = self.graph_extraction_guidance(config=merged)
@@ -1488,6 +1814,8 @@ class LightRAGService:
         allowed = {
             "entity_types",
             "relation_types",
+            "entity_exclusion_rules",
+            "relation_exclusion_rules",
             "aliases_text",
             "extraction_prompt",
             "rule_template_id",
@@ -1526,7 +1854,12 @@ class LightRAGService:
         custom = self._load_custom_graph_rule_templates()
         builtin_ids = {item["id"] for item in BUILTIN_GRAPH_RULE_TEMPLATES}
         clean_custom = [
-            {**item, "built_in": False}
+            {
+                **item,
+                "entity_exclusion_rules": list(item.get("entity_exclusion_rules") or []),
+                "relation_exclusion_rules": list(item.get("relation_exclusion_rules") or []),
+                "built_in": False,
+            }
             for item in custom
             if item.get("id") and item.get("id") not in builtin_ids
         ]
@@ -1550,12 +1883,15 @@ class LightRAGService:
             "description": str(template.get("description") or existing.get("description") or "").strip(),
             "entity_types": [str(item).strip() for item in template.get("entity_types", existing.get("entity_types", [])) if str(item).strip()],
             "relation_types": [str(item).strip() for item in template.get("relation_types", existing.get("relation_types", [])) if str(item).strip()],
+            "entity_exclusion_rules": [str(item).strip() for item in template.get("entity_exclusion_rules", existing.get("entity_exclusion_rules", [])) if str(item).strip()],
+            "relation_exclusion_rules": [str(item).strip() for item in template.get("relation_exclusion_rules", existing.get("relation_exclusion_rules", [])) if str(item).strip()],
             "aliases_text": str(template.get("aliases_text", existing.get("aliases_text", ""))),
             "extraction_prompt": str(template.get("extraction_prompt", existing.get("extraction_prompt", ""))),
             "built_in": False,
             "created_at": existing.get("created_at", now),
             "updated_at": now,
         }
+        validate_extraction_policy(saved)
         custom = [saved if item.get("id") == template_id else item for item in custom]
         if not any(item.get("id") == template_id for item in custom):
             custom.insert(0, saved)
@@ -1593,6 +1929,8 @@ class LightRAGService:
                 "allow_other_entity_type": bool(allow_other_entity_type),
                 "entity_types": list(template.get("entity_types") or []),
                 "relation_types": list(template.get("relation_types") or []),
+                "entity_exclusion_rules": list(template.get("entity_exclusion_rules") or []),
+                "relation_exclusion_rules": list(template.get("relation_exclusion_rules") or []),
                 "aliases_text": str(template.get("aliases_text") or ""),
                 "extraction_prompt": str(template.get("extraction_prompt") or ""),
             }
@@ -1618,6 +1956,8 @@ class LightRAGService:
             "allow_other_entity_type": bool(cfg.get("allow_other_entity_type", True)),
             "entity_type_count": len(cfg.get("entity_types") or []),
             "relation_type_count": len(cfg.get("relation_types") or []),
+            "entity_exclusion_count": len(cfg.get("entity_exclusion_rules") or []),
+            "relation_exclusion_count": len(cfg.get("relation_exclusion_rules") or []),
             "extraction_prompt_preview": prompt[:180] + ("..." if len(prompt) > 180 else ""),
             "effective_extraction_prompt_preview": str(cfg.get("effective_extraction_prompt") or "")[:240],
             "updated_at": cfg.get("updated_at", ""),
@@ -1687,6 +2027,8 @@ class LightRAGService:
         cfg = config or self.load_graph_governance()
         entity_types = [str(item).strip() for item in cfg.get("entity_types") or [] if str(item).strip()]
         relation_types = [str(item).strip() for item in cfg.get("relation_types") or [] if str(item).strip()]
+        entity_exclusions = [str(item).strip() for item in cfg.get("entity_exclusion_rules") or [] if str(item).strip()]
+        relation_exclusions = [str(item).strip() for item in cfg.get("relation_exclusion_rules") or [] if str(item).strip()]
         refs = self.graph_reference_bundle(max_chars=max_reference_chars, config=cfg)
         mode = str(cfg.get("extraction_mode") or "assist")
         allow_other = bool(cfg.get("allow_other_entity_type", True))
@@ -1697,7 +2039,9 @@ class LightRAGService:
                 "- Extract stable, meaningful entities and real relationships that are explicit or strongly implied by the text.\n"
                 "- Project-specific rules below are guidance for classification, normalization and prioritization; they are not the source of truth.\n"
                 "- Do not skip an important entity or relationship only because it does not match the configured domain vocabulary, unless strict whitelist mode is enabled.\n"
-                "- Do not extract meaningless section numbers, page headers, isolated variables, boilerplate, or generic fragments as entities."
+                "- Do not extract meaningless section numbers, page headers, isolated variables, boilerplate, or generic fragments as entities.\n"
+                "- Treat raw log timestamps, command status listings, database query result rows, sample record values, file paths, ports and standalone configuration values as evidence, not entities. "
+                "Only extract a named configuration item or technical object when it is central to the document's reusable explanation."
             )
         ]
         if mode == "strict":
@@ -1733,6 +2077,18 @@ class LightRAGService:
             blocks.append(
                 "Preferred relationship categories:\n"
                 + "\n".join(f"- {item}" for item in relation_types)
+            )
+        if entity_exclusions:
+            blocks.append(
+                "Hard entity-name exclusions (case-insensitive and enforced again before graph storage). "
+                "Plain entries are exact matches; contains:, prefix:, and suffix: specify matching behavior:\n"
+                + "\n".join(f"- {item}" for item in entity_exclusions)
+            )
+        if relation_exclusions:
+            blocks.append(
+                "Hard relationship-category exclusions (case-insensitive and enforced again before graph storage). "
+                "Plain entries are exact matches; contains:, prefix:, and suffix: specify matching behavior:\n"
+                + "\n".join(f"- {item}" for item in relation_exclusions)
             )
         if cfg.get("extraction_prompt"):
             blocks.append("Additional project extraction guidance:\n" + str(cfg.get("extraction_prompt")))
@@ -2462,8 +2818,10 @@ class LightRAGService:
         policy_config = deepcopy(graph_policy_snapshot["config"] if graph_policy_snapshot is not None else self.load_graph_governance())
         guidance = graph_policy_snapshot["guidance"] if graph_policy_snapshot is not None else self.graph_extraction_guidance(config=policy_config)
         previous_policy = item.get("kg_policy_fingerprint")
-        if (previous_policy and item.get("kg_status") != "skipped"
-                and previous_policy != policy_fingerprint(policy_config, guidance)):
+        if (
+            item.get("kg_status") in {"complete", "partial"}
+            and previous_policy != policy_fingerprint(policy_config, guidance)
+        ):
             raise ValueError("抽取规则已变更，不能将新规则追加到旧图谱。请重新索引该文档或重建知识库。")
         chunk_ids = list(item.get("chunks_list") or [])
         if not chunk_ids:
@@ -2600,7 +2958,13 @@ class LightRAGService:
             self._last_stage_timings = timings
             raise
 
-    def read_graph(self, *, limit: int = 200, include_isolated: bool = True) -> dict[str, Any]:
+    def read_graph(
+        self,
+        *,
+        limit: int = 200,
+        include_isolated: bool = True,
+        focus_node_id: str = "",
+    ) -> dict[str, Any]:
         """Read LightRAG's GraphML as frontend-friendly nodes and edges."""
         path = self.graphml_path
         if not path.exists():
@@ -2615,6 +2979,9 @@ class LightRAGService:
                     "returned_nodes": 0,
                     "returned_edges": 0,
                     "truncated": False,
+                    "view": "neighborhood" if focus_node_id else "overview",
+                    "focus_node_id": str(focus_node_id or ""),
+                    "focus_found": not bool(focus_node_id),
                 },
             }
 
@@ -2634,6 +3001,9 @@ class LightRAGService:
                     "returned_nodes": 0,
                     "returned_edges": 0,
                     "truncated": False,
+                    "view": "neighborhood" if focus_node_id else "overview",
+                    "focus_node_id": str(focus_node_id or ""),
+                    "focus_found": None,
                 },
             }
 
@@ -2656,7 +3026,22 @@ class LightRAGService:
             )
 
         all_node_items = list(graph.nodes(data=True))
-        if include_isolated:
+        focus_node_id = str(focus_node_id or "")
+        focus_found = not focus_node_id or focus_node_id in graph
+        if focus_node_id and focus_found:
+            undirected = graph.to_undirected(as_view=True)
+            neighbor_ids = set(undirected.neighbors(focus_node_id))
+            neighbor_items = [
+                item for item in all_node_items
+                if item[0] in neighbor_ids
+            ]
+            selected_items = [
+                (focus_node_id, graph.nodes[focus_node_id]),
+                *sorted(neighbor_items, key=node_rank, reverse=True)[: max(0, limit - 1)],
+            ]
+        elif focus_node_id:
+            selected_items = []
+        elif include_isolated:
             selected_items = sorted(all_node_items, key=node_rank, reverse=True)[:limit]
         else:
             selected_items = [
@@ -2722,7 +3107,93 @@ class LightRAGService:
                 "returned_edges": len(edges),
                 "truncated": graph.number_of_nodes() > len(nodes),
                 "directed": graph.is_directed(),
+                "view": "neighborhood" if focus_node_id else "overview",
+                "focus_node_id": focus_node_id,
+                "focus_found": focus_found,
             },
+        }
+
+    def search_graph_nodes(self, query: str, *, limit: int = 8) -> dict[str, Any]:
+        """Search every persisted graph node, independent of overview truncation."""
+        clean_query = str(query or "").strip()
+        terms = [term for term in clean_query.casefold().split() if term]
+        limit = max(1, min(int(limit or 8), 30))
+        path = self.graphml_path
+        if not terms or not path.exists():
+            return {"nodes": [], "total_matches": 0, "query": clean_query}
+        try:
+            graph = nx.read_graphml(path)
+        except Exception as exc:
+            logger.warning("Failed to search LightRAG graphml {}: {}", path, exc)
+            return {
+                "nodes": [],
+                "total_matches": 0,
+                "query": clean_query,
+                "error": str(exc),
+            }
+
+        degree = dict(graph.degree())
+
+        def clean(value: Any, max_len: int = 300) -> str:
+            text = str(value or "").replace("<SEP>", "；")
+            text = CONTROL_CHARS_RE.sub("", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            return text[:max_len].rstrip()
+
+        phrase = " ".join(terms)
+        matches: list[tuple[int, int, str, str, dict[str, Any]]] = []
+        for node_id, data in graph.nodes(data=True):
+            node_id_text = str(node_id)
+            label = clean(data.get("entity_id") or node_id_text, 80) or node_id_text
+            entity_type = clean(data.get("entity_type") or "entity", 80).lower()
+            description = clean(data.get("description"), 500)
+            category = GRAPH_CATEGORY_MAP.get(entity_type, entity_type or "核心系统")
+            label_folded = label.casefold()
+            id_folded = node_id_text.casefold()
+            haystack = " ".join(
+                (
+                    label_folded,
+                    id_folded,
+                    category.casefold(),
+                    entity_type.casefold(),
+                    description.casefold(),
+                )
+            )
+            if not all(term in haystack for term in terms):
+                continue
+            if label_folded == phrase or id_folded == phrase:
+                rank = 0
+            elif label_folded.startswith(phrase) or id_folded.startswith(phrase):
+                rank = 1
+            elif phrase in label_folded or phrase in id_folded:
+                rank = 2
+            else:
+                rank = 3
+            source_id = clean(data.get("source_id"), 300)
+            file_path = clean(data.get("file_path"), 180)
+            if not description and source_id:
+                description = f"来源: {source_id}"
+            if file_path:
+                description = f"{description}（{file_path}）" if description else file_path
+            node = {
+                "id": node_id_text,
+                "label": label,
+                "category": category,
+                "description": description or "暂无描述",
+                "critical": degree.get(node_id, 0) >= 3,
+                "entity_type": entity_type,
+                "source_id": source_id,
+                "file_path": file_path,
+                "degree": degree.get(node_id, 0),
+            }
+            matches.append(
+                (rank, -degree.get(node_id, 0), label_folded, id_folded, node)
+            )
+        matches.sort(key=lambda item: item[:4])
+        return {
+            "nodes": [item[4] for item in matches[:limit]],
+            "total_matches": len(matches),
+            "query": clean_query,
         }
 
     def find_graph_references(
@@ -3437,8 +3908,8 @@ class LightRAGService:
                     "error_msg": error_msg,
                     "index_stale": bool(item.get("index_stale", False)),
                     "kg_policy_stale": (
-                        item["kg_policy_fingerprint"] != current_policy_fingerprint
-                        if indexed and item.get("kg_policy_fingerprint") and item.get("kg_status") != "skipped"
+                        item.get("kg_policy_fingerprint") != current_policy_fingerprint
+                        if indexed and item.get("kg_status") != "skipped"
                         else None
                     ),
                     "last_index_attempt_status": item.get(

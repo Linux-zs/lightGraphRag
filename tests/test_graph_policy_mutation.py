@@ -28,14 +28,35 @@ def test_invalid_strict_rules_are_rejected_before_service_write(monkeypatch):
     assert error.value.detail['code'] == 'INVALID_EXTRACTION_POLICY'
 
 
-def test_backfill_does_not_merge_changed_policy_into_existing_graph():
+def test_governance_api_persists_exclusion_rules(monkeypatch):
+    from unittest.mock import Mock
+
+    save = Mock(return_value={})
+    service = SimpleNamespace(save_graph_governance=save)
+    monkeypatch.setattr(server, '_index_tasks', {})
+    monkeypatch.setattr(server, 'get_lightrag_service', lambda _: service)
+    request = server.GraphGovernanceUpdate(
+        workspace='kb',
+        entity_exclusion_rules=[' unknown ', 'contains:/tmp/'],
+        relation_exclusion_rules=[' temporary '],
+    )
+
+    asyncio.run(server.update_graph_governance_config(request))
+
+    saved = save.call_args.args[0]
+    assert saved['entity_exclusion_rules'] == ['unknown', 'contains:/tmp/']
+    assert saved['relation_exclusion_rules'] == ['temporary']
+
+
+@pytest.mark.parametrize('previous_policy', ['old-policy', None])
+def test_backfill_does_not_merge_changed_or_unknown_policy_into_existing_graph(previous_policy):
     from unittest.mock import AsyncMock
     from src.lightrag_service import LightRAGService
     service = object.__new__(LightRAGService)
     service.assert_embedding_compatible = lambda: None
     service._load_manifest = lambda: {'documents': {'doc': {
         'doc_name': 'source.txt', 'indexed': True, 'kg_status': 'partial',
-        'kg_policy_fingerprint': 'old-policy', 'chunks_list': ['chunk']}}}
+        'kg_policy_fingerprint': previous_policy, 'chunks_list': ['chunk']}}}
     service.load_graph_governance = lambda: {'entity_types': ['Service']}
     service.graph_extraction_guidance = lambda config: 'new rules'
     service.get_rag = AsyncMock()
@@ -44,7 +65,7 @@ def test_backfill_does_not_merge_changed_policy_into_existing_graph():
     service.get_rag.assert_not_awaited()
 
 
-def test_document_list_distinguishes_stale_current_and_unknown_policy(monkeypatch):
+def test_document_list_marks_legacy_graph_without_policy_version_for_rebuild(monkeypatch):
     from unittest.mock import AsyncMock
     from src.extraction_policy import policy_fingerprint
     from src.lightrag_service import LightRAGService
@@ -64,7 +85,7 @@ def test_document_list_distinguishes_stale_current_and_unknown_policy(monkeypatc
     docs = {item['doc_id']: item for item in asyncio.run(service.list_documents())}
     assert docs['current']['kg_policy_stale'] is False
     assert docs['stale']['kg_policy_stale'] is True
-    assert docs['legacy']['kg_policy_stale'] is None
+    assert docs['legacy']['kg_policy_stale'] is True
     assert docs['fast']['kg_policy_stale'] is None
 
 

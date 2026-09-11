@@ -34,3 +34,43 @@ it('distinguishes empty, stale and unavailable graph data', async () => {
   expect(screen.getByRole('button', { name: /^严格/ })).toHaveAttribute('aria-pressed', 'true')
   expect(screen.getByText(/Other 只有明确列入实体白名单/)).toBeInTheDocument()
 })
+
+it('adds a selected noisy entity to the exclusion draft without deleting it', async () => {
+  vi.mocked(getGraphGovernanceConfig).mockResolvedValue({
+    workspace: 'kb',
+    rule_template_id: 'general_knowledge',
+    rule_template_name: '通用知识库',
+    extraction_mode: 'assist',
+    allow_other_entity_type: true,
+    entity_types: ['概念'],
+    relation_types: ['关联'],
+    entity_exclusion_rules: [],
+    relation_exclusion_rules: [],
+    aliases_text: '',
+    extraction_prompt: '',
+    effective_extraction_prompt: '',
+    reference_files: [],
+    updated_at: '',
+    audit_log: [],
+  })
+  vi.mocked(listGraphImports).mockResolvedValue([])
+  vi.mocked(listGraphRuleTemplates).mockResolvedValue([])
+  vi.mocked(getGraph).mockResolvedValue({
+    nodes: [{
+      id: 'unknown', label: 'unknown', category: '概念', entity_type: '概念',
+      description: '噪声实体', critical: false,
+    }],
+    edges: [],
+    metadata: { total_nodes: 1, total_edges: 0 },
+  } as Awaited<ReturnType<typeof getGraph>>)
+
+  render(<GraphPage workspace="kb" />)
+  await screen.findByText('graph canvas')
+  await userEvent.click(screen.getByRole('button', { name: '实体治理' }))
+  await userEvent.click(screen.getByRole('button', { name: /unknown/ }))
+  await userEvent.click(screen.getByRole('button', { name: '加入排除草稿' }))
+
+  expect(screen.getByLabelText('实体名称排除')).toHaveValue('unknown')
+  expect(screen.getByText(/保存规则并重新索引后生效/)).toBeInTheDocument()
+  expect(getGraph).toHaveBeenCalledTimes(1)
+})

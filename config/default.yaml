@@ -49,6 +49,11 @@ lightrag:
   kg_min_substantive_chars: 8
   kg_symbol_ratio_threshold: 0.78
   kg_structured_line_ratio: 0.72
+  # 混合正文 chunk 中的大段 SQL 结果、对象 OK 清单等只从 KG 抽取输入移除；
+  # 原文和向量索引保持不变。普通管道表至少连续 6 行才处理；带终端边框的
+  # SQL 结果及明确的对象 OK/兼容性清单可逐条识别，避免 chunk 边界漏网。
+  kg_strip_bulk_record_noise: true
+  kg_bulk_record_min_lines: 6
   # 单个 KG chunk 超时不应拖垮整份文档。超时 chunk 仍保留文本和向量，
   # 只跳过该块的实体关系抽取；超过上限后才终止文档索引。
   kg_skip_timed_out_chunks: true

@@ -5,11 +5,14 @@ import ExtractionPolicySummary from './ExtractionPolicySummary'
 afterEach(cleanup)
 it('shows each rejection reason as record counts', () => {
   render(<ExtractionPolicySummary results={[{ doc_name: 'source.txt', status: 'ok',
-    kg_policy_rejections: { entity_type_not_allowed: 3, relation_endpoint_not_allowed: 2, relation_type_not_allowed: 4 } }]} />)
+    kg_policy_rejections: { entity_type_not_allowed: 3, entity_name_excluded: 5,
+      relation_endpoint_not_allowed: 2, relation_type_not_allowed: 4, relation_type_excluded: 6 } }]} />)
   expect(screen.getByText(/记录数，非去重实体数/)).toBeInTheDocument()
   expect(screen.getByText(/source.txt/)).toHaveTextContent('实体类型不匹配 3')
+  expect(screen.getByText(/source.txt/)).toHaveTextContent('实体名称命中排除规则 5')
   expect(screen.getByText(/source.txt/)).toHaveTextContent('关系端点未通过 2')
   expect(screen.getByText(/source.txt/)).toHaveTextContent('关系类型不匹配 4')
+  expect(screen.getByText(/source.txt/)).toHaveTextContent('关系类别命中排除规则 6')
 })
 it('does not report rejection for legacy or zero-count results', () => {
   const view = render(<ExtractionPolicySummary results={[{ doc_name: 'old', status: 'ok' },

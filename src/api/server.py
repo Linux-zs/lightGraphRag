@@ -864,6 +864,38 @@ class ChunkPreviewItem(BaseModel):
     text: str
     char_count: int
 
+class GraphExtractionPreviewRequest(ChunkPreviewRequest):
+    sample_chunk_count: int = Field(default=2, ge=1, le=5)
+    kg_max_entities: int = Field(default=24, ge=1, le=200)
+    kg_max_records: int = Field(default=48, ge=1, le=400)
+
+class GraphExtractionPreviewEntity(BaseModel):
+    name: str
+    entity_type: str = ""
+    description: str = ""
+    record_count: int = 0
+
+class GraphExtractionPreviewRelation(BaseModel):
+    source: str
+    target: str
+    keywords: str = ""
+    description: str = ""
+    record_count: int = 0
+
+class GraphExtractionPreviewResponse(BaseModel):
+    file_name: str
+    total_chunk_count: int
+    sampled_chunks: list[ChunkPreviewItem]
+    entities: list[GraphExtractionPreviewEntity]
+    relations: list[GraphExtractionPreviewRelation]
+    entity_count: int
+    relation_count: int
+    entities_truncated: bool = False
+    relations_truncated: bool = False
+    filter_stats: dict[str, Any] = {}
+    elapsed_seconds: float = 0.0
+    graph_rule: dict[str, Any] = {}
+
 class IndexRequest(ChunkingRequest):
     workspace: WorkspaceName = DEFAULT_WORKSPACE
     file_name: str
@@ -1072,6 +1104,8 @@ class GraphGovernanceConfig(BaseModel):
     allow_other_entity_type: bool = True
     entity_types: list[str] = []
     relation_types: list[str] = []
+    entity_exclusion_rules: list[str] = []
+    relation_exclusion_rules: list[str] = []
     aliases_text: str = ""
     extraction_prompt: str = ""
     effective_extraction_prompt: str = ""
@@ -1087,6 +1121,8 @@ class GraphGovernanceUpdate(BaseModel):
     allow_other_entity_type: bool = True
     entity_types: list[str] = []
     relation_types: list[str] = []
+    entity_exclusion_rules: list[str] = []
+    relation_exclusion_rules: list[str] = []
     aliases_text: str = ""
     extraction_prompt: str = ""
 
@@ -1096,6 +1132,8 @@ class GraphRuleTemplate(BaseModel):
     description: str = ""
     entity_types: list[str] = []
     relation_types: list[str] = []
+    entity_exclusion_rules: list[str] = []
+    relation_exclusion_rules: list[str] = []
     aliases_text: str = ""
     extraction_prompt: str = ""
     built_in: bool = False
@@ -3715,6 +3753,39 @@ async def preview_chunks(req: ChunkPreviewRequest):
     return result
 
 
+@app.post("/api/kb/preview-graph-extraction", response_model=GraphExtractionPreviewResponse)
+async def preview_graph_extraction(req: GraphExtractionPreviewRequest):
+    """Preview sampled KG extraction without merging results into graph storage."""
+    req.workspace = sanitize_workspace(req.workspace)
+    _ensure_workspace_available(req.workspace)
+    try:
+        req.file_name = _safe_leaf_name(req.file_name)
+        doc = _load_doc_for_index(req.file_name, req.workspace)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except FileNotFoundError:
+        raise HTTPException(404, f"File '{req.file_name}' not uploaded yet")
+
+    try:
+        async with _get_workspace_rag_lock(req.workspace):
+            return await get_lightrag_service(req.workspace).preview_graph_extraction(
+                doc,
+                chunk_size=req.chunk_size,
+                chunk_overlap=req.chunk_overlap,
+                separators=req.separators,
+                sample_chunk_count=req.sample_chunk_count,
+                kg_max_entities=req.kg_max_entities,
+                kg_max_records=req.kg_max_records,
+            )
+    except ValueError as exc:
+        raise HTTPException(400, {"code": "INVALID_EXTRACTION_POLICY", "detail": str(exc)}) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Graph extraction preview failed for {} in {}", req.file_name, req.workspace)
+        raise HTTPException(502, f"图谱抽取预览失败: {exc}") from exc
+
+
 @app.post("/api/kb/index")
 async def index_document(req: IndexRequest):
     """Create a background task to index a document into LightRAG."""
@@ -5495,6 +5566,44 @@ async def get_graph(limit: int = Query(200, ge=1, le=1000), workspace: Workspace
         return get_lightrag_service(workspace).read_graph(limit=limit, include_isolated=True)
 
 
+@app.get("/api/graph/search")
+async def search_graph_nodes(
+    query: str = Query(min_length=1, max_length=120),
+    limit: int = Query(8, ge=1, le=30),
+    workspace: WorkspaceName = Query(DEFAULT_WORKSPACE),
+):
+    """Search all graph entities, including nodes omitted from the overview."""
+    workspace = sanitize_workspace(workspace)
+    _ensure_workspace_available(workspace)
+    async with _get_workspace_rag_lock(workspace):
+        result = get_lightrag_service(workspace).search_graph_nodes(query, limit=limit)
+    if result.get("error"):
+        raise HTTPException(500, "Graph search is unavailable because graph storage could not be read")
+    return result
+
+
+@app.get("/api/graph/neighborhood")
+async def get_graph_neighborhood(
+    entity_id: str = Query(min_length=1, max_length=200),
+    limit: int = Query(200, ge=2, le=1000),
+    workspace: WorkspaceName = Query(DEFAULT_WORKSPACE),
+):
+    """Return a focused one-hop subgraph without loading the entire corpus."""
+    workspace = sanitize_workspace(workspace)
+    _ensure_workspace_available(workspace)
+    async with _get_workspace_rag_lock(workspace):
+        graph = get_lightrag_service(workspace).read_graph(
+            limit=limit,
+            include_isolated=True,
+            focus_node_id=entity_id,
+        )
+    if graph.get("metadata", {}).get("error"):
+        raise HTTPException(500, "Graph neighborhood is unavailable because graph storage could not be read")
+    if graph.get("metadata", {}).get("focus_found") is False:
+        raise HTTPException(404, "Graph entity not found")
+    return graph
+
+
 def _graph_payload_without_empty(data: dict[str, Any]) -> dict[str, Any]:
     out = {}
     for key, value in data.items():
@@ -5941,6 +6050,8 @@ async def update_graph_governance_config(req: GraphGovernanceUpdate):
             "allow_other_entity_type": req.allow_other_entity_type,
             "entity_types": [item.strip() for item in req.entity_types if item.strip()],
             "relation_types": [item.strip() for item in req.relation_types if item.strip()],
+            "entity_exclusion_rules": [item.strip() for item in req.entity_exclusion_rules if item.strip()],
+            "relation_exclusion_rules": [item.strip() for item in req.relation_exclusion_rules if item.strip()],
             "aliases_text": req.aliases_text,
             "extraction_prompt": req.extraction_prompt,
         }

@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, useMemo, useId } from 'react'
 import type { GraphNode, GraphEdge } from '../api'
-import { chooseGraphLabels } from '../utils/graphLabels'
+import { placeGraphLabels } from '../utils/graphLabels'
+import { orientGraph } from '../utils/graphOrientation'
+import { searchGraphNodes } from '../utils/graphSearch'
 
 interface Props {
   nodes: GraphNode[]
@@ -10,6 +12,11 @@ interface Props {
   hitNodes?: Set<string>
   /** Actual retrieved relations; node co-occurrence alone is not evidence. */
   pathEdges?: Pick<GraphEdge, 'source' | 'target'>[]
+  /** Search the full persisted graph when the overview is truncated. */
+  searchAllNodes?: (query: string, signal: AbortSignal) => Promise<GraphNode[]>
+  /** Load a focused subgraph when a search hit is outside the current view. */
+  onOpenSearchResult?: (node: GraphNode) => Promise<void>
+  focusNodeId?: string | null
   className?: string
 }
 
@@ -36,7 +43,17 @@ const CATEGORY_COLORS: Record<string, string> = {
 }
 const DEFAULT_COLOR = '#6b7280'
 
-export default function GraphView({ nodes, edges, directed = false, hitNodes, pathEdges, className }: Props) {
+export default function GraphView({
+  nodes,
+  edges,
+  directed = false,
+  hitNodes,
+  pathEdges,
+  searchAllNodes,
+  onOpenSearchResult,
+  focusNodeId,
+  className,
+}: Props) {
   const pathEdgeKeys = useMemo(() => new Set((pathEdges || []).map(edge =>
     JSON.stringify(directed ? [edge.source, edge.target] : [edge.source, edge.target].sort())
   )), [pathEdges, directed])
@@ -47,6 +64,15 @@ export default function GraphView({ nodes, edges, directed = false, hitNodes, pa
   const [selected, setSelected] = useState<string | null>(null)
   const [localOnly, setLocalOnly] = useState(false)
   const [allLabels, setAllLabels] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [remoteSearch, setRemoteSearch] = useState<{
+    query: string
+    nodes: GraphNode[]
+    loading: boolean
+    error: string
+  }>({ query: '', nodes: [], loading: false, error: '' })
+  const [focusRequest, setFocusRequest] = useState<{ id: string } | null>(null)
   const [camera, setCamera] = useState({ x: 0, y: 0, zoom: 1 })
   const drag = useRef<{ x: number; y: number; cx: number; cy: number } | null>(null)
   useEffect(() => {
@@ -58,7 +84,15 @@ export default function GraphView({ nodes, edges, directed = false, hitNodes, pa
     observer.observe(containerRef.current)
     return () => observer.disconnect()
   }, [])
-  useEffect(() => { setSelected(null); setHovered(null); setLocalOnly(false); setCamera({ x: 0, y: 0, zoom: 1 }) }, [nodes])
+  useEffect(() => {
+    const requested = focusNodeId && nodes.some(node => node.id === focusNodeId)
+      ? focusNodeId
+      : null
+    const requestedNode = requested ? nodes.find(node => node.id === requested) : null
+    setSelected(requested); setHovered(null); setLocalOnly(false); setCamera({ x: 0, y: 0, zoom: 1 })
+    setSearchQuery(requestedNode?.label || ''); setSearchOpen(false)
+    setFocusRequest(requested ? { id: requested } : null)
+  }, [nodes, focusNodeId])
   const initialPositions = useMemo(() => nodes.map((node, i) => ({
     ...node, x: 500 + 260 * Math.cos(2 * Math.PI * i / nodes.length),
     y: 375 + 260 * Math.sin(2 * Math.PI * i / nodes.length),
@@ -87,13 +121,60 @@ export default function GraphView({ nodes, edges, directed = false, hitNodes, pa
     catch { setLayoutStatus(fallback); worker.terminate() }
     return () => { active = false; worker.terminate() }
   }, [nodes, edges])
-  const positioned = layout?.source === nodes && layout.edges === edges ? layout.positions : initialPositions
+  const rawPositions = layout?.source === nodes && layout.edges === edges ? layout.positions : initialPositions
+  // Selection/hover must not change orientation or invalidate the worker layout.
+  const positioned = useMemo(() => orientGraph(rawPositions, Math.max(100, dims.width - 40),
+    Math.max(100, dims.height - (dims.width < 520 ? 180 : 140))), [rawPositions, dims])
   const nodeMap = useMemo(() => new Map(positioned.map(n => [n.id, n])), [positioned])
   const degrees = useMemo(() => {
     const result = new Map<string, number>()
     edges.forEach(e => { result.set(e.source, (result.get(e.source) || 0) + 1); result.set(e.target, (result.get(e.target) || 0) + 1) })
     return result
   }, [edges])
+  const localSearchResults = useMemo(
+    () => searchGraphNodes(nodes, searchQuery, degrees),
+    [nodes, searchQuery, degrees],
+  )
+  const normalizedSearchQuery = searchQuery.trim()
+  const searchResults = useMemo(() => {
+    if (!searchAllNodes || remoteSearch.query !== normalizedSearchQuery) {
+      return localSearchResults
+    }
+    const combined = [...remoteSearch.nodes, ...localSearchResults]
+    return combined.filter(
+      (node, index) => combined.findIndex(candidate => candidate.id === node.id) === index,
+    ).slice(0, 8)
+  }, [localSearchResults, normalizedSearchQuery, remoteSearch, searchAllNodes])
+  useEffect(() => {
+    if (!searchAllNodes || !normalizedSearchQuery) {
+      setRemoteSearch({ query: '', nodes: [], loading: false, error: '' })
+      return
+    }
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => {
+      setRemoteSearch({ query: normalizedSearchQuery, nodes: [], loading: true, error: '' })
+      searchAllNodes(normalizedSearchQuery, controller.signal)
+        .then(result => {
+          if (!controller.signal.aborted) {
+            setRemoteSearch({ query: normalizedSearchQuery, nodes: result, loading: false, error: '' })
+          }
+        })
+        .catch(error => {
+          if (!controller.signal.aborted) {
+            setRemoteSearch({
+              query: normalizedSearchQuery,
+              nodes: [],
+              loading: false,
+              error: (error as Error).message || '全库搜索失败',
+            })
+          }
+        })
+    }, 180)
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+    }
+  }, [normalizedSearchQuery, searchAllNodes])
   const active = selected || hovered
   const neighbors = useMemo(() => {
     const result = new Set(active ? [active] : [])
@@ -109,13 +190,41 @@ export default function GraphView({ nodes, edges, directed = false, hitNodes, pa
     return { x: Math.min(...xs) - 85, y: Math.min(...ys) - 65,
       width: Math.max(...xs) - Math.min(...xs) + 170, height: Math.max(...ys) - Math.min(...ys) + 130 }
   }, [visible])
-  const detail = active ? nodeMap.get(active) : null
-  const topInset = dims.width < 520 ? 110 : 70
+  // Hover must not change the camera fit: moving the target under the pointer
+  // would repeatedly enter/leave it. Only a deliberate selection opens details.
+  const detail = selected ? nodeMap.get(selected) : null
+  const topInset = dims.width < 520 ? 160 : 70
   const bottomInset = detail ? 170 : 70
   const canvasHeight = Math.max(100, dims.height - topInset - bottomInset)
   const scale = Math.min(Math.max(100, dims.width - 40) / bounds.width, canvasHeight / bounds.height) * camera.zoom
   const tx = dims.width / 2 - (bounds.x + bounds.width / 2) * scale + camera.x
   const ty = topInset + canvasHeight / 2 - (bounds.y + bounds.height / 2) * scale + camera.y
+  useEffect(() => {
+    if (!focusRequest || localOnly) return
+    const node = nodeMap.get(focusRequest.id)
+    if (!node) { setFocusRequest(null); return }
+    const baseScale = scale / camera.zoom
+    setCamera({ zoom: 1,
+      x: (bounds.x + bounds.width / 2 - node.x) * baseScale,
+      y: (bounds.y + bounds.height / 2 - node.y) * baseScale })
+    setFocusRequest(null)
+  }, [focusRequest, localOnly, nodeMap, bounds, scale, camera.zoom])
+  const focusSearchResult = (node: PositionedNode | GraphNode) => {
+    if (!nodeMap.has(node.id) && onOpenSearchResult) {
+      setSearchQuery(node.label); setSearchOpen(false)
+      void onOpenSearchResult(node).catch(error => {
+        setRemoteSearch(current => ({
+          ...current,
+          loading: false,
+          error: (error as Error).message || '实体邻域加载失败',
+        }))
+      })
+      return
+    }
+    setFocusRequest({ id: node.id })
+    setSelected(node.id); setHovered(null); setLocalOnly(false)
+    setSearchQuery(node.label); setSearchOpen(false)
+  }
   const nodeRadius = (id: string) => 4.5 + Math.min(4, Math.sqrt(degrees.get(id) || 0) * 0.9)
   const nodeLabelKey = (id: string) => JSON.stringify(['node', id])
   const edgeLabelKey = (index: number) => JSON.stringify(['edge', index])
@@ -123,9 +232,14 @@ export default function GraphView({ nodes, edges, directed = false, hitNodes, pa
     const focused = node.id === active
     const label = node.label.length > 22 && !focused ? node.label.slice(0, 22) + '…' : node.label
     const radius = nodeRadius(node.id)
+    const width = Array.from(label).reduce((sum, char) => sum + (/[^\x00-\x7f]/.test(char) ? 11 : 6.5), 0)
     return { id: nodeLabelKey(node.id), x: node.x * scale + tx, y: node.y * scale + ty + radius + 15,
-      width: Array.from(label).reduce((sum, char) => sum + (/[^\x00-\x7f]/.test(char) ? 11 : 6.5), 0),
-      height: 13, force: focused,
+      width, alternatives: [
+        { dx: 0, dy: -(2 * radius + 22) },
+        { dx: width / 2 + radius + 8, dy: -(radius + 11) },
+        { dx: -(width / 2 + radius + 8), dy: -(radius + 11) },
+      ],
+      height: 13, force: focused, ownerId: node.id,
       priority: (hitNodes?.has(node.id) ? 2000000 : neighbors.has(node.id) ? 1000000 : 0) + Math.min(999999, degrees.get(node.id) || 0) }
   })
   const edgeLabelCandidates = visibleEdges.flatMap((edge, index) => {
@@ -136,16 +250,51 @@ export default function GraphView({ nodes, edges, directed = false, hitNodes, pa
       width: Array.from(edge.relation).reduce((sum, char) => sum + (/[^\x00-\x7f]/.test(char) ? 10 : 6), 0),
       height: 12, priority: 1500000, group: 'relations', groupLimit: 8 }]
   })
-  const automaticLabels = chooseGraphLabels([...nodeLabelCandidates, ...edgeLabelCandidates].map(candidate => ({
+  const automaticLabels = placeGraphLabels([...nodeLabelCandidates, ...edgeLabelCandidates].map(candidate => ({
     ...candidate, x: candidate.x - 16, y: candidate.y - topInset,
-  })), Math.max(0, dims.width - 32), canvasHeight)
+  })), Math.max(0, dims.width - 32), canvasHeight, 32, visible.map(node => ({
+    id: node.id, x: node.x * scale + tx - 16, y: node.y * scale + ty - topInset,
+    radius: nodeRadius(node.id) + 2,
+  })))
   const buttonClass = 'rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-600 hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-teal-500 disabled:opacity-40'
   return (
     <div ref={containerRef} className={`relative w-full h-full overflow-hidden bg-slate-50 ${className || ''}`}
       style={{ backgroundImage: 'radial-gradient(#cbd5e1 0.7px, transparent 0.7px)', backgroundSize: '22px 22px' }}>
-      <div className="absolute left-4 right-4 top-3 z-10 flex flex-wrap items-center justify-between gap-2">
+      <div className="absolute left-4 right-4 top-3 z-10 flex flex-wrap items-start justify-between gap-2">
         <div><div className="text-xs font-semibold tracking-widest text-slate-700">实体关系网络</div><div className="mt-1 text-[11px] text-slate-500">{visible.length} 个实体 · {visibleEdges.length} 条关系{localOnly ? ' · 邻居视图' : ''}</div>{layoutStatus && <p role="status" className="text-xs text-slate-600">{layoutStatus}</p>}</div>
-        <div className="flex gap-1 rounded-lg bg-white/90 p-1 shadow-sm">
+        <div className="flex w-full max-w-full flex-wrap justify-end gap-1 rounded-lg bg-white/90 p-1 shadow-sm sm:w-auto">
+          <div className="relative w-full sm:w-44" onBlur={event => {
+            if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setSearchOpen(false)
+          }}>
+            <input role="combobox" aria-label="查找实体" aria-expanded={searchOpen}
+              aria-controls={`${marker}-search-results`} aria-autocomplete="list" value={searchQuery}
+              onFocus={() => setSearchOpen(Boolean(searchQuery.trim()))}
+              onChange={event => { setSearchQuery(event.target.value); setSearchOpen(Boolean(event.target.value.trim())) }}
+              onKeyDown={event => {
+                if (event.key === 'Enter' && searchResults[0]) { event.preventDefault(); focusSearchResult(searchResults[0]) }
+                if (event.key === 'Escape') { setSearchOpen(false); setSearchQuery('') }
+              }}
+              className="h-[30px] w-full rounded-md border border-slate-200 bg-white px-2.5 text-xs text-slate-700 outline-none placeholder:text-slate-400 focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
+              placeholder={searchAllNodes ? '查找全库实体…' : '查找实体名称…'} />
+            {searchOpen && <div id={`${marker}-search-results`} role="listbox"
+              className="absolute right-0 top-[34px] z-20 max-h-56 w-full min-w-56 overflow-auto rounded-lg border border-slate-200 bg-white p-1 shadow-lg">
+              {searchResults.map(node => <button key={node.id} role="option" aria-selected={selected === node.id}
+                onPointerDown={event => event.preventDefault()} onClick={() => focusSearchResult(node)}
+                className="block w-full rounded-md px-2.5 py-2 text-left hover:bg-teal-50 focus-visible:bg-teal-50 focus-visible:outline-none">
+                <span className="block truncate text-xs font-medium text-slate-700">{node.label}</span>
+                <span className="mt-0.5 block truncate text-[10px] text-slate-400">{node.category} · {degrees.get(node.id) ?? node.degree ?? 0} 条关联</span>
+              </button>)}
+              {remoteSearch.loading && remoteSearch.query === normalizedSearchQuery && (
+                <div role="status" className="px-2.5 py-2 text-xs text-slate-400">正在搜索全库…</div>
+              )}
+              {remoteSearch.error && remoteSearch.query === normalizedSearchQuery && (
+                <div role="alert" className="px-2.5 py-2 text-xs text-amber-700">全库搜索失败，当前仅显示已加载结果</div>
+              )}
+              {searchResults.length === 0 && !remoteSearch.loading && (
+                <div className="px-2.5 py-3 text-xs text-slate-400">没有匹配实体</div>
+              )}
+            </div>}
+          </div>
           <button className={buttonClass} aria-label="缩小" onClick={() => setCamera(c => ({ ...c, zoom: Math.max(.3, c.zoom / 1.3) }))}>−</button>
           <button className={buttonClass} aria-label="放大" onClick={() => setCamera(c => ({ ...c, zoom: Math.min(5, c.zoom * 1.3) }))}>＋</button>
           <button className={buttonClass} onClick={() => setCamera({ x: 0, y: 0, zoom: 1 })}>适配视野</button>
@@ -173,11 +322,13 @@ export default function GraphView({ nodes, edges, directed = false, hitNodes, pa
               {connected && selected && (allLabels || automaticLabels.has(edgeLabelKey(i))) && <text x={(s.x+t.x)/2} y={(s.y+t.y)/2-5/scale} textAnchor="middle" fontSize={10/scale} fill="#0f766e" stroke="#f8fafc" strokeWidth={3/scale} paintOrder="stroke">{edge.relation}</text>}
             </g>
           })}
-          {visible.map(node => {
+          {/* Paint the active entity last so dense neighbors cannot cover its name. */}
+          {[...visible.filter(node => node.id !== active), ...visible.filter(node => node.id === active)].map(node => {
             const color = CATEGORY_COLORS[node.category] || DEFAULT_COLOR
             const focused = active === node.id
             const radius = nodeRadius(node.id) / scale
             const showLabel = allLabels || automaticLabels.has(nodeLabelKey(node.id))
+            const labelOffset = !allLabels ? automaticLabels.get(nodeLabelKey(node.id)) : undefined
             return <g key={node.id} transform={`translate(${node.x},${node.y})`} opacity={active && !neighbors.has(node.id) ? .14 : 1}
               className="cursor-pointer" role="button" tabIndex={0} aria-label={`查看实体 ${node.label}`}
               onPointerDown={e => e.stopPropagation()} onClick={() => {
@@ -193,7 +344,7 @@ export default function GraphView({ nodes, edges, directed = false, hitNodes, pa
               <title>{node.label} · {node.category}</title>
               {(focused || hitNodes?.has(node.id)) && <circle r={radius+4/scale} fill="none" stroke={hitNodes?.has(node.id) ? '#f59e0b' : color} strokeWidth={2/scale} opacity={.6} />}
               <circle r={radius} fill={color} stroke="white" strokeWidth={1.5/scale} />
-              {showLabel && <text y={radius+15/scale} textAnchor="middle" fontSize={11/scale} fontWeight={focused ? 700 : 500} fill="#334155" stroke="#f8fafc" strokeWidth={4/scale} paintOrder="stroke" className="select-none pointer-events-none">{node.label.length > 22 && !focused ? node.label.slice(0,22)+'…' : node.label}</text>}
+              {showLabel && <text x={(labelOffset?.dx || 0)/scale} y={radius+(15+(labelOffset?.dy || 0))/scale} textAnchor="middle" fontSize={11/scale} fontWeight={focused ? 700 : 500} fill="#334155" stroke="#f8fafc" strokeWidth={4/scale} paintOrder="stroke" className="select-none pointer-events-none">{node.label.length > 22 && !focused ? node.label.slice(0,22)+'…' : node.label}</text>}
             </g>
           })}
         </g>

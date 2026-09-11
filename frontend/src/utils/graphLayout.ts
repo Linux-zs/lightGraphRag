@@ -88,6 +88,14 @@ export function computeLayout(
       const v = vel.get(node.id)!
       v.vx += (cx - node.x) * centering
       v.vy += (cy - node.y) * centering
+      // Close pairs and high-degree hubs can generate huge impulses. Bound
+      // displacement, then cool gradually so outliers cannot dominate fit-to-view.
+      const maxVelocity = (12 * (1 - iter / iterations) + 0.5) / 0.1
+      const speed = Math.hypot(v.vx, v.vy)
+      if (speed > maxVelocity) {
+        v.vx *= maxVelocity / speed
+        v.vy *= maxVelocity / speed
+      }
       node.x += v.vx * 0.1
       node.y += v.vy * 0.1
       v.vx *= damping

@@ -7,8 +7,10 @@ export default function ExtractionPolicySummary({ results }: { results: IndexTas
     <p className="font-medium">抽取规则过滤（记录数，非去重实体数）</p>
     {filtered.map(result => <p key={`${result.doc_name}-policy`} className="mt-1">{result.doc_name}：
       实体类型不匹配 {result.kg_policy_rejections?.entity_type_not_allowed || 0}；
+      实体名称命中排除规则 {result.kg_policy_rejections?.entity_name_excluded || 0}；
       关系端点未通过 {result.kg_policy_rejections?.relation_endpoint_not_allowed || 0}；
-      关系类型不匹配 {result.kg_policy_rejections?.relation_type_not_allowed || 0}
+      关系类型不匹配 {result.kg_policy_rejections?.relation_type_not_allowed || 0}；
+      关系类别命中排除规则 {result.kg_policy_rejections?.relation_type_excluded || 0}
     </p>)}
   </div>
 }

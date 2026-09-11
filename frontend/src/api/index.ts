@@ -209,6 +209,43 @@ export interface DocInfo {
   }
 }
 
+export interface GraphExtractionPreviewEntity {
+  name: string
+  entity_type: string
+  description: string
+  record_count: number
+}
+
+export interface GraphExtractionPreviewRelation {
+  source: string
+  target: string
+  keywords: string
+  description: string
+  record_count: number
+}
+
+export interface GraphExtractionPreview {
+  file_name: string
+  total_chunk_count: number
+  sampled_chunks: ChunkPreviewItem[]
+  entities: GraphExtractionPreviewEntity[]
+  relations: GraphExtractionPreviewRelation[]
+  entity_count: number
+  relation_count: number
+  entities_truncated: boolean
+  relations_truncated: boolean
+  filter_stats: {
+    policy_rejections?: Record<string, number>
+    skipped?: number
+    reasons?: Record<string, number>
+    sanitized?: number
+    removed_lines?: number
+    sanitized_reasons?: Record<string, number>
+  }
+  elapsed_seconds: number
+  graph_rule: GraphRuleSummary
+}
+
 export interface WorkspaceInfo {
   workspace: string
   is_default: boolean
@@ -448,6 +485,23 @@ export interface IndexTask {
 
 export function getIndexTask(taskId: string, signal?: AbortSignal) {
   return request<IndexTask>(`/kb/index-tasks/${taskId}`, { signal })
+}
+
+export function previewGraphExtraction(params: {
+  workspace?: string
+  file_name: string
+  separators: string[]
+  chunk_size: number
+  chunk_overlap: number
+  sample_chunk_count?: number
+  kg_max_entities?: number
+  kg_max_records?: number
+}, signal?: AbortSignal) {
+  return request<GraphExtractionPreview>('/kb/preview-graph-extraction', {
+    method: 'POST',
+    body: JSON.stringify(params),
+    signal,
+  })
 }
 
 export function listIndexTasks(signal?: AbortSignal) {
@@ -850,6 +904,9 @@ export interface GraphData {
     returned_edges?: number
     truncated?: boolean
     directed?: boolean
+    view?: 'overview' | 'neighborhood'
+    focus_node_id?: string
+    focus_found?: boolean
     path?: string
     error?: string
   }
@@ -857,6 +914,41 @@ export interface GraphData {
 
 export function getGraph(limit = 200, workspace = DEFAULT_WORKSPACE, signal?: AbortSignal) {
   return request<GraphData>(`/graph?limit=${limit}&workspace=${encodeURIComponent(workspace)}`, { signal })
+}
+
+export interface GraphNodeSearchResult {
+  nodes: GraphNode[]
+  total_matches: number
+  query: string
+  error?: string
+}
+
+export function searchGraphNodes(
+  query: string,
+  workspace = DEFAULT_WORKSPACE,
+  signal?: AbortSignal,
+  limit = 8,
+) {
+  const params = new URLSearchParams({
+    query,
+    workspace,
+    limit: String(limit),
+  })
+  return request<GraphNodeSearchResult>(`/graph/search?${params.toString()}`, { signal })
+}
+
+export function getGraphNeighborhood(
+  entityId: string,
+  limit = 200,
+  workspace = DEFAULT_WORKSPACE,
+  signal?: AbortSignal,
+) {
+  const params = new URLSearchParams({
+    entity_id: entityId,
+    workspace,
+    limit: String(Math.max(2, limit)),
+  })
+  return request<GraphData>(`/graph/neighborhood?${params.toString()}`, { signal })
 }
 
 export interface GraphGovernanceConfig {
@@ -867,6 +959,8 @@ export interface GraphGovernanceConfig {
   allow_other_entity_type: boolean
   entity_types: string[]
   relation_types: string[]
+  entity_exclusion_rules: string[]
+  relation_exclusion_rules: string[]
   aliases_text: string
   extraction_prompt: string
   effective_extraction_prompt: string
@@ -882,6 +976,8 @@ export interface GraphRuleSummary {
   allow_other_entity_type: boolean
   entity_type_count: number
   relation_type_count: number
+  entity_exclusion_count: number
+  relation_exclusion_count: number
   extraction_prompt_preview: string
   effective_extraction_prompt_preview?: string
   updated_at: string
@@ -893,6 +989,8 @@ export interface GraphRuleTemplate {
   description: string
   entity_types: string[]
   relation_types: string[]
+  entity_exclusion_rules: string[]
+  relation_exclusion_rules: string[]
   aliases_text: string
   extraction_prompt: string
   built_in: boolean
@@ -971,6 +1069,8 @@ export function updateGraphGovernanceConfig(config: {
   allow_other_entity_type?: boolean
   entity_types: string[]
   relation_types: string[]
+  entity_exclusion_rules: string[]
+  relation_exclusion_rules: string[]
   aliases_text: string
   extraction_prompt: string
 }) {

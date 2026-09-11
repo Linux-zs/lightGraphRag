@@ -19,9 +19,9 @@ knowledge bases; never rebuild real user data as a regression test.
 - [ ] Improve evidence relevance and contextual retrieval for follow-up questions.
 - [ ] Align embedding inputs with chunk sizes; expose degradation and eliminate
   placeholder-vector success and destructive text normalization.
-- [ ] Enforce extraction schema and scope after model output; fix code-block
+- [x] Enforce extraction schema and scope after model output; fix code-block
   detection; add preview, exclusions, rejection reasons and rule version tracking.
-- [ ] Provide corpus-wide entity search, progressive graph expansion, correct
+- [x] Provide corpus-wide entity search, progressive graph expansion, correct
   edge direction/path highlighting, scalable layout and accurate subset counts.
 - [ ] Simplify navigation and separate global connections from knowledge-base
   rules; verify browser flows, loading/errors and document-to-evidence navigation.
@@ -576,3 +576,180 @@ all-label override still available. Text boxes use estimated font widths, so
 browser rendering/visual QA remains necessary; this is not a pixel-perfect
 overlap guarantee. Nine focused tests and the production build passed, including
 an 80-node hub that previously rendered 111 automatic text labels.
+
+### Graph hover stability and screen-space regression checks (2026-09-11)
+
+Hover now highlights relationships without opening the detail panel or changing
+the camera fit. Details open on selection only, preventing target movement and
+enter/leave flicker caused by changing the bottom inset during hover.
+
+Added regression tests for stable hover transforms, selection-only details,
+constant screen-space node radii and font sizes across zoom, and rejection of
+partially clipped labels at all four viewport boundaries. Full frontend: 56
+tests passed; production build and git diff --check passed. This turn did not
+complete browser visual acceptance or change/rebuild any knowledge-base data.
+
+### Graph aspect-ratio adaptation and browser checks (2026-09-11)
+
+Browser screenshots of the actual GraphView fixture revealed a tall network
+occupying only the middle of a wide canvas. Coordinates now rotate 90 degrees
+when that improves fit by more than 15%; labels remain upright, identities and
+pairwise distances are preserved, and selection/hover do not affect orientation.
+Narrow canvases retain the original orientation when rotation would not help.
+
+Verified in the browser with the 120-node/119-edge synthetic fixture: wide-screen
+layout uses horizontal space, the 390px container separates toolbar and legend
+from the graph, and selected details remain separate from the 21-node/20-edge
+neighbor view on both widths. This is component-fixture QA, not real-corpus or
+full GraphPage acceptance. Dense labels can still intersect nodes/edges; large
+hub browsing and full-corpus exploration remain follow-up work. Two orientation
+tests were added; full frontend 58 tests and production build passed.
+
+### Automatic labels avoid node bodies (2026-09-11)
+
+Automatic node and relation labels now reject positions intersecting other node
+circles plus a 2px clearance. Screen-space obstacles use a 64px spatial grid,
+avoiding a full node scan for each label. The label's own node is excluded;
+focused labels and the explicit all-label mode retain their existing override.
+No underlying graph entities or edges are removed. Tests cover both label kinds,
+cell-boundary intersections, owner exclusion, focus override, and skipped labels
+not consuming the display budget. Full frontend: 60 tests passed; build passed.
+Text extents remain estimated, and this latest change still needs browser visual
+verification. Edge crossings and representative real-corpus acceptance remain
+outstanding; this is not a claim of globally overlap-free graph rendering.
+
+### Dense force-layout instability reproduced and bounded (2026-09-11)
+
+Browser QA of the 600-node multi-hub fixture exposed outliers that compressed most
+nodes into the center during fit-to-view. A new regression reproduced a horizontal
+span of 128044 before the fix. The simulation now caps per-step velocity and cools
+that cap across iterations, preventing close-pair impulses from ejecting nodes.
+The bounded-span regression passes; full frontend 61 tests and build passed.
+Browser recheck confirms a distributed 600-node layout instead of outlier-driven
+compression. This is stability evidence, not layout-quality completion: clusters
+remain mixed, and node-obstacle rejection leaves too few labels (none in the
+dense default screenshot). Multiple candidate label positions and better dense
+graph exploration are still necessary. No real knowledge-base data was changed.
+
+### Multi-position entity labels (2026-09-11)
+
+Entity labels now try below, above, right and left in that order before hiding.
+The packer returns the chosen screen-space offset; rendering applies that same
+offset with inverse zoom, while collision checks reserve the actual chosen box.
+Focused labels try clear positions first and retain a guaranteed fallback. Manual
+all-label mode retains the standard below-node position. Relation placement and
+the shared 32-label/eight-relation budget are unchanged. Tests cover alternate
+placement around a node, collision with the relocated box, clipped alternatives,
+input immutability and one budget entry per label. Full frontend: 63 tests passed;
+production build passed. Browser verification of the 600-node case remains needed.
+
+### Active-node layering and graph entity search (2026-09-11)
+
+The active entity now renders after all other nodes so dense neighbors cannot
+cover its ring or forced label. Browser QA verified “MySQL 主库” remains readable
+when selected in a synthetic 600-node/599-edge single-hub graph, with the detail
+panel reporting all 599 relationships.
+
+GraphView now includes a local entity search across label, ID, category, type and
+description. Results rank exact/prefix name matches ahead of descriptive matches,
+then use degree and stable Chinese label ordering. Up to six suggestions display
+category and relationship count. Clicking a result or pressing Enter selects,
+highlights and centers it without removing graph data or issuing another backend
+request; repeated searches for the current entity recenter it as well. Escape
+clears the query, empty results are explicit, and narrow canvases reserve an extra
+toolbar row.
+
+Browser checks covered suggestion rendering, selecting “业务服务 / 配置项 118”,
+automatic centering/details, and the same state in a 390px container. Search and
+component tests cover ranking, multi-term matching, limits, empty/keyboard states,
+selection, centering, repeated centering and node preservation. Full frontend:
+68 tests passed after repeated-center hardening; the production build also
+passed. This remains synthetic component QA, not a
+representative real-corpus GraphPage acceptance run.
+
+### Hard extraction exclusions and rejection visibility (2026-09-11)
+
+Graph governance now accepts entity-name and relationship-category exclusion
+rules in assist, enhanced and strict modes. Plain lines are case-insensitive exact
+matches; `contains:`, `prefix:` and `suffix:` provide explicit non-regex matching.
+Rules are validated (200 rules and 200 characters per rule maximum), included in
+the frozen policy fingerprint, added to model guidance, and enforced again after
+LLM extraction but before LightRAG graph merging. Removing an entity also removes
+its connected extracted records. Relationship rules match the SDK `keywords`
+category and deliberately do not scan free-form descriptions.
+
+The rule editor, custom templates, API models and index-result summary expose the
+new fields and separate rejection counts. Old saved configs and templates receive
+empty defaults. Editing a template-backed rule now changes its displayed identity
+to “当前知识库自定义规则”; an untouched template retains its identity, and merely
+selecting a template without applying it cannot relabel the current rules. Tests
+cover all match operators, non-strict enforcement, relation
+semantics, invalid input, API persistence and template round trips. No existing
+graph is cleaned automatically; saved rules affect subsequent indexing/rebuilds.
+
+### Sampled graph extraction preview (2026-09-11)
+
+The single-document index flow now offers “预览实体关系”. It samples the centers
+of two evenly divided chunk ranges, calls the configured KG model with the current
+frozen governance rules and returns up to 200 unique entities and relationships,
+along with rule-rejection statistics and elapsed time. It shares the per-workspace
+LightRAG lock with indexing/query operations and never invokes graph merge or
+index publication. The UI states that model usage is incurred and that sampled
+counts are not full-document estimates; fast-index mode disables the action.
+
+Backend service/API tests use fake extraction and verify sampling, aggregation,
+guidance restoration and policy statistics without external model calls. Browser
+QA covered the real route/schema, disabled pre-upload state and narrow-layout
+entry/empty state without submitting a model request or changing knowledge-base
+data. Full isolated backend: 373 passed, 10 skipped. Full frontend: 73 passed;
+production build passed. A representative real-document model preview remains a
+manual acceptance step because it would consume the configured external model.
+
+### KG-only bulk record sanitation and extraction versioning (2026-09-11)
+
+Entity extraction now receives a temporary sanitized copy of each chunk. Large
+SQL/console tables, successful `mysqlcheck`-style object inventories, repeated
+schema-character-set records and obsolete object listings are removed locally;
+surrounding prose remains. Original document text and vector chunks are never
+changed. Short Markdown tables and ordinary command/config examples remain
+eligible for extraction. Recognizable console borders and inventory record
+signatures handle structures split at chunk boundaries.
+
+The actual `MySQL就地升级.md` source was replayed through the current 40-chunk
+preview without indexing or model calls. Eighteen mixed chunks were sanitized,
+159 bulk-output lines were removed, and the targeted leaked values
+`Kabul`, `Qandahar`, `columns_priv`, `actor_info` and `film_in_stock` were absent
+from the final KG input. The same source preview retains normal version strings
+such as `5.7` and `8.0`; the abnormal period/newline splits belong to the old
+persisted index and will disappear on rebuild.
+
+The policy fingerprint version is now 3 and explicitly covers KG-input
+sanitation as part of the extraction contract. Indexed graphs with an older or
+missing fingerprint are reported as stale in document management; first-time KG
+backfill remains valid for vector-only documents, while complete/partial graphs
+cannot be mixed with changed or unknown extraction policy. No existing user
+index was rebuilt during verification.
+
+### Full-corpus graph search and focused expansion (2026-09-11)
+
+The overview remains bounded for rendering performance, but its search box now
+queries all persisted GraphML nodes. Selecting a hit outside the current subset
+loads only the center entity and its highest-ranked one-hop neighbors, focuses
+the entity, shows a clear neighborhood banner and offers a return-to-overview
+action. Remote results preserve corpus-wide degree counts; stale requests abort
+when the query changes. Missing entities, absent graph storage and unreadable
+GraphML have distinct API outcomes.
+
+Service tests cover hidden-node search, bounded neighborhoods and missing
+centers. Browser QA used the real 308-node graph with a 200-node overview:
+`/usr/local/mysql8.0` was absent from the overview, found as the first exact
+full-corpus result, and opened as a 2-node/1-edge focused graph before returning
+to the overview. No graph data was modified.
+
+### Final regression checkpoint (2026-09-11)
+
+The isolated backend suite passes 382 tests with 10 environment-dependent tests
+skipped. The frontend suite passes 78 tests. The production TypeScript/Vite
+build, Python compilation and `git diff --check` also pass. Backend and frontend
+were restored through the one-click launcher after the isolated suite; health
+and service-identity checks pass on ports 8101 and 5173.
