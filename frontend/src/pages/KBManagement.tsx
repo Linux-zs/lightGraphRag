@@ -1,3 +1,4 @@
+import { ImageIndexPanel } from '../components/Multimodal'
 import { useEffect, useRef, useState } from 'react'
 import { ChevronDown, ShieldCheck, SlidersHorizontal, Trash2 } from 'lucide-react'
 import FileUpload from '../components/FileUpload'
@@ -1014,6 +1015,7 @@ export default function KBManagement({
         </p>
       </div>
 
+      <ImageIndexPanel key={`images-${workspace}`} workspace={workspace} names={docs.filter(d => /\.(pdf|docx|png|jpe?g|webp)$/i.test(d.doc_name) && (!checkedDocs.size || checkedDocs.has(d.doc_name))).map(d => d.doc_name)} />
       {/* Upload section */}
       <section className="rounded-lg border border-gray-200 bg-white p-4 sm:p-6">
         <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide mb-4">

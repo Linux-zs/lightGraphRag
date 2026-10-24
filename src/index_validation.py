@@ -74,6 +74,13 @@ def validate_index(workspace_dir: Path, manifest: dict, expected_names: list[str
     names = [item.get("doc_name") for item in documents.values()]
     if len(names) != len(set(names)) or set(names) != set(expected_names):
         raise RuntimeError("Index validation: rebuilt document set differs from requested corpus")
+    # Image-only sources belong to the corpus, but never fabricate LightRAG chunks.
+    visual_only = {key: item for key, item in documents.items() if item.get("text_index_exempt")}
+    for item in visual_only.values():
+        if (item.get("file_type") not in {"image", "pdf", "docx"} or item.get("char_count") != 0
+                or item.get("indexed") or item.get("active_index_doc_id") or item.get("chunks_list") or item.get("chunk_count")):
+            raise RuntimeError("Index validation: invalid image-only text exemption")
+    documents = {key: item for key, item in documents.items() if key not in visual_only}
     if allow_unindexed:
         # Restoring an existing generation is different from publishing a full
         # rebuild: uploaded sources need not already belong to its index.

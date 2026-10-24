@@ -371,10 +371,25 @@ class LightRAGService:
         if not compatibility["compatible"]:
             stored = compatibility.get("stored") or {}
             current = compatibility.get("current") or {}
+            fields = {
+                "base_url": "嵌入服务地址", "model": "模型", "embed_dim": "维度",
+                "embed_max_chars": "最大输入字符数", "embed_max_tokens": "最大输入 token 数",
+            }
+            missing = [label for key, label in fields.items() if key not in stored]
+            changed = [
+                f"{label}：已有 {stored[key]}，当前 {current.get(key)}"
+                for key, label in fields.items()
+                if key in stored and stored[key] != current.get(key)
+            ]
+            details = []
+            if missing:
+                details.append("历史索引未记录：" + "、".join(missing))
+            details.extend(changed)
+            if not details:
+                details.append(str(compatibility.get("reason") or "索引签名无法读取"))
             raise RuntimeError(
-                "当前嵌入模型或输入限制与已有索引不兼容，或历史签名不完整，请先重建索引。"
-                f" 已有: {stored.get('model')} / {stored.get('embed_dim')}，"
-                f"当前: {current.get('model')} / {current.get('embed_dim')}"
+                "嵌入模型或输入限制兼容性检查未通过。" + "；".join(details)
+                + "。请在系统状态中为当前知识库重建索引后重试；模型和维度相同也不能确认未记录的输入限制一致。"
             )
 
     async def cleanup_interrupted_index_docs(self) -> list[dict[str, str]]:
@@ -2427,6 +2442,7 @@ class LightRAGService:
             "file_path": doc.file_path,
             "raw_text_path": doc.metadata.get("raw_text_path", existing.get("raw_text_path", "")),
             "char_count": len(doc.raw_text),
+            "text_index_exempt": not doc.raw_text.strip() and doc.file_type in {"image", "pdf", "docx"},
             "indexed": existing.get("indexed", False),
             "status": existing.get("status", "uploaded"),
             "chunk_count": existing.get("chunk_count", 0),

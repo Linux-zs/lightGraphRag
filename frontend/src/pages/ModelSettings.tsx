@@ -1,3 +1,4 @@
+import { mmRequest } from '../components/Multimodal'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   discoverModels,
@@ -54,6 +55,8 @@ const DEFAULT_CONFIG: ModelConfig = {
 }
 
 const DEFAULT_BINDINGS: ModelBindings = {
+  multimodal_embedding: { profile_id: 'siliconflow-default', model: 'Qwen/Qwen3-VL-Embedding-8B', embed_dim: 4096, adapter: 'siliconflow_vl' },
+  vision: { profile_id: 'siliconflow-default', model: 'Qwen/Qwen3-VL-8B-Instruct' },
   chat: { profile_id: 'siliconflow-default', model: 'Qwen/Qwen2.5-7B-Instruct' },
   kg: { profile_id: 'siliconflow-default', model: 'Qwen/Qwen2.5-7B-Instruct' },
   embedding: {
@@ -374,7 +377,7 @@ export default function ModelSettings({ workspace }: Props) {
   }
 
   const testPurpose = async (purpose: keyof ModelBindings) => {
-    const binding = bindings[purpose]
+    const binding = bindings[purpose] || DEFAULT_BINDINGS[purpose]!
     if (!binding.profile_id || !binding.model) return
     const profile = profileById.get(binding.profile_id)
     if (needsSavedApiKey(profile)) {
@@ -384,7 +387,10 @@ export default function ModelSettings({ workspace }: Props) {
     setTesting(purpose)
     setMessage('')
     try {
-      if (purpose === 'chat') {
+      if (purpose === 'vision' || purpose === 'multimodal_embedding') {
+        const result = await mmRequest<{ dimension: number }>('/model-profiles/test-multimodal', { method: 'POST', body: JSON.stringify({ multimodal_embedding: bindings.multimodal_embedding || DEFAULT_BINDINGS.multimodal_embedding, vision: bindings.vision || DEFAULT_BINDINGS.vision }) })
+        setMessage(`图片、文字向量与视觉流式识别测试通过，维度 ${result.dimension}`)
+      } else if (purpose === 'chat') {
         await testChatModel(binding.profile_id, binding.model)
         setMessage('大语言模型测试通过')
       } else if (purpose === 'kg') {
@@ -406,7 +412,7 @@ export default function ModelSettings({ workspace }: Props) {
   }
 
   const renderBinding = (purpose: keyof ModelBindings, title: string, hint: string) => {
-    const binding = bindings[purpose]
+    const binding = bindings[purpose] || DEFAULT_BINDINGS[purpose]!
     const profile = profileById.get(binding.profile_id)
     const options = modelOptions(profile, binding.model)
 
@@ -458,14 +464,14 @@ export default function ModelSettings({ workspace }: Props) {
           </button>
         </div>
 
-        {purpose === 'embedding' && (
+        {(purpose === 'embedding' || purpose === 'multimodal_embedding') && (
           <div className="mt-3 grid grid-cols-2 gap-3">
             <label className="text-xs text-gray-500">
               向量维度
               <input
                 type="number"
                 value={binding.embed_dim || 1024}
-                onChange={(e) => updateBinding('embedding', { embed_dim: Number(e.target.value) })}
+                onChange={(e) => updateBinding(purpose, { embed_dim: Number(e.target.value) })}
                 className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
               />
             </label>
@@ -615,6 +621,8 @@ export default function ModelSettings({ workspace }: Props) {
         </section>
 
         <section className="space-y-4">
+          {renderBinding('multimodal_embedding', '图片嵌入模型', '首版使用 SiliconFlow VL 接口。更换模型或维度后须重建全部图片索引。')}
+          {renderBinding('vision', '视觉模型', '用于图片文字识别、描述和图文问答；测试同时验证图片嵌入能力。')}
           {renderBinding('chat', '大语言模型', '用于问答生成、图谱修正建议和 LightRAG 查询。')}
           {renderBinding('kg', 'KG 抽取模型', '用于文档索引时抽取实体和关系；可选择更快或更适合 JSON 抽取的模型。')}
           {renderBinding('embedding', '嵌入模型', '用于索引和检索向量。模型或维度变化后需要重建索引。')}

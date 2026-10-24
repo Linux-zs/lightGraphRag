@@ -14,6 +14,7 @@ from src.doc_processor.parsers.md_parser import MdParser
 from src.doc_processor.parsers.html_parser import HtmlParser
 from src.doc_processor.parsers.txt_parser import TxtParser
 from src.exceptions import DocProcessError
+from src.doc_processor.parsers.image_parser import ImageParser
 
 
 class DocumentLoader:
@@ -21,6 +22,7 @@ class DocumentLoader:
 
     def __init__(self) -> None:
         self._parsers: list[BaseParser] = [
+            ImageParser(),
             DocxParser(),
             PdfParser(),
             MdParser(),

@@ -1,5 +1,6 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { useState } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import QAChat from './QAChat'
 import { ConfirmProvider } from '../components/ConfirmDialog'
@@ -100,6 +101,52 @@ function renderChat(props: Partial<React.ComponentProps<typeof QAChat>> = {}) {
 describe('QAChat async state', () => {
   afterEach(cleanup)
 
+  it('keeps the new conversation stream alive when adopting its server ID', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>
+    const encoder = new TextEncoder()
+    vi.mocked(api.chatSendStream).mockResolvedValue(new Response(new ReadableStream({ start(c) { controller = c } })))
+    function NewChat() {
+      const [id, setId] = useState<string | null>(null)
+      return <ConfirmProvider><QAChat workspace="old" workspaces={workspaces} onWorkspaceChange={vi.fn()} sessions={[]} activeId={id} setActiveId={setId} reloadSessions={async () => {}} /></ConfirmProvider>
+    }
+    render(<NewChat />)
+    await userEvent.type(screen.getByPlaceholderText('输入问题，按 Enter 发送'), 'question{enter}')
+    controller.enqueue(encoder.encode('event: session\ndata: {"session_id":"created"}\n\n'))
+    await waitFor(() => expect(screen.getByRole('heading', { name: '对话' })).toBeInTheDocument())
+    const calls = vi.mocked(api.chatSendStream).mock.calls
+    expect(calls[calls.length - 1][1]?.aborted).toBe(false)
+    controller.enqueue(encoder.encode('data: {"token":"still streaming"}\n\n'))
+    expect(await screen.findByText('still streaming')).toBeInTheDocument()
+    controller.close()
+  })
+
+  it('restores a running server turn and refreshes it after completion', async () => {
+    const saved = session('pending', 'old', '正在检索知识库…')
+    vi.mocked(api.getChatSession).mockResolvedValueOnce({
+      ...saved, messages: [{ ...saved.messages[0], generation_status: 'running' }],
+    }).mockResolvedValue({ ...saved, messages: [{ ...saved.messages[0], content: '后台回答已完成', generation_status: 'complete' }] })
+    renderChat({ activeId: 'pending' })
+    expect(await screen.findByText('正在检索知识库…')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '发送' })).toBeDisabled()
+    expect(await screen.findByText('后台回答已完成', {}, { timeout: 4500 })).toBeInTheDocument()
+    expect(screen.getByPlaceholderText('输入问题，按 Enter 发送')).not.toBeDisabled()
+  })
+
+  it('preserves the visible answer when a background refresh fails', async () => {
+    const saved = session('pending-refresh', 'old', '已保存的部分回答')
+    vi.mocked(api.getChatSession).mockResolvedValueOnce({
+      ...saved, messages: [{ ...saved.messages[0], generation_status: 'running' }],
+    }).mockRejectedValueOnce(new Error('offline'))
+    renderChat({ activeId: saved.id })
+    expect(await screen.findByText('已保存的部分回答')).toBeInTheDocument()
+    expect(await screen.findByRole('alert', {}, { timeout: 4500 })).toHaveTextContent('对话同步失败')
+    expect(screen.getByText('已保存的部分回答')).toBeInTheDocument()
+    expect(screen.queryByText('加载对话历史...')).not.toBeInTheDocument()
+    vi.mocked(api.getChatSession).mockResolvedValue({ ...saved, messages: [{ ...saved.messages[0], content: '同步完成', generation_status: 'complete' }] })
+    await userEvent.click(screen.getByRole('button', { name: '重试同步' }))
+    expect(await screen.findByText('同步完成')).toBeInTheDocument()
+  })
+
   it('shows verified source pages and does not reopen a closed citation on late response', async () => {
     const saved = session('cited', 'old', 'answer')
     vi.mocked(api.getChatSession).mockResolvedValue({ ...saved, messages: [{
@@ -131,6 +178,7 @@ describe('QAChat async state', () => {
   })
 
   beforeEach(() => {
+    vi.clearAllMocks()
     vi.mocked(api.listModelProfiles).mockResolvedValue([])
     vi.mocked(api.getModelBindings).mockResolvedValue({
       chat: { profile_id: 'default', model: 'model' },

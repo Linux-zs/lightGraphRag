@@ -682,6 +682,7 @@ export interface DiscoveredModel {
 }
 
 export interface ModelBinding {
+  adapter?: string
   profile_id: string
   model: string
   embed_dim?: number
@@ -690,6 +691,8 @@ export interface ModelBinding {
 }
 
 export interface ModelBindings {
+  multimodal_embedding?: ModelBinding
+  vision?: ModelBinding
   chat: ModelBinding
   kg: ModelBinding
   embedding: ModelBinding
@@ -1283,6 +1286,8 @@ export interface EvidenceChain {
 // --- Chat ---
 
 export interface ChatMessage {
+  generation_status?: string | null
+  image_id?: string | null
   role: 'user' | 'assistant'
   content: string
   timestamp: string
@@ -1306,6 +1311,10 @@ export interface ChatSettings {
 }
 
 export interface Citation {
+  content_type?: string
+  image_id?: string | null
+  doc_id?: string
+  location?: Record<string, unknown>
   index: number
   doc_name: string
   chunk_index: number
@@ -1342,6 +1351,7 @@ export interface ChatSessionListItem {
 }
 
 export function chatSend(params: {
+  image_id?: string | null
   session_id?: string | null
   workspace?: string
   message: string
@@ -1359,6 +1369,7 @@ export function chatSend(params: {
 
 /** Stream chat response via SSE. Returns a ReadableStream of SSE events. */
 export function chatSendStream(params: {
+  image_id?: string | null
   session_id?: string | null
   workspace?: string
   message: string

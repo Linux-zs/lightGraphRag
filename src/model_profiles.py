@@ -240,6 +240,16 @@ def _default_store(config: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "profiles": [profile],
         "bindings": {
+            "multimodal_embedding": {
+                "profile_id": DEFAULT_PROFILE_ID,
+                "model": "Qwen/Qwen3-VL-Embedding-8B",
+                "embed_dim": 4096,
+                "adapter": "siliconflow_vl",
+            },
+            "vision": {
+                "profile_id": DEFAULT_PROFILE_ID,
+                "model": "Qwen/Qwen3-VL-8B-Instruct",
+            },
             "chat": {
                 "profile_id": DEFAULT_PROFILE_ID,
                 "model": sf.get("chat_model", "Qwen/Qwen2.5-7B-Instruct"),
@@ -350,7 +360,7 @@ def get_bindings(config: dict[str, Any] | None = None) -> dict[str, Any]:
 def save_bindings(bindings: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
     store = _load_store(config)
     current = store["bindings"]
-    for purpose in ("chat", "kg", "embedding", "rerank"):
+    for purpose in ("chat", "kg", "embedding", "rerank", "multimodal_embedding", "vision"):
         if purpose in bindings and isinstance(bindings[purpose], dict):
             current[purpose] = {**current.get(purpose, {}), **bindings[purpose]}
     store["bindings"] = current
@@ -445,6 +455,8 @@ def get_runtime_model_config(config: dict[str, Any] | None = None) -> dict[str, 
     embedding = resolve("embedding")
     rerank = resolve("rerank")
     return {
+        **{purpose: {**resolve(purpose), "base_url": resolve(purpose).get("api_base", DEFAULT_BASE_URL)}
+           for purpose in ("multimodal_embedding", "vision")},
         "chat": {
             "profile_id": chat.get("profile_id") or chat.get("id", DEFAULT_PROFILE_ID),
             "base_url": chat.get("api_base", DEFAULT_BASE_URL),

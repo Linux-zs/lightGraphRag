@@ -7,7 +7,7 @@ interface Props {
   uploading?: boolean
 }
 
-const ACCEPT_TYPES = '.txt,.md,.pdf,.docx'
+const ACCEPT_TYPES = '.txt,.md,.pdf,.docx,.jpg,.jpeg,.png,.webp'
 
 export default function FileUpload({ onUpload, onMultiUpload, accept = ACCEPT_TYPES, uploading }: Props) {
   const inputRef = useRef<HTMLInputElement>(null)
@@ -69,7 +69,7 @@ export default function FileUpload({ onUpload, onMultiUpload, accept = ACCEPT_TY
               点击或拖拽文件到此处上传（支持多选）
             </p>
             <p className="text-xs text-gray-400 mt-1">
-              支持 TXT, MD, PDF, DOCX，可一次选择多个文件
+              支持 TXT、MD、PDF、DOCX、JPEG、PNG、WebP，可多选
             </p>
           </>
         )}

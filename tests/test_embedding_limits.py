@@ -46,6 +46,11 @@ def test_unknown_historical_input_limits_are_not_silently_claimed_compatible(ser
         instance.embedding_meta_path.write_text(json.dumps(payload), encoding='utf-8')
     before = instance.embedding_meta_path.read_bytes() if legacy_metadata else None
     assert not instance.embedding_compatibility(initialize_legacy=True)['compatible']
+    with pytest.raises(RuntimeError) as error:
+        instance.assert_embedding_compatible()
+    assert '历史索引未记录' in str(error.value)
+    assert '最大输入字符数' in str(error.value)
+    assert '最大输入 token 数' in str(error.value)
     after = instance.embedding_meta_path.read_bytes() if instance.embedding_meta_path.exists() else None
     assert before == after
 

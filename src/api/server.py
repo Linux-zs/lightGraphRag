@@ -24,6 +24,7 @@ import uvicorn
 import yaml
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
@@ -85,10 +86,13 @@ async def _app_lifespan(_: FastAPI):
             migration["unassigned"],
         )
     renamed_sessions = _backfill_legacy_session_titles()
+    _recover_interrupted_chat_turns()
     if renamed_sessions:
         logger.info("Backfilled {} legacy chat session titles", renamed_sessions)
     try:
         await _resume_persisted_index_tasks()
+        from src.multimodal.api import cleanup_loop
+        _spawn_background(cleanup_loop(_multimodal_server))
         yield
     finally:
         tasks = list(_background_tasks)
@@ -120,6 +124,22 @@ app.add_middleware(
 
 APP_API_TOKEN = os.environ.get("LIGHTGRAPHRAG_APP_API_TOKEN", "").strip()
 _background_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _recover_interrupted_chat_turns() -> None:
+    for path in SESSIONS_DIR.glob("*.json"):
+        if not _SESSION_ID_RE.fullmatch(path.stem):
+            continue
+        session = _load_session(path.stem)
+        if not session:
+            continue
+        changed = False
+        for message in session.get("messages", []):
+            if message.get("generation_status") == "running":
+                message.update(generation_status="failed", content="服务重启，本次回答已中断，请重新提问。")
+                changed = True
+        if changed:
+            _save_session(path.stem, session)
 
 
 def _spawn_background(coro: Any) -> asyncio.Task[Any]:
@@ -193,7 +213,7 @@ async def _http_exception_handler(request: Request, exc: HTTPException):
 async def _validation_exception_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(
         status_code=422,
-        content=_error_payload(request, "VALIDATION_ERROR", exc.errors()),
+        content=_error_payload(request, "VALIDATION_ERROR", jsonable_encoder(exc.errors(), custom_encoder={ValueError: str})),
     )
 
 
@@ -1012,7 +1032,12 @@ class EmbeddingBinding(ModelBindingBase):
 class RerankBinding(ModelBindingBase):
     enabled: bool = True
 
+class MultimodalEmbeddingBinding(EmbeddingBinding):
+    adapter: Literal["siliconflow_vl"] = "siliconflow_vl"
+
 class ModelBindingsPayload(BaseModel):
+    multimodal_embedding: MultimodalEmbeddingBinding | None = None
+    vision: ModelBindingBase | None = None
     chat: ModelBindingBase
     kg: ModelBindingBase
     embedding: EmbeddingBinding
@@ -1032,6 +1057,8 @@ class SearchRequest(BaseModel):
 # --- Chat Models ---
 
 class ChatMessage(BaseModel):
+    generation_status: str | None = None
+    image_id: str | None = None
     role: str  # "user" | "assistant"
     content: str
     timestamp: str = ""
@@ -1055,9 +1082,16 @@ class ChatSettings(BaseModel):
 
 
 class ChatSendRequest(BaseModel):
+    image_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     session_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{12}$")
     workspace: WorkspaceName = DEFAULT_WORKSPACE
-    message: str = Field(min_length=1, max_length=20000)
+    message: str = Field(default="", max_length=20000)
+
+    @model_validator(mode="after")
+    def require_content(self):
+        if not self.message.strip() and not self.image_id:
+            raise ValueError("请输入文字或上传图片")
+        return self
     mode: str = Field(default="mix", pattern=r"^(mix|hybrid|local|global|naive)$")
     top_k: int = Field(default=40, ge=1, le=100)
     chunk_top_k: int = Field(default=20, ge=1, le=100)
@@ -1065,6 +1099,11 @@ class ChatSendRequest(BaseModel):
     settings: Optional[ChatSettings] = None
 
 class Citation(BaseModel):
+    content_type: str = "text"
+    image_id: str | None = None
+    doc_id: str = ""
+    location: dict = Field(default_factory=dict)
+    sources: list[dict] = Field(default_factory=list)
     index: int
     doc_name: str
     chunk_index: int
@@ -2608,7 +2647,7 @@ async def _create_index_task(
     policy_service = get_lightrag_service(workspace)
     policy_config = deepcopy(policy_service.load_graph_governance())
     from src.extraction_policy import validate_extraction_policy
-    if (request_config or {}).get("index_mode") != "fast":
+    if kind != "images" and (request_config or {}).get("index_mode") != "fast":
         try:
             validate_extraction_policy(policy_config)
         except ValueError as exc:
@@ -3195,6 +3234,15 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                         stage_timings=stage_timings,
                     )
 
+                    if not doc.raw_text.strip() and Path(doc.file_path).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".pdf", ".docx"}:
+                        item = service.register_upload(doc)
+                        if initial_task.get("kind") != "rebuild":
+                            from src.multimodal.api import provider as image_provider
+                            await _image_store(workspace).index(item["doc_id"], doc_name, Path(doc.file_path), image_provider(_multimodal_server),
+                                cancelled=lambda: _index_tasks[task_id].get("cancel_requested", False))
+                        results.append({"doc_name": doc_name, "doc_id": item["doc_id"], "status": "ok", "chunks": 0, "image_only": True})
+                        await _update_index_task(task_id, current=idx+1, results=results, errors=errors)
+                        continue
                     if not doc.raw_text.strip():
                         raise ValueError("Document text is empty")
 
@@ -3277,6 +3325,14 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
                         ),
                         "stage_timings": stage_timings,
                     }
+                    if initial_task.get("kind") != "rebuild" and Path(doc.file_path).suffix.lower() in {".pdf", ".docx"}:
+                        from src.multimodal.api import provider as image_provider
+                        try:
+                            result["image_index"] = await _image_store(workspace).index(item["doc_id"], doc_name, Path(doc.file_path), image_provider(_multimodal_server),
+                                cancelled=lambda: _index_tasks[task_id].get("cancel_requested", False))
+                        except Exception as exc:
+                            result["image_index"] = {"status": "partial", "error": str(exc)}
+                            errors.append({"doc_name": doc_name, "error": f"文本索引成功，图片索引未发布：{exc}"})
                     results.append(result)
                     logger.info("Indexed '{}' into LightRAG as {}", doc_name, item["doc_id"])
                 except asyncio.TimeoutError:
@@ -3376,6 +3432,8 @@ async def _run_index_task(task_id: str, req: IndexRequest | BatchIndexRequest) -
             graph_replay=graph_replay,
             phase="done",
         )
+    except asyncio.CancelledError:
+        await _update_index_task(task_id, status="cancelled", phase="done", message="索引已取消", results=results, errors=errors)
     except Exception as exc:
         logger.exception("Index task crashed: {}", task_id)
         await _update_index_task(
@@ -3620,6 +3678,11 @@ async def delete_workspace(workspace: str):
         service.manifest_path.unlink()
     removed_uploads = _remove_workspace_sources(workspace)
     metadata = await _remove_workspace_metadata(workspace, service)
+    image_root = _image_store(workspace).root.resolve()
+    expected_root = (Path(get_config()["paths"]["data_dir"]) / "multimodal").resolve()
+    if image_root.parent != expected_root:
+        raise RuntimeError("Invalid image workspace path")
+    shutil.rmtree(image_root)
     await reset_lightrag_service_async(workspace)
     return {"deleted": workspace, "removed_uploads": removed_uploads, **metadata, **result}
 
@@ -3654,7 +3717,7 @@ async def upload_document(file: UploadFile = File(...), workspace: WorkspaceName
         await _stream_upload_to_file(
             file,
             temp_path,
-            max_bytes=DOCUMENT_UPLOAD_MAX_BYTES,
+            max_bytes=min(DOCUMENT_UPLOAD_MAX_BYTES, 20 * 1024 * 1024) if ext in {".jpg", ".jpeg", ".png", ".webp"} else DOCUMENT_UPLOAD_MAX_BYTES,
         )
         content_changed = not dest.is_file() or not filecmp.cmp(
             temp_path,
@@ -3687,6 +3750,8 @@ async def upload_document(file: UploadFile = File(...), workspace: WorkspaceName
                 None,
             )
             os.replace(temp_path, dest)
+            if existing_item is not None and content_changed:
+                _image_store(workspace).invalidate(existing_item["doc_id"])
             item = service.register_upload(doc)
             raw_text_path = _resolve_raw_text_path(workspace, item["doc_id"], create_dir=True)
             _atomic_write_text(raw_text_path, doc.raw_text)
@@ -3710,7 +3775,7 @@ async def upload_document(file: UploadFile = File(...), workspace: WorkspaceName
         raise
     except Exception as e:
         logger.exception("Upload failed for {} in {}", safe_name, workspace)
-        raise HTTPException(500, f"Upload failed: {e}")
+        raise HTTPException(400 if ext in {".jpg", ".jpeg", ".png", ".webp"} else 500, f"Upload failed: {e}")
     finally:
         try:
             Path(temp_name).unlink(missing_ok=True)
@@ -3800,6 +3865,11 @@ async def index_document(req: IndexRequest):
         raise HTTPException(400, str(exc))
     req.workspace = sanitize_workspace(req.workspace)
     _ensure_workspace_available(req.workspace)
+    if Path(req.file_name).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+        from src.multimodal.api import index_task, ImageIndexRequest
+        task = await _create_index_task("images", [req.file_name], req.workspace, {})
+        _spawn_background(index_task(_multimodal_server, task["task_id"], ImageIndexRequest(workspace=req.workspace, doc_names=[req.file_name])))
+        return _public_index_task(task)
     _ensure_embedding_compatible(req.workspace)
     manifest = get_lightrag_service(req.workspace)._load_manifest()
     registered = any(
@@ -3838,6 +3908,7 @@ async def delete_document(doc_name: str, workspace: WorkspaceName = Query(DEFAUL
         service = get_lightrag_service(workspace)
         try:
             result = await service.delete_document(doc_name)
+            _image_store(workspace).remove_document(result["doc_id"])
         except KeyError:
             raise HTTPException(404, f"Document '{doc_name}' not found")
         except Exception as e:
@@ -3928,6 +3999,7 @@ async def batch_delete(req: BatchDeleteRequest):
         for doc_name in req.doc_names:
             try:
                 result = await service.delete_document(doc_name)
+                _image_store(req.workspace).remove_document(result["doc_id"])
                 _uploaded_files.pop(_cache_key(req.workspace, result["doc_name"]), None)
                 _chunk_cache.pop(_cache_key(req.workspace, result["doc_name"]), None)
                 for source_path in (
@@ -4069,6 +4141,7 @@ async def clear_knowledge_base(req: ClearKnowledgeBaseRequest):
     async with _get_workspace_rag_lock(req.workspace):
         service = get_lightrag_service(req.workspace)
         result = await service.clear_workspace()
+        _image_store(req.workspace).clear()
         await reset_lightrag_service_async(req.workspace)
         _clear_workspace_cache(req.workspace)
 
@@ -4283,6 +4356,10 @@ async def _resume_persisted_index_tasks() -> None:
                 errors=[],
                 message="服务重启后恢复索引任务",
             )
+            if task.get("kind") == "images":
+                from src.multimodal.api import index_task, ImageIndexRequest
+                _spawn_background(index_task(_multimodal_server, task_id, ImageIndexRequest(workspace=workspace, doc_names=doc_names)))
+                continue
             if task.get("kind") == "kg_backfill":
                 backfill_req = GraphBackfillRequest(
                     workspace=workspace,
@@ -4846,7 +4923,7 @@ async def api_update_model_bindings(req: ModelBindingsUpdate):
     _ensure_model_config_mutable()
     old_runtime = get_runtime_model_config(get_config())
     _record_existing_embedding_signatures()
-    payload = req.bindings.model_dump()
+    payload = req.bindings.model_dump(exclude_none=True)
     known_profiles = {item["id"] for item in list_profiles(get_config())}
     missing = sorted(
         {
@@ -5405,6 +5482,7 @@ async def delete_chat_session(
             if not session or session.get("workspace") != sanitize_workspace(workspace):
                 raise HTTPException(404, "Session not found in current workspace")
             path.unlink(missing_ok=True)
+            _image_store(workspace).expire_attachments(session_id)
             logger.info(f"Deleted chat session: {session_id}")
     _session_locks.pop(session_id, None)
     _session_turn_locks.pop(session_id, None)
@@ -5831,6 +5909,9 @@ async def chat_send(req: ChatSendRequest):
         sid, _session = _ensure_session(None, req.message, req.workspace)
         req.session_id = sid
     async with _session_turn(req.session_id):
+        if _use_multimodal(req):
+            from src.multimodal.api import chat
+            return await chat(_multimodal_server, req)
         return await _chat_send_impl(req)
 
 
@@ -5841,6 +5922,9 @@ async def chat_send_stream(req: ChatSendRequest):
         req.session_id = sid
     lock = await _acquire_session_turn_lock(req.session_id)
     try:
+        if _use_multimodal(req):
+            from src.multimodal.api import chat
+            return await chat(_multimodal_server, req, lock)
         return await _chat_send_stream_impl(req, lock)
     except HTTPException as exc:
         _release_session_turn_lock(req.session_id, lock)
@@ -6276,6 +6360,21 @@ async def merge_graph_entities(req: GraphEntityMergeRequest):
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "service": "lightgraphrag-workbench"}
+
+
+from src.multimodal.api import install as _install_multimodal, store as _mm_store
+
+
+def _image_store(workspace):
+    return _mm_store(_multimodal_server, workspace)
+
+
+def _use_multimodal(req):
+    root = Path(get_config()["paths"]["data_dir"]) / "multimodal" / sanitize_workspace(req.workspace)
+    return bool(req.image_id) or ((root / "images.sqlite").exists() and bool(_image_store(req.workspace).occurrences()))
+
+
+_multimodal_server = _install_multimodal(app, globals())
 
 
 def main():

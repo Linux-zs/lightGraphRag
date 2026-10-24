@@ -1,3 +1,5 @@
+import { ImageInput, StoredImage } from '../components/Multimodal'
+import { AnswerImageFigure, AnswerImagesContext, inlineAnswerImages } from '../components/AnswerImages'
 import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   Check,
@@ -171,7 +173,7 @@ function normalizeCitations(citations: Citation[] | undefined): Citation[] {
   return citations
     .filter((citation) => citation && typeof citation.index === 'number')
     .filter((citation) => {
-      const key = `${citation.doc_name}|${citation.chunk_index}|${citation.excerpt}`
+      const key = `${citation.doc_name}|${citation.chunk_index}|${citation.image_id || ""}|${citation.excerpt}`
       if (seen.has(key)) return false
       seen.add(key)
       return true
@@ -213,16 +215,21 @@ export default function QAChat({
   const [citationsByIndex, setCitationsByIndex] = useState<CitationMap>(new Map())
   const [evidenceByIndex, setEvidenceByIndex] = useState<EvidenceMap>(new Map())
   const [input, setInput] = useState('')
+  const [queryImage, setQueryImage] = useState<string | null>(null)
+  useEffect(() => { setQueryImage(null) }, [workspace, activeId])
   const [sending, setSending] = useState(false)
   const [generationStatus, setGenerationStatus] = useState('')
   const [loadingSession, setLoadingSession] = useState(false)
+  const [sessionError, setSessionError] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const streamingRef = useRef(false)
   const streamAbortRef = useRef<AbortController | null>(null)
+  const pendingServerTurnRef = useRef(false)
   const sessionAbortRef = useRef<AbortController | null>(null)
   const sessionRequestRef = useRef(0)
   const sendRequestRef = useRef(0)
+  const adoptedSessionRef = useRef<{ id: string; workspace: string } | null>(null)
   const [copiedMsgIndex, setCopiedMsgIndex] = useState<number | null>(null)
 
   /** Tracks which citation is currently highlighted (after clicking a superscript). */
@@ -280,17 +287,21 @@ export default function QAChat({
     setExpandedEvidence(new Set())
   }, [])
 
-  const loadActiveSession = useCallback(async (id: string) => {
+  const loadActiveSession = useCallback(async (id: string, background = false) => {
+    if (background && sessionAbortRef.current && !sessionAbortRef.current.signal.aborted) return
     sessionAbortRef.current?.abort()
     const controller = new AbortController()
     sessionAbortRef.current = controller
     const requestId = ++sessionRequestRef.current
-    setLoadingSession(true)
+    if (!background) { setLoadingSession(true); setSessionError('') }
     try {
       const data = await getChatSession(id, workspace, controller.signal)
       if (requestId !== sessionRequestRef.current || controller.signal.aborted) return
+      setSessionError('')
       setMessages(data.messages)
-      setChatSettings(getUnsavedDraft(workspace, id) || data.settings || DEFAULT_CHAT_SETTINGS)
+      pendingServerTurnRef.current = data.messages.some(msg => msg.generation_status === 'running')
+      if (!streamingRef.current) setSending(pendingServerTurnRef.current)
+      if (!background) setChatSettings(getUnsavedDraft(workspace, id) || data.settings || DEFAULT_CHAT_SETTINGS)
       const restoredCitations: CitationMap = new Map()
       const restoredEvidence: EvidenceMap = new Map()
       data.messages.forEach((msg, idx) => {
@@ -303,14 +314,20 @@ export default function QAChat({
       })
       setCitationsByIndex(restoredCitations)
       setEvidenceByIndex(restoredEvidence)
-      setHighlightedCitation(null)
-      setExpandedCitations(new Set())
-      setExpandedEvidence(new Set())
+      if (!background) {
+        setHighlightedCitation(null)
+        setExpandedCitations(new Set())
+        setExpandedEvidence(new Set())
+      }
     } catch {
       if (controller.signal.aborted) return
-      setMessages([])
+      setSessionError('对话同步失败，请重试。已显示的内容会保留。')
+      // Keep the last saved answer visible during transient refresh failures.
     } finally {
-      if (requestId === sessionRequestRef.current) setLoadingSession(false)
+      if (requestId === sessionRequestRef.current) {
+        sessionAbortRef.current = null
+        if (!background) setLoadingSession(false)
+      }
     }
   }, [workspace, getUnsavedDraft])
 
@@ -350,8 +367,20 @@ export default function QAChat({
   }, [workspace, activeId])
 
   useEffect(() => {
+    if (adoptedSessionRef.current?.id === activeId && adoptedSessionRef.current.workspace === workspace && streamingRef.current) {
+      adoptedSessionRef.current = null
+      return
+    }
+    adoptedSessionRef.current = null
     streamAbortRef.current?.abort()
+    ++sendRequestRef.current
+    streamingRef.current = false
+    pendingServerTurnRef.current = false
+    setSending(false)
+    setGenerationStatus('')
+    setSessionError('')
     if (activeId) {
+      resetConversationState()
       loadActiveSession(activeId)
     } else {
       resetConversationState()
@@ -359,9 +388,22 @@ export default function QAChat({
     }
     return () => {
       sessionAbortRef.current?.abort()
-      streamAbortRef.current?.abort()
     }
   }, [activeId, loadActiveSession, resetConversationState])
+
+  useEffect(() => () => {
+    streamAbortRef.current?.abort()
+    sessionAbortRef.current?.abort()
+  }, [])
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (activeId && pendingServerTurnRef.current && !streamingRef.current) {
+        void loadActiveSession(activeId, true)
+      }
+    }, 3000)
+    return () => clearInterval(timer)
+  }, [activeId, loadActiveSession])
 
   const updateSettings = useCallback((patch: Partial<ChatSettings>) => {
     if (loadingSession || sending) return
@@ -476,7 +518,9 @@ export default function QAChat({
 
   const handleSend = async () => {
     const text = input.trim()
-    if (!text || sending || loadingSession) return
+    if ((!text && !queryImage) || sending || loadingSession) return
+    const sentImage = queryImage
+    setQueryImage(null)
     setInput('')
     setSending(true)
     setGenerationStatus('')
@@ -487,7 +531,7 @@ export default function QAChat({
     const sendRequestId = ++sendRequestRef.current
 
     const now = new Date().toISOString()
-    const userMsg: ChatMessage = { role: 'user', content: text, timestamp: now }
+    const userMsg: ChatMessage = { role: 'user', content: text || '检索相关资料并说明', timestamp: now, image_id: sentImage }
     // Placeholder assistant message (will be updated with streamed content)
     const asstIdx = messages.length + 1
     setMessages((prev) => [...prev, userMsg, { role: 'assistant', content: '...', timestamp: now }])
@@ -506,6 +550,7 @@ export default function QAChat({
         session_id: activeId,
         workspace,
         message: text,
+        image_id: sentImage,
         settings: chatSettings,
       }, controller.signal)
 
@@ -522,6 +567,7 @@ export default function QAChat({
 
       while (true) {
         const { done, value } = await reader.read()
+        if (controller.signal.aborted || sendRequestId !== sendRequestRef.current) return
         if (done) break
         buffer += decoder.decode(value, { stream: true })
 
@@ -552,7 +598,14 @@ export default function QAChat({
           try {
             const data = JSON.parse(dataLines.join('\n'))
 
-            if (eventType === 'citations') {
+            if (eventType === 'session') {
+              sessionIdFromStream = data.session_id
+              void reloadSessions()
+              if (!activeId && data.session_id) {
+                adoptedSessionRef.current = { id: data.session_id, workspace }
+                setActiveId(data.session_id)
+              }
+            } else if (eventType === 'citations') {
               const cites = normalizeCitations(Array.isArray(data) ? data : (data.citations || []))
               const rawEvidence = Array.isArray(data) ? null : data.evidence
               const evidence: EvidenceChain = {
@@ -671,6 +724,7 @@ export default function QAChat({
    */
   const renderCitations = (msgIndex: number) => {
     const cites = normalizeCitations(citationsByIndex.get(msgIndex))
+    if (messages[msgIndex]?.generation_status === 'running' && cites.length === 0) return null
 
     // Historical messages (loaded from server) don't carry citation data
     if (!citationsByIndex.has(msgIndex)) return null
@@ -733,14 +787,17 @@ export default function QAChat({
                       {num}
                     </span>
                     <button
-                      onClick={() => handleDocNameClick(c.doc_name, c.chunk_index, c.chunk_id, c.excerpt)}
+                      disabled={Boolean(c.image_id)}
+                      onClick={() => { if (!c.image_id) void handleDocNameClick(c.doc_name, c.chunk_index, c.chunk_id, c.excerpt) }}
                       className="text-gray-700 font-medium truncate hover:text-primary-600 hover:underline cursor-pointer text-left"
                       title={`点击查看 ${c.doc_name} #${c.chunk_index} 的完整文本`}
                     >
                       {c.doc_name}
                     </button>
-                    <span className="text-gray-400 shrink-0">#{c.chunk_index}</span>
+                    <span className="text-gray-400 shrink-0">{c.image_id ? '图片' : `#${c.chunk_index}`}</span>
                   </div>
+                  {c.image_id && <StoredImage path={`/kb/images/${c.image_id}?workspace=${encodeURIComponent(workspace)}&doc_id=${encodeURIComponent(c.doc_id || '')}`} alt={c.doc_name} />}
+                  {c.location && <p className="text-xs text-gray-500">{c.location.page ? `第 ${c.location.page} 页` : c.location.paragraph ? `段落 ${c.location.paragraph}` : ''}</p>}
                   <p className="text-gray-600 leading-relaxed line-clamp-3">{c.excerpt}</p>
                 </div>
               )
@@ -1042,13 +1099,14 @@ export default function QAChat({
   )
 
   const isStreamingMsg = (msg: ChatMessage, i: number) =>
-    msg.role === 'assistant' && streamingRef.current && i === messages.length - 1
+    msg.role === 'assistant' && (msg.generation_status === 'running' || (streamingRef.current && i === messages.length - 1))
 
   /**
    * Render an assistant message's markdown content with [数字] citation
    * markers converted to clickable superscripts.
    */
   const renderAssistantContent = (content: string, msgIndex: number) => {
+    const imageCitations = normalizeCitations(citationsByIndex.get(msgIndex))
     const onCiteClick = (num: number) => handleCitationClick(msgIndex, num)
     const isCiteHighlighted = (num: number) =>
       highlightedCitation?.msgIndex === msgIndex &&
@@ -1061,10 +1119,14 @@ export default function QAChat({
       processChildren(children, onCiteClick, isCiteHighlighted, validCitationNumbers)
 
     return (
+      <AnswerImagesContext.Provider value={{ workspace, citations: imageCitations }}>
       <div className="prose prose-sm max-w-none prose-headings:text-gray-800 prose-p:text-gray-700 prose-code:text-primary-700 prose-code:bg-gray-200 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-xs prose-pre:bg-gray-800 prose-pre:text-gray-100 prose-a:text-primary-600 prose-strong:text-gray-800 prose-li:text-gray-700">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
+          rehypePlugins={[inlineAnswerImages(imageCitations)]}
           components={{
+            figure: AnswerImageFigure,
+            img: () => null,
             p: ({ children }) => <p>{process(children)}</p>,
             li: ({ children }) => <li>{process(children)}</li>,
             h1: ({ children }) => <h1>{process(children)}</h1>,
@@ -1082,6 +1144,7 @@ export default function QAChat({
           {content}
         </ReactMarkdown>
       </div>
+      </AnswerImagesContext.Provider>
     )
   }
 
@@ -1097,6 +1160,7 @@ export default function QAChat({
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-3 py-4 sm:px-4 sm:py-6">
+          {sessionError && <div role="alert" className="mb-3 text-sm text-amber-700">{sessionError} <button className="underline" onClick={() => activeId && void loadActiveSession(activeId, messages.length > 0)}>重试同步</button></div>}
           {loadingSession ? (
             <div className="flex items-center justify-center py-12 text-gray-400">
               <div className="animate-spin w-5 h-5 border-2 border-primary-500 border-t-transparent rounded-full mr-2" />
@@ -1122,7 +1186,7 @@ export default function QAChat({
                     : 'w-full text-gray-900'
                 }`}>
                   {msg.role === 'user' ? (
-                    <p className="text-sm whitespace-pre-wrap leading-relaxed">{msg.content}</p>
+                    <div>{msg.image_id && <StoredImage path={`/images/attachments/${msg.image_id}?workspace=${encodeURIComponent(workspace)}${activeId ? `&session_id=${activeId}` : ''}`} alt="用户查询附件" />}<p className="text-sm whitespace-pre-wrap leading-relaxed">{msg.content}</p></div>
                   ) : (
                     isStreamingMsg(msg, i) && msg.content === '...' ? (
                       <div className="prose prose-sm max-w-none">
@@ -1172,7 +1236,8 @@ export default function QAChat({
             {showSettings && renderSettingsPanel()}
             {renderComposerToolbar()}
             <div className="flex gap-2 rounded-2xl border border-gray-200 bg-white px-3 py-2 shadow-sm focus-within:border-gray-300">
-              <input
+              <ImageInput key={`${workspace}-${activeId}`} workspace={workspace} value={queryImage} onChange={setQueryImage} disabled={sending} />
+                <input
                 ref={inputRef}
                 type="text"
                 value={input}
@@ -1184,7 +1249,7 @@ export default function QAChat({
               />
               <button
                 onClick={handleSend}
-                disabled={!input.trim() || sending}
+                disabled={(!input.trim() && !queryImage) || sending}
                 className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-gray-900 text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:bg-gray-200 disabled:text-gray-400"
                 title="发送"
                 aria-label="发送"
